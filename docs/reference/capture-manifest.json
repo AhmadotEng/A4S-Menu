@@ -1,0 +1,138 @@
+{
+  "capturedAt": "2026-08-30",
+  "target": "StartAllBack popup Start menu only",
+  "status": "complete-for-phase4",
+  "requiredStates": {
+    "normal": "captured",
+    "hover": "captured-left-and-right",
+    "selection": "captured",
+    "allPrograms": "captured",
+    "searchResults": "captured",
+    "submenu": "captured-inline-expansion-current-configuration",
+    "userMenu": "not-applicable-direct-user-link-current-configuration",
+    "shutdownMenu": "captured",
+    "scrollbarActive": "captured",
+    "backdropTint": "captured"
+  },
+  "captureSheet": {
+    "file": "docs/reference/StartAllBack-capture-sheet.png",
+    "width": 1194,
+    "height": 3360,
+    "bytes": 1358583,
+    "sha256": "C82727A28E85D35968B3438CC3705E611930938D679C019E9D84FEE725429631"
+  },
+  "captures": [
+    {
+      "file": "docs/reference/states/StartAllBack-normal.png",
+      "state": "normal-main",
+      "width": 468,
+      "height": 450,
+      "bytes": 100800,
+      "sha256": "9B0D5F155A1E9FE6E43B6AAA42EBC27653219FCBD38D5CA383C2BD115D5ACDCE"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs.png",
+      "state": "all-programs-clean-core",
+      "width": 463,
+      "height": 443,
+      "bytes": 31186,
+      "sha256": "D778D0F1CB00C8026B037ADA6F8CAD860D3D570E44CF205A825D847625FB6F89"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-user-full.png",
+      "state": "all-programs-full-context",
+      "width": 475,
+      "height": 451,
+      "bytes": 119515,
+      "sha256": "3943078C951B199F1D0AB2E98B4E0481C355B83C97042490A7940B8E929A772B"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-hover.png",
+      "state": "left-hover-reveal",
+      "width": 463,
+      "height": 443,
+      "bytes": 31976,
+      "sha256": "67D9F76E1960A3FB615C8DD4F083BCC8BC844D58C2A89C241C276F2F672E2FFB"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-hover-user.png",
+      "state": "left-neutral-hover",
+      "width": 467,
+      "height": 443,
+      "bytes": 118206,
+      "sha256": "D03B9B364071217A2A1C5F91E4DC403D1AA6F58740493F90B9C8CA67DF94D5BF"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-selection.png",
+      "state": "left-keyboard-selection",
+      "width": 463,
+      "height": 443,
+      "bytes": 31490,
+      "sha256": "40A7ABC457EFBBF7EF118C77D6B1E8F96CBC50BE524658266A76D8D0AF2123AD"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-right-pane-hover.png",
+      "state": "right-pane-hover-command-prompt",
+      "width": 470,
+      "height": 451,
+      "bytes": 127041,
+      "sha256": "0EAAA5F7C818296652BCA19BEBE782EE69AFE661EA2448FDDEEEECAAEF540842"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-inline-submenus.png",
+      "state": "inline-expanded-accessibility-and-apps",
+      "width": 465,
+      "height": 441,
+      "bytes": 120191,
+      "sha256": "0D1EF07732E4287BAB2216A1336B2710589BCC247EA7B4AA30E920504AD435ED"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-search-steam.png",
+      "state": "search-results-steam",
+      "width": 468,
+      "height": 454,
+      "bytes": 100126,
+      "sha256": "39304C060DD3EC5ED4B88DB0ED3646B29E413877F80A639E9F72E7DB9248B210"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-shutdown-hover-tooltip.png",
+      "state": "shutdown-hover-tooltip",
+      "width": 491,
+      "height": 461,
+      "bytes": 127844,
+      "sha256": "4D40817BE726DF1E6DF5B19D44AE27D12EBD102CF8E2FD5D50E4D26C21E6AA09"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-shutdown-menu.png",
+      "state": "shutdown-flyout",
+      "width": 523,
+      "height": 455,
+      "bytes": 133280,
+      "sha256": "395724AA62065715A6FD4366558F7E6E3C92A56959241C70401B18B4AF902287"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-scrollbar-active.png",
+      "state": "scrollbar-active-clean-line",
+      "width": 465,
+      "height": 450,
+      "bytes": 152674,
+      "sha256": "F31410DC20463F70479F15D1BA577117BCBAE725F86A6236F67E36293CDA398F"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-blue-backdrop.png",
+      "state": "all-programs-blue-backdrop-tint",
+      "width": 468,
+      "height": 451,
+      "bytes": 215329,
+      "sha256": "8265E34B8335D1CEEDB0F4CDCA89C17B5E928DA107D7D0240985CD57FC455099"
+    },
+    {
+      "file": "docs/reference/states/StartAllBack-all-programs-shadow.png",
+      "state": "vertical-shadow-evidence",
+      "width": 463,
+      "height": 459,
+      "bytes": 32679,
+      "sha256": "714EA4D551BBDF70D79BFBE91FB32DD41F255C1E87E7D39074A33596D63A380F"
+    }
+  ]
+}
