@@ -8,7 +8,15 @@
 #include <stdafx.h>
 #include "StringUtils.h"
 #include <stdio.h>
+#ifdef A4S_PRODUCT
+// The isolated runtime project adds Src/Lib to its include path, where the
+// case-insensitive filesystem would resolve <assert.h> to our Assert.h rather
+// than the CRT header. Use the equivalent project assertion explicitly.
+#include "Assert.h"
+#define assert(exp) Assert(exp)
+#else
 #include <assert.h>
+#endif
 
 #ifndef STR_USE_WIN32_CONV
 #include <stdlib.h>

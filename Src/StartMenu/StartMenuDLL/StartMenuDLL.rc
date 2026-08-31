@@ -51,6 +51,7 @@ END
 // Dialog
 //
 
+#ifndef A4S_PRODUCT
 IDD_RENAME DIALOGEX 0, 0, 227, 54
 STYLE DS_SETFONT | DS_MODALFRAME | DS_SETFOREGROUND | DS_FIXEDSYS | DS_CENTER | WS_POPUP | WS_CAPTION | WS_SYSMENU
 EXSTYLE WS_EX_TOPMOST
@@ -216,6 +217,7 @@ BEGIN
     LTEXT           "Click on each item to change it. Double-click the icon to edit the additional settings. Drag to change order. Right-click for more functions. Use Tab or Shift+Tab to navigate with the keyboard",IDC_STATICHINT,7,151,351,25
     CONTROL         "",IDC_LISTITEMS,"SysListView32",LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_ALIGNLEFT | LVS_NOSORTHEADER | WS_BORDER | WS_TABSTOP,7,16,351,133
 END
+#endif
 
 
 /////////////////////////////////////////////////////////////////////////////
@@ -323,13 +325,27 @@ BEGIN
     BEGIN
         BLOCK "040904b0"
         BEGIN
+#ifdef A4S_PRODUCT
+            VALUE "CompanyName", "A4SMenu"
+            VALUE "FileDescription", "A4SMenu popup Start menu"
+#else
             VALUE "CompanyName", "Open-Shell"
             VALUE "FileDescription", "Open-Shell Menu"
+#endif
             VALUE "FileVersion", _PRODUCT_VERSION_STR
+#ifdef A4S_PRODUCT
+            VALUE "InternalName", "A4SMenu"
+#else
             VALUE "InternalName", "StartMenuDLL"
+#endif
             VALUE "LegalCopyright", "Copyright (C) 2017-2018, The Open-Shell Team"
+#ifdef A4S_PRODUCT
+            VALUE "OriginalFilename", "A4SMenu.dll"
+            VALUE "ProductName", "A4SMenu"
+#else
             VALUE "OriginalFilename", "StartMenuDLL.dll"
             VALUE "ProductName", "Open-Shell"
+#endif
             VALUE "ProductVersion", _PRODUCT_VERSION_STR
         END
     END
@@ -347,20 +363,26 @@ END
 
 // Icon with lowest ID value placed first to ensure application icon
 // remains consistent on all systems.
+#ifndef A4S_PRODUCT
 IDI_APPICON             ICON                    "..\\..\\Setup\\OpenShell.ico"
+#endif
 IDI_APPSICON            ICON                    "apps.ico"
 IDI_APPSICON10          ICON                    "apps10.ico"
 IDI_APPSICON11          ICON                    "apps11.ico"
+#ifndef A4S_PRODUCT
 IDI_BTN_CLASSIC         ICON                    "btn_aero.ico"
 IDI_START               ICON                    "start.ico"
 IDI_START10             ICON                    "start10.ico"
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 //
 // SKIN
 //
 
+#ifndef A4S_PRODUCT
 1                       SKIN                    "SkinDescription.txt"
+#endif
 2                       SKIN                    "SkinDescription7.txt"
 
 /////////////////////////////////////////////////////////////////////////////
@@ -378,13 +400,16 @@ IDI_START10             ICON                    "start10.ico"
 IDB_ARROWS              BITMAP                  "menu_arrows.bmp"
 IDB_ARROWS150           BITMAP                  "menu_arrows150.bmp"
 IDB_SEARCH_ICONS        BITMAP                  "search_icons.bmp"
+#ifndef A4S_PRODUCT
 IDB_BTN_CLASSIC         BITMAP                  "btn_classic.bmp"
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 //
 // IMAGE
 //
 
+#ifndef A4S_PRODUCT
 IDB_STYLE_CLASSIC1      IMAGE                   "style_classic.png"
 IDB_STYLE_CLASSIC2      IMAGE                   "style_vista.png"
 IDB_STYLE_WIN7          IMAGE                   "style_7.png"
@@ -396,6 +421,7 @@ IDB_BUTTON96            IMAGE                   "button96.png"
 IDB_BUTTON120           IMAGE                   "button120.png"
 IDB_BUTTON144           IMAGE                   "button144.png"
 IDB_BUTTON180           IMAGE                   "button180.png"
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 //
@@ -1357,7 +1383,9 @@ END
 // Generated from the TEXTINCLUDE 3 resource.
 //
 #include "..\..\Lib\resource.h"
+#ifndef A4S_PRODUCT
 #include "..\..\Lib\Lib.rc"
+#endif
 
 /////////////////////////////////////////////////////////////////////////////
 #endif    // not APSTUDIO_INVOKED

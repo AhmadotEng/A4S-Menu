@@ -16,8 +16,8 @@ class CSearchManager
 public:
 	CSearchManager( void );
 	~CSearchManager( void );
-	void Init( void );
-	void Close( void );
+	bool Init( void );
+	bool Close( void );
 
 
 	enum TItemCategory

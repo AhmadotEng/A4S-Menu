@@ -4,17 +4,22 @@
 
 #include <stdafx.h>
 #include "resource.h"
+#include "Assert.h"
 #include "Settings.h"
 #include "SettingsParser.h"
+#ifndef A4S_PRODUCT
 #include "SettingsUIHelper.h"
+#endif
 #include "ResourceHelper.h"
 #include "StringUtils.h"
 #include "FNVHash.h"
+#ifndef A4S_PRODUCT
 #include <Uxtheme.h>
 #include <VSStyle.h>
 #include <propkey.h>
 #include <propvarutil.h>
 #include <htmlhelp.h>
+#endif
 #include <vector>
 #include <map>
 #include <algorithm>
@@ -402,8 +407,35 @@ CSettingsManager::CSettingsManager( void )
 	m_RegPath=m_RegPathShared=m_GpPath=m_GpPathShared=m_CompName=m_XMLName=NULL;
 }
 
+struct TSettingsRegPathOverride
+{
+	const wchar_t *regPath;
+	const wchar_t *gpPath;
+};
+
+static TSettingsRegPathOverride g_SettingsRegPathOverrides[COMPONENT_SHARED+1]={};
+
+void SetSettingsRegPathOverride( TSettingsComponent component, const wchar_t *regPath, const wchar_t *gpPath )
+{
+	if (component<COMPONENT_EXPLORER || component>COMPONENT_SHARED)
+		return;
+	g_SettingsRegPathOverrides[component].regPath=regPath;
+	g_SettingsRegPathOverrides[component].gpPath=gpPath;
+}
+
 static void GetRegPaths( TSettingsComponent component, const wchar_t *&regPath, const wchar_t *&gpPath )
 {
+	if (component>=COMPONENT_EXPLORER && component<=COMPONENT_SHARED)
+	{
+		const TSettingsRegPathOverride &pathOverride=g_SettingsRegPathOverrides[component];
+		if (pathOverride.regPath && pathOverride.gpPath)
+		{
+			regPath=pathOverride.regPath;
+			gpPath=pathOverride.gpPath;
+			return;
+		}
+	}
+
 	switch (component)
 	{
 		case COMPONENT_EXPLORER:
@@ -976,6 +1008,7 @@ void CSettingsManager::ResetSettings( void )
 	}
 }
 
+#ifndef A4S_PRODUCT
 HIMAGELIST CSettingsManager::GetImageList( HWND tree )
 {
 	if (m_ImageList) return m_ImageList;
@@ -1992,6 +2025,59 @@ bool ExportSettingsXml( const wchar_t *fname )
 	}
 	return false;
 }
+#else
+HIMAGELIST CSettingsManager::GetImageList( HWND tree )
+{
+	UNREFERENCED_PARAMETER(tree);
+	return NULL;
+}
+
+void CSettingsManager::ResetImageList( void )
+{
+	m_ImageList=NULL;
+}
+
+void EditSettings( const wchar_t *title, bool bModal, int tab, const wchar_t *appId )
+{
+	UNREFERENCED_PARAMETER(title);
+	UNREFERENCED_PARAMETER(bModal);
+	UNREFERENCED_PARAMETER(tab);
+	UNREFERENCED_PARAMETER(appId);
+}
+
+void CloseSettings( void )
+{
+}
+
+void SetSettingsDirty( void )
+{
+}
+
+void SelectSettingsTab( int tab, bool bAdvanced, const CSetting *pSelect )
+{
+	UNREFERENCED_PARAMETER(tab);
+	UNREFERENCED_PARAMETER(bAdvanced);
+	UNREFERENCED_PARAMETER(pSelect);
+}
+
+bool IsSettingsMessage( MSG *msg )
+{
+	UNREFERENCED_PARAMETER(msg);
+	return false;
+}
+
+bool ImportSettingsXml( const wchar_t *fname )
+{
+	UNREFERENCED_PARAMETER(fname);
+	return false;
+}
+
+bool ExportSettingsXml( const wchar_t *fname )
+{
+	UNREFERENCED_PARAMETER(fname);
+	return false;
+}
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -2019,8 +2105,12 @@ void SaveSettings( void )
 
 void UpdateDefaultSettings( void )
 {
+#ifdef A4S_PRODUCT
+	UpdateSettings();
+#else
 	if (!g_SettingsDlg.m_hWnd)
 		UpdateSettings();
+#endif
 }
 
 bool GetSettingBool( const wchar_t *name )
@@ -2170,8 +2260,12 @@ const CSetting *GetAllSettings( void )
 void SetSettingsStyle( int style, int mask )
 {
 	Assert((style&~mask)==0);
+#ifdef A4S_PRODUCT
+	g_SettingsManager.SetSettingsStyle(style,mask);
+#else
 	if (g_SettingsManager.SetSettingsStyle(style,mask) && g_SettingsDlg.m_hWnd)
 		g_SettingsDlg.PostMessage(WM_CLEAR);
+#endif
 }
 
 void GetSettingsStyle( int &style, int &mask )
@@ -2181,22 +2275,28 @@ void GetSettingsStyle( int &style, int &mask )
 
 bool HasHelp( void )
 {
+#ifdef A4S_PRODUCT
+	return false;
+#else
 	wchar_t path[_MAX_PATH];
 	GetModuleFileName(_AtlBaseModule.GetResourceInstance(),path,_countof(path));
 	*PathFindFileName(path)=0;
 	wchar_t topic[_MAX_PATH];
 	Sprintf(topic,_countof(topic),L"%sOpenShell.chm",path);
 	return (GetFileAttributes(topic)!=INVALID_FILE_ATTRIBUTES);
+#endif
 }
 
 void ShowHelp( void )
 {
+#ifndef A4S_PRODUCT
 	wchar_t path[_MAX_PATH];
 	GetModuleFileName(_AtlBaseModule.GetResourceInstance(),path,_countof(path));
 	*PathFindFileName(path)=0;
 	wchar_t topic[_MAX_PATH];
 	Sprintf(topic,_countof(topic),L"%sOpenShell.chm::/%s.html",path,PathFindFileName(g_SettingsManager.GetRegPath()));
 	HtmlHelp(GetDesktopWindow(),topic,HH_DISPLAY_TOPIC,NULL);
+#endif
 }
 
 // Opens the registry keys for the settings of the given component

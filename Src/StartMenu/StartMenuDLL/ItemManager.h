@@ -29,8 +29,8 @@ public:
 	static int EXTRA_LARGE_ICON_SIZE;
 
 	// Initializes the manager. Called from DllMain
-	void Init( void );
-	void Close( void );
+	bool Init( void );
+	bool Close( void );
 	void ResetTempIcons( void );
 	void LoadCacheFile( void );
 	void SaveCacheFile( void );

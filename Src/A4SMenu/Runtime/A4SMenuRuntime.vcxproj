@@ -1,0 +1,87 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="Current" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="A4SProduct|x64">
+      <Configuration>A4SProduct</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{97C38DB3-5BCF-4142-AF6B-19AAE9D84E5A}</ProjectGuid>
+    <RootNamespace>A4SMenuRuntime</RootNamespace>
+    <ProjectName>A4SMenuRuntime</ProjectName>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>StaticLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseOfAtl>Static</UseOfAtl>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="..\A4SProductVersion.props" />
+    <Import Project="..\..\Common.props" />
+    <Import Project="..\A4SProduct.props" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+  <PropertyGroup>
+    <TargetName>A4SMenuRuntime</TargetName>
+    <OutDir>$(A4SProductBuildRoot)lib\$(Platform)\</OutDir>
+    <IntDir>$(A4SProductBuildRoot)obj\$(Platform)\A4SMenuRuntime\</IntDir>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>..\..\Lib;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="A4SSettingsRuntime.cpp" />
+    <ClCompile Include="..\..\Lib\Assert.cpp" />
+    <ClCompile Include="..\..\Lib\FileHelper.cpp" />
+    <ClCompile Include="..\..\Lib\FNVHash.cpp" />
+    <ClCompile Include="..\..\Lib\IatHookHelper.cpp" />
+    <ClCompile Include="..\..\Lib\Instance.cpp" />
+    <ClCompile Include="..\..\Lib\ResourceHelper.cpp" />
+    <ClCompile Include="..\..\Lib\Settings.cpp" />
+    <ClCompile Include="..\..\Lib\SettingsParser.cpp" />
+    <ClCompile Include="..\..\Lib\stdafx.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+    <ClCompile Include="..\..\Lib\StringSet.cpp" />
+    <ClCompile Include="..\..\Lib\StringUtils.cpp" />
+    <ClCompile Include="..\..\Lib\TrackResources.cpp" />
+    <ClCompile Include="..\..\Lib\Translations.cpp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="..\..\Lib\Assert.h" />
+    <ClInclude Include="..\..\Lib\ComHelper.h" />
+    <ClInclude Include="..\..\Lib\FileHelper.h" />
+    <ClInclude Include="..\..\Lib\FNVHash.h" />
+    <ClInclude Include="..\..\Lib\IatHookHelper.h" />
+    <ClInclude Include="..\..\Lib\ResourceHelper.h" />
+    <ClInclude Include="..\..\Lib\Settings.h" />
+    <ClInclude Include="..\..\Lib\SettingsParser.h" />
+    <ClInclude Include="..\..\Lib\stdafx.h" />
+    <ClInclude Include="..\..\Lib\StringSet.h" />
+    <ClInclude Include="..\..\Lib\StringUtils.h" />
+    <ClInclude Include="..\..\Lib\targetver.h" />
+    <ClInclude Include="..\..\Lib\TrackResources.h" />
+    <ClInclude Include="..\..\Lib\Translations.h" />
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

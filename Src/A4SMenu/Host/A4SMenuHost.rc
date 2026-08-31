@@ -1,0 +1,38 @@
+#include <winres.h>
+#include "../Shared/A4SProductIdentity.h"
+
+LANGUAGE LANG_ENGLISH, SUBLANG_ENGLISH_US
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION A4S_PRODUCT_VERSION_MAJOR,A4S_PRODUCT_VERSION_MINOR,A4S_PRODUCT_VERSION_PATCH,A4S_PRODUCT_VERSION_BUILD
+ PRODUCTVERSION A4S_PRODUCT_VERSION_MAJOR,A4S_PRODUCT_VERSION_MINOR,A4S_PRODUCT_VERSION_PATCH,A4S_PRODUCT_VERSION_BUILD
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS 0x1L
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS 0x40004L
+ FILETYPE 0x1L
+ FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904b0"
+        BEGIN
+            VALUE "CompanyName", "A4SMenu Project"
+            VALUE "FileDescription", "A4S Menu Explorer host"
+            VALUE "FileVersion", A4S_PRODUCT_VERSION_STR_A
+            VALUE "InternalName", "A4SMenuHost"
+            VALUE "LegalCopyright", "Open-Shell contributors and A4SMenu Project"
+            VALUE "OriginalFilename", "A4SMenuHost.exe"
+            VALUE "ProductName", "A4S Menu"
+            VALUE "ProductVersion", A4S_PRODUCT_VERSION_STR_A
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END
+

@@ -1,0 +1,5 @@
+LIBRARY "A4SMenu"
+
+EXPORTS
+    A4SMenu_GetApi
+    A4SMenu_HookInject

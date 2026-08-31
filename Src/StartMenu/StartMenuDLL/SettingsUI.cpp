@@ -10,8 +10,15 @@
 #include "Settings.h"
 #include "SkinManager.h"
 #include "FNVHash.h"
+#ifdef A4S_PRODUCT
+#include "../../Lib/resource.h"
+DWORD RgbToBgr( DWORD val );
+DWORD BgrToRgb( DWORD val );
+DWORD ParseColor( const wchar_t *str );
+#else
 #include "SettingsUIHelper.h"
 #include "LanguageSettingsHelper.h"
+#endif
 #include "SettingsUI.h"
 #include "ResourceHelper.h"
 #include "MenuContainer.h"
@@ -44,6 +51,7 @@ CString BgrToRgb(const wchar_t* str)
 	return RgbToBgr(str);
 }
 
+#ifndef A4S_PRODUCT
 class CSkinSettingsDlg: public CResizeableDlg<CSkinSettingsDlg>
 {
 public:
@@ -1004,9 +1012,11 @@ static CSkinSettingsPanel g_SkinSettingsPanelClassic1(MenuSkin::SKIN_TYPE_CLASSI
 static CSkinSettingsPanel g_SkinSettingsPanelClassic2(MenuSkin::SKIN_TYPE_CLASSIC2);
 static CSkinSettingsPanel g_SkinSettingsPanelWin7(MenuSkin::SKIN_TYPE_WIN7);
 static CSkinSettingsPanel g_SkinSettingsPanelAll(MenuSkin::SKIN_TYPE_ALL_PROGRAMS);
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifndef A4S_PRODUCT
 static const CStdCommand g_StdCommands[]={
 	{L"SEPARATOR",IDS_SEPARATOR_ITEM,IDS_SEPARATOR_TIP},
 	{L"COLUMN_BREAK",IDS_COLUMN_BREAK_ITEM,IDS_BREAK_TIP},
@@ -1056,6 +1066,7 @@ static const CStdCommand g_StdCommands[]={
 	{L"",IDS_CUSTOM_ITEM,IDS_CUSTOM_TIP,L"CustomItem",NULL,NULL,L""},
 	{NULL},
 };
+#endif
 
 const wchar_t *g_DefaultStartMenu1=
 L"Items=COLUMN_PADDING, ProgramsMenu, AppsMenu, COLUMN_BREAK, FavoritesItem, RecentDocumentsItem, ComputerItem, SettingsMenu, SearchMenu, HelpItem, RunItem, SEPARATOR, LogOffItem, UndockItem, DisconnectItem, ShutdownBoxItem, SearchBoxItem\n"
@@ -1413,6 +1424,7 @@ L"Item23.Settings=ITEM_DISABLED\n"
 L"Item24.Command=windows_security\n"
 ;
 
+#ifndef A4S_PRODUCT
 static const KNOWNFOLDERID *g_CommonLinks[]=
 {
 	&FOLDERID_CommonAdminTools,
@@ -1438,9 +1450,11 @@ static const KNOWNFOLDERID *g_CommonLinks[]=
 	&FOLDERID_NetworkFolder,
 	NULL,
 };
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifndef A4S_PRODUCT
 class CEditMenuDlg: public CEditCustomItemDlg
 {
 public:
@@ -4130,11 +4144,20 @@ HWND CStyleSettingsPanel::Activate( CSetting *pGroup, const RECT &rect, bool bRe
 }
 
 static CStyleSettingsPanel g_StyleSettingsPanel;
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifdef A4S_PRODUCT
+#define A4S_SETTINGS_PANEL(panel) NULL
+#define A4S_LANGUAGE_SETTINGS_PANEL NULL
+#else
+#define A4S_SETTINGS_PANEL(panel) (&panel)
+#define A4S_LANGUAGE_SETTINGS_PANEL GetLanguageSettings(COMPONENT_MENU)
+#endif
+
 CSetting g_Settings[]={
-{L"MenuStyleGroup",CSetting::TYPE_GROUP,IDS_STYLE_SETTINGS,0,0,CSetting::FLAG_BASIC,NULL,NULL,&g_StyleSettingsPanel},
+{L"MenuStyleGroup",CSetting::TYPE_GROUP,IDS_STYLE_SETTINGS,0,0,CSetting::FLAG_BASIC,NULL,NULL,A4S_SETTINGS_PANEL(g_StyleSettingsPanel)},
 	{L"MenuStyle",CSetting::TYPE_INT,0,0,2,CSetting::FLAG_NORESET},
 		{L"Classic1",CSetting::TYPE_RADIO},
 		{L"Classic2",CSetting::TYPE_RADIO},
@@ -4283,7 +4306,7 @@ CSetting g_Settings[]={
 	{L"PinnedPrograms",CSetting::TYPE_INT,IDS_PINNED_PROGRAMS,IDS_PINNED_PROGRAMS_TIP,PINNED_PROGRAMS_PINNED},
 		{L"FastItems",CSetting::TYPE_RADIO,IDS_FAST_ITEMS,IDS_FAST_ITEMS_TIP},
 		{L"PinnedItems",CSetting::TYPE_RADIO,IDS_PINNED_ITEMS,IDS_PINNED_ITEMS_TIP},
-	{L"PinnedItemsPath",CSetting::TYPE_DIRECTORY,IDS_PINNED_PATH,IDS_PINNED_PATH_TIP,L"%APPDATA%\\OpenShell\\Pinned",0,L"PinnedPrograms=1",L"PinnedItems"},
+	{L"PinnedItemsPath",CSetting::TYPE_DIRECTORY,IDS_PINNED_PATH,IDS_PINNED_PATH_TIP,A4S_MENU_PINNED_DIR,0,L"PinnedPrograms=1",L"PinnedItems"},
 	{L"RecentPrograms",CSetting::TYPE_INT,IDS_RECENT_PROGRAMS,IDS_RECENT_PROGRAMS_TIP,RECENT_PROGRAMS_RECENT,CSetting::FLAG_BASIC},
 		{L"None",CSetting::TYPE_RADIO,IDS_NO_RECENT,IDS_NO_RECENT_TIP},
 		{L"Recent",CSetting::TYPE_RADIO,IDS_SHOW_RECENT,IDS_SHOW_RECENT_TIP},
@@ -4432,17 +4455,17 @@ CSetting g_Settings[]={
 	{L"GlassBlending",CSetting::TYPE_INT,IDS_GLASS_BLENDING,IDS_GLASS_BLENDING_TIP,0,0,L"GlassOverride",L"GlassOverride"},
 	{L"GlassOpacity",CSetting::TYPE_INT,IDS_GLASS_OPACITY,IDS_GLASS_OPACITY_TIP,DEFAULT_GLASS_OPACITY,0,L"EnableGlass"},
 
-{L"Skin",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_CLASSIC1,NULL,NULL,&g_SkinSettingsPanelClassic1},
+{L"Skin",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_CLASSIC1,NULL,NULL,A4S_SETTINGS_PANEL(g_SkinSettingsPanelClassic1)},
 	{L"SkinC1",CSetting::TYPE_STRING,0,0,L"Windows Aero"},
 	{L"SkinVariationC1",CSetting::TYPE_STRING,0,0,L""},
 	{L"SkinOptionsC1",CSetting::TYPE_MULTISTRING,0,0,L""},
 
-{L"Skin",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_CLASSIC2,NULL,NULL,&g_SkinSettingsPanelClassic2},
+{L"Skin",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_CLASSIC2,NULL,NULL,A4S_SETTINGS_PANEL(g_SkinSettingsPanelClassic2)},
 	{L"SkinC2",CSetting::TYPE_STRING,0,0,L"Windows Aero"},
 	{L"SkinVariationC2",CSetting::TYPE_STRING,0,0,L""},
 	{L"SkinOptionsC2",CSetting::TYPE_MULTISTRING,0,0,L""},
 
-{L"Skin7",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_WIN7,NULL,NULL,&g_SkinSettingsPanelWin7},
+{L"Skin7",CSetting::TYPE_GROUP,IDS_SKIN_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_WIN7,NULL,NULL,A4S_SETTINGS_PANEL(g_SkinSettingsPanelWin7)},
 	{L"SkinW7",CSetting::TYPE_STRING,0,0,L"Windows Aero"},
 	{L"SkinVariationW7",CSetting::TYPE_STRING,0,0,L""},
 	{L"SkinOptionsW7",CSetting::TYPE_MULTISTRING,0,0,L""},
@@ -4492,13 +4515,13 @@ CSetting g_Settings[]={
 		{L"DisableAll",CSetting::TYPE_RADIO,IDS_DISABLE_ALL,IDS_DISABLE_ALL_TIP},
 	{L"OpenMouseMonitor",CSetting::TYPE_BOOL,IDS_MOUSE_MONITOR,IDS_MOUSE_MONITOR_TIP,0},
 
-{L"CustomMenu1",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_MENU_CLASSIC1,NULL,NULL,&g_CustomMenuPanel1},
+{L"CustomMenu1",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_MENU_CLASSIC1,NULL,NULL,A4S_SETTINGS_PANEL(g_CustomMenuPanel1)},
 	{L"MenuItems1",CSetting::TYPE_MULTISTRING,0,0,L""},
 
-{L"CustomMenu2",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_MENU_CLASSIC2,NULL,NULL,&g_CustomMenuPanel2},
+{L"CustomMenu2",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_MENU_CLASSIC2,NULL,NULL,A4S_SETTINGS_PANEL(g_CustomMenuPanel2)},
 	{L"MenuItems2",CSetting::TYPE_MULTISTRING,0,0,L""},
 
-{L"CustomMenu7",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_WIN7,NULL,NULL,&g_CustomMenuPanel7},
+{L"CustomMenu7",CSetting::TYPE_GROUP,IDS_CUSTOM_SETTINGS,0,0,CSetting::FLAG_BASIC|CSetting::FLAG_MENU_WIN7,NULL,NULL,A4S_SETTINGS_PANEL(g_CustomMenuPanel7)},
 	{L"MenuItems7",CSetting::TYPE_MULTISTRING,0,0,L""},
 
 {L"WindowsMenu",CSetting::TYPE_GROUP,IDS_WSM_SETTINGS},
@@ -4509,7 +4532,7 @@ CSetting g_Settings[]={
 		{L"SelectButton",CSetting::TYPE_RADIO,IDS_SELECT_BUTTON,IDS_SELECT_BUTTON_TIP},
 	{L"HideUserPic",CSetting::TYPE_BOOL,IDS_HIDE_PIC,IDS_HIDE_PIC_TIP,0},
 
-{L"AllProgramsSkin",CSetting::TYPE_GROUP,IDS_ALL_SKIN_SETTINGS,0,0,0,NULL,NULL,&g_SkinSettingsPanelAll},
+{L"AllProgramsSkin",CSetting::TYPE_GROUP,IDS_ALL_SKIN_SETTINGS,0,0,0,NULL,NULL,A4S_SETTINGS_PANEL(g_SkinSettingsPanelAll)},
 	{L"SkinA",CSetting::TYPE_STRING,0,0,L""},
 	{L"SkinVariationA",CSetting::TYPE_STRING,0,0,L""},
 	{L"SkinOptionsA",CSetting::TYPE_MULTISTRING,0,0,L""},
@@ -4530,12 +4553,15 @@ CSetting g_Settings[]={
 	{L"SoundDrop",CSetting::TYPE_SOUND,IDS_SOUND_DROP,IDS_SOUND_DROP_TIP,L"MoveMenuItem"},
 	{L"SoundButtonHover",CSetting::TYPE_SOUND,IDS_SOUND_HOVER,IDS_SOUND_HOVER_TIP,L""},
 
-{L"Language",CSetting::TYPE_GROUP,IDS_LANGUAGE_SETTINGS_SM,0,0,0,NULL,NULL,GetLanguageSettings(COMPONENT_MENU)},
+{L"Language",CSetting::TYPE_GROUP,IDS_LANGUAGE_SETTINGS_SM,0,0,0,NULL,NULL,A4S_LANGUAGE_SETTINGS_PANEL},
 	{L"Language",CSetting::TYPE_STRING,0,0,L"",CSetting::FLAG_COLD|CSetting::FLAG_SHARED},
 	{L"Update",CSetting::TYPE_BOOL,0,0,1,CSetting::FLAG_SHARED}, // this is here only to generate the ADMX entry
 
 {NULL}
 };
+
+#undef A4S_SETTINGS_PANEL
+#undef A4S_LANGUAGE_SETTINGS_PANEL
 
 void UpgradeSettings( bool bShared )
 {
@@ -4716,7 +4742,7 @@ void UpdateSettings( void )
 	{
 		CRegKey regKey;
 		wchar_t language[100]=L"";
-		if (regKey.Open(HKEY_LOCAL_MACHINE,L"Software\\OpenShell\\OpenShell",KEY_READ|KEY_WOW64_64KEY)==ERROR_SUCCESS)
+		if (regKey.Open(HKEY_LOCAL_MACHINE,A4S_SHARED_MACHINE_REG,KEY_READ|KEY_WOW64_64KEY)==ERROR_SUCCESS)
 		{
 			ULONG size=_countof(language);
 			if (regKey.QueryStringValue(L"DefaultLanguage",language,&size)!=ERROR_SUCCESS)
@@ -4735,8 +4761,10 @@ void UpdateSettings( void )
 	FindSetting(L"SortRecentDocuments2")->pLinkTo=FindSetting(L"SortRecentDocuments");
 	FindSetting(L"ControlPanelCategories2")->pLinkTo=FindSetting(L"ControlPanelCategories");
 	FindSetting(L"ConfirmLogOff2")->pLinkTo=FindSetting(L"ConfirmLogOff");
+#ifndef A4S_PRODUCT
 	CMenuStyleDlg::UpdateDefaults();
 	CCustomMenuDlg::UpdateWarnings(menuStyle);
+#endif
 
 	int dpi=FindSetting(L"OverrideDPI")->value.intVal;
 	if (dpi==0)
@@ -5124,6 +5152,7 @@ void UpdateSettings( void )
 	SetSettingsStyle(CSetting::FLAG_MENU_WIN7,CSetting::FLAG_MENU_MASK);
 }
 
+#ifndef A4S_PRODUCT
 class MenuCustomSettings: public ICustomSettings
 {
 public:
@@ -5150,6 +5179,7 @@ void MenuCustomSettings::ExecuteBackupMenu( int id )
 }
 
 static MenuCustomSettings g_CustomSettings;
+#endif
 
 void InitSettings( void )
 {
@@ -5162,9 +5192,16 @@ void InitSettings( void )
 				break;
 			}
 	}
+#ifdef A4S_PRODUCT
+	SetSettingsRegPathOverride(COMPONENT_MENU,L"Software\\A4SMenu\\Menu",L"Software\\Policies\\A4SMenu\\Menu");
+	SetSettingsRegPathOverride(COMPONENT_SHARED,L"Software\\A4SMenu\\Shared",L"Software\\Policies\\A4SMenu\\Shared");
+	InitSettings(g_Settings,COMPONENT_MENU,NULL);
+#else
 	InitSettings(g_Settings,COMPONENT_MENU,&g_CustomSettings);
+#endif
 }
 
+#ifndef A4S_PRODUCT
 static int g_ButtonPath, g_ButtonSize, g_ButtonIcon, g_ButtonOffset, g_ButtonIconSize, g_ButtonText, g_ButtonTip;
 static bool g_bButtonEnable, g_bTaskbarsChanged, g_bTaskbarsUpdated;
 
@@ -5210,9 +5247,15 @@ static void UpdateButtons( bool bForce )
 	}
 	StoreButtonSettings();
 }
+#endif
 
 void ClosingSettings( HWND hWnd, int flags, int command )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(hWnd);
+	UNREFERENCED_PARAMETER(flags);
+	UNREFERENCED_PARAMETER(command);
+#else
 	EnableHotkeys(HOTKEYS_NORMAL);
 	bool bRecreate=false;
 	if (command==IDOK)
@@ -5233,10 +5276,14 @@ void ClosingSettings( HWND hWnd, int flags, int command )
 	UpdateButtons(false);
 	ResetHotCorners();
 	RedrawTaskbars();
+#endif
 }
 
 void SettingChangedCallback( const CSetting *pSetting )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(pSetting);
+#else
 	if (wcscmp(pSetting->name,L"CustomTaskbar")==0 || wcscmp(pSetting->name,L"TaskbarLook")==0 || wcscmp(pSetting->name,L"TaskbarOpacity")==0 || wcscmp(pSetting->name,L"TaskbarColor")==0 || wcscmp(pSetting->name,L"TaskbarTextColor")==0)
 	{
 		UpdateTaskBars(TASKBAR_UPDATE);
@@ -5260,10 +5307,15 @@ void SettingChangedCallback( const CSetting *pSetting )
 		else
 			FindSetting(L"TaskbarLook")[4].flags|=CSetting::FLAG_HIDDEN;
 	}*/
+#endif
 }
 
 void EditSettings( bool bModal, int tab )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(bModal);
+	UNREFERENCED_PARAMETER(tab);
+#else
 	if (A4SMenuProfile::IsEnabled())
 		return;
 #ifndef BUILD_SETUP
@@ -5283,19 +5335,30 @@ void EditSettings( bool bModal, int tab )
 		Sprintf(title,_countof(title),LoadStringEx(IDS_SETTINGS_TITLE_VER),ver>>24,(ver>>16)&0xFF,ver&0xFFFF);
 	else
 		Sprintf(title,_countof(title),LoadStringEx(IDS_SETTINGS_TITLE));
-	EditSettings(title,bModal,tab,L"OpenShell.StartMenu.Settings");
+	EditSettings(title,bModal,tab,A4S_MENU_SETTINGS_APP_ID);
+#endif
 }
 
 bool DllImportSettingsXml( const wchar_t *fname )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(fname);
+	return false;
+#else
 	if (A4SMenuProfile::IsEnabled())
 		return false;
 	return ImportSettingsXml(fname);
+#endif
 }
 
 bool DllExportSettingsXml( const wchar_t *fname )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(fname);
+	return false;
+#else
 	if (A4SMenuProfile::IsEnabled())
 		return false;
 	return ExportSettingsXml(fname);
+#endif
 }

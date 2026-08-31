@@ -45,6 +45,7 @@ static int g_LoadDialogs[]=
 	0
 };
 
+#ifndef A4S_PRODUCT
 static HANDLE g_DllInitThread;
 
 static DWORD CALLBACK DllInitThread( void* )
@@ -53,22 +54,70 @@ static DWORD CALLBACK DllInitThread( void* )
 	InitSettings();
 
 	// This environment fork is a fixed English, two-binary product. All menu
-	// text overrides are embedded as resource 1/L10N in StartMenuDLL.dll.
+	// text overrides are embedded as resource 1/L10N in the menu DLL.
 	ParseTranslations(NULL,L"en-US");
 	LoadTranslationResources(g_Instance,g_LoadDialogs);
 
 	CoUninitialize();
 	return 0;
 }
+#else
+// Product initialization is intentionally not started from DllMain.  The DLL is
+// loaded into A4SMenuHost once so the host can inspect its ABI, and a second time
+// into Explorer by the taskbar-thread hook.  Running COM, settings, translations,
+// logging, or worker creation under either process' loader lock makes both paths
+// fragile.  A4SMenu_HookInject performs the explicit initialization instead.
+static INIT_ONCE g_A4SRuntimeInitOnce=INIT_ONCE_STATIC_INIT;
+
+static BOOL CALLBACK InitA4SRuntimeOnce( PINIT_ONCE, PVOID, PVOID * )
+{
+	HRESULT hr=CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
+	if (FAILED(hr) && hr!=RPC_E_CHANGED_MODE)
+	{
+		SetLastError(HRESULT_CODE(hr));
+		return FALSE; // InitOnce permits a later HookInject call to retry.
+	}
+
+	InitSettings();
+	ParseTranslations(NULL,L"en-US");
+	// Product text overrides are embedded in A4SMenu.dll. Settings and skin
+	// dialogs are not product surfaces, so do not preload their templates.
+	LoadTranslationResources(g_Instance,NULL);
+
+	// If this call created the taskbar thread's STA, retain that apartment for
+	// the pinned product lifetime because later menu shell work runs on the same
+	// thread. Balance only S_FALSE, which added a reference to an existing STA.
+	if (hr==S_FALSE)
+		CoUninitialize();
+	return TRUE;
+}
+
+bool EnsureA4SRuntimeInitialized( void )
+{
+	return InitOnceExecuteOnce(&g_A4SRuntimeInitOnce,InitA4SRuntimeOnce,NULL,NULL)!=FALSE;
+}
+#endif
 
 STARTMENUAPI void WaitDllInitThread( void )
 {
+#ifdef A4S_PRODUCT
+	// Kept for source compatibility with shared code. Product initialization is
+	// driven only by A4SMenu_HookInject, outside loader lock.
+	ATLASSERT(FALSE);
+#else
 	ATLASSERT(g_DllInitThread);
 	WaitForSingleObject(g_DllInitThread,INFINITE);
+#endif
 }
 
 extern "C" BOOL WINAPI DllMain( HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved )
 {
+#ifdef A4S_PRODUCT
+	if (dwReason==DLL_PROCESS_ATTACH)
+	{
+		g_Instance=hInstance;
+	}
+#else
 	if (dwReason==DLL_PROCESS_ATTACH)
 	{
 		LogToFile(STARTUP_LOG,L"StartMenu DLL: DLL_PROCESS_ATTACH");
@@ -79,6 +128,7 @@ extern "C" BOOL WINAPI DllMain( HINSTANCE hInstance, DWORD dwReason, LPVOID lpRe
 	{
 		LogToFile(STARTUP_LOG,L"StartMenu DLL: DLL_PROCESS_DETACH");
 	}
+#endif
 
 	return TRUE;
 }

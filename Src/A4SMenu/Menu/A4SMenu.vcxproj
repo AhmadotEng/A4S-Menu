@@ -1,0 +1,140 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" ToolsVersion="15.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="A4SProduct|x64">
+      <Configuration>A4SProduct</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+
+  <PropertyGroup Label="Globals">
+    <ProjectGuid>{2EA82DAA-EC62-4C0B-B7C8-BBE334734C44}</ProjectGuid>
+    <RootNamespace>A4SMenu</RootNamespace>
+    <ProjectName>A4SMenu</ProjectName>
+    <Keyword>Win32Proj</Keyword>
+    <WindowsTargetPlatformVersion>10.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+
+  <PropertyGroup Label="Configuration">
+    <ConfigurationType>DynamicLibrary</ConfigurationType>
+    <PlatformToolset>v143</PlatformToolset>
+    <UseOfAtl>Static</UseOfAtl>
+    <CharacterSet>Unicode</CharacterSet>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+  </PropertyGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+
+  <ImportGroup Label="ExtensionSettings" />
+  <ImportGroup Label="PropertySheets">
+    <Import Project="..\A4SProductVersion.props" />
+    <Import Project="..\..\Common.props" />
+    <Import Project="..\A4SProduct.props" />
+  </ImportGroup>
+
+  <PropertyGroup Label="UserMacros" />
+
+  <PropertyGroup>
+    <TargetName>A4SMenu</TargetName>
+    <TargetExt>.dll</TargetExt>
+  </PropertyGroup>
+
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <AdditionalIncludeDirectories>..\..\StartMenu\StartMenuDLL;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <PreprocessorDefinitions>_USRDLL;CLASSICSTARTMENUDLL_EXPORTS;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ResourceCompile>
+      <AdditionalIncludeDirectories>..\..\StartMenu\StartMenuDLL;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ResourceCompile>
+    <Link>
+      <AdditionalDependencies>$(A4SProductBuildRoot)lib\$(Platform)\A4SMenuRuntime.lib;comctl32.lib;uxtheme.lib;WtsApi32.lib;Secur32.lib;Msimg32.lib;Netapi32.lib;dwmapi.lib;PowrProf.lib;Oleacc.lib;winmm.lib;structuredquery.lib;Propsys.lib;wintrust.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <ModuleDefinitionFile>A4SMenu.def</ModuleDefinitionFile>
+      <ImportLibrary>$(IntDir)A4SMenu.lib</ImportLibrary>
+      <ProgramDatabaseFile>$(IntDir)A4SMenu.pdb</ProgramDatabaseFile>
+    </Link>
+  </ItemDefinitionGroup>
+
+  <ItemGroup>
+    <ClCompile Include="A4SDisabledFeatures.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\A4SMenuProfile.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\Accessibility.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\StartButton.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\CustomMenu.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\dllmain.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\ItemManager.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\LogManager.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\MenuCommands.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\MenuContainer.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\MenuPaint.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\MetroLinkManager.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\ProgramsTree.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\SearchManager.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\SettingsUI.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\SkinManager.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\stdafx.cpp">
+      <PrecompiledHeader>Create</PrecompiledHeader>
+    </ClCompile>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ClInclude Include="..\Shared\A4SProductApi.h" />
+    <ClInclude Include="..\Shared\A4SProductIdentity.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\A4SProductRuntime.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\A4SMenuProfile.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\Accessibility.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\StartButton.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\CustomMenu.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\dllmain.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\DragDrop.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\ItemManager.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\JumpLists.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\LogManager.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\MenuContainer.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\MetroLinkManager.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\ProgramsTree.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\resource.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\SearchManager.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\SettingsUI.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\SkinManager.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\stdafx.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\targetver.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\TouchHelper.h" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Image Include="..\..\StartMenu\StartMenuDLL\apps.ico" />
+    <Image Include="..\..\StartMenu\StartMenuDLL\apps10.ico" />
+    <Image Include="..\..\StartMenu\StartMenuDLL\apps11.ico" />
+    <Image Include="..\..\StartMenu\StartMenuDLL\menu_arrows.bmp" />
+    <Image Include="..\..\StartMenu\StartMenuDLL\menu_arrows150.bmp" />
+    <Image Include="..\..\StartMenu\StartMenuDLL\search_icons.bmp" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ResourceCompile Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.rc" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Text Include="..\..\StartMenu\StartMenuDLL\A4SMenuL10N.txt" />
+    <Text Include="..\..\StartMenu\StartMenuDLL\SkinDescription7.txt" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="A4SMenu.def" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Runtime\A4SMenuRuntime.vcxproj">
+      <Project>{97C38DB3-5BCF-4142-AF6B-19AAE9D84E5A}</Project>
+      <ReferenceOutputAssembly>false</ReferenceOutputAssembly>
+    </ProjectReference>
+  </ItemGroup>
+
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+  <ImportGroup Label="ExtensionTargets" />
+</Project>

@@ -31,7 +31,7 @@ bool g_bAllowMoveButton;
 class CStartButton: public CWindowImpl<CStartButton>
 {
 public:
-	DECLARE_WND_CLASS_EX(L"OpenShell.CStartButton",CS_DBLCLKS,COLOR_MENU)
+	DECLARE_WND_CLASS_EX(A4S_MENU_START_BUTTON_CLASS,CS_DBLCLKS,COLOR_MENU)
 	CStartButton( void );
 
 	// message handlers

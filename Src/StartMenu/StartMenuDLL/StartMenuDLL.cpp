@@ -17,6 +17,11 @@
 #include "IatHookHelper.h"
 #include "dllmain.h"
 #include "A4SMenuProfile.h"
+#ifdef A4S_PRODUCT
+#define A4S_MENU_API_EXPORTS
+#include "../../A4SMenu/Shared/A4SProductApi.h"
+#undef A4S_MENU_API_EXPORTS
+#endif
 #include <uxtheme.h>
 #include <dwmapi.h>
 #include <htmlhelp.h>
@@ -66,6 +71,13 @@ static DWORD g_TaskbarThreadId;
 static bool g_bA4SStartLeftCapture;
 static bool g_bA4SQueuedStartLeftCapture;
 static const LPARAM A4S_MOUSE_TOGGLE=0x4134534D; // "A4SM"
+#ifdef A4S_PRODUCT
+static const WPARAM A4S_COMMAND_TOGGLE=A4S_MENU_COMMAND_TOGGLE;
+static const WPARAM A4S_COMMAND_EXIT=A4S_MENU_COMMAND_EXIT;
+#else
+static const WPARAM A4S_COMMAND_TOGGLE=MSG_TOGGLE;
+static const WPARAM A4S_COMMAND_EXIT=MSG_EXIT;
+#endif
 static HWND g_CurrentTaskList, g_CurrentTaskChevron, g_CurrentRebar, g_CurrentTaskbarPart, g_CurrentTaskbarButton, g_CurrentDesktopButton;
 static HBITMAP g_TaskbarTexture;
 static SIZE g_TaskbarTextureSize;
@@ -75,9 +87,93 @@ int g_CurrentCSMTaskbar=-1, g_CurrentWSMTaskbar=-1;
 // ExplorerPatcher taskbar
 static bool g_epTaskbar = false;
 
+static HWND FindStartHookWindow( void )
+{
+#ifdef A4S_PRODUCT
+	return FindWindow(A4S_HOST_WINDOW_CLASS_W,A4S_HOST_WINDOW_TITLE_W);
+#else
+	return FindWindow(L"OpenShellMenu.CStartHookWindow",L"StartHookWindow");
+#endif
+}
+
+#ifdef A4S_PRODUCT
+enum A4SInitializationState
+{
+	A4S_INIT_UNINITIALIZED,
+	A4S_INIT_INITIALIZING,
+	A4S_INIT_READY,
+	A4S_INIT_FAILED,
+	A4S_INIT_DISARMING,
+	A4S_INIT_DISARMED,
+};
+
+static volatile LONG g_A4SInitializationState=A4S_INIT_UNINITIALIZED;
+static HMODULE g_A4SPinnedModule;
+static SRWLOCK g_A4SAttemptLock=SRWLOCK_INIT;
+static HWND g_A4SAttemptHost;
+static UINT_PTR g_A4SAttemptCookie;
+static DWORD g_A4SAttemptHostProcess;
+
+bool IsA4SRuntimeReady( void )
+{
+	return InterlockedCompareExchange(&g_A4SInitializationState,
+		A4S_INIT_UNINITIALIZED,A4S_INIT_UNINITIALIZED)==A4S_INIT_READY;
+}
+
+static bool BindA4SAttempt( HWND host, UINT_PTR attemptCookie )
+{
+	DWORD hostProcess=0;
+	if (!host || !attemptCookie || !IsWindow(host) ||
+		!GetWindowThreadProcessId(host,&hostProcess) || hostProcess==GetCurrentProcessId() ||
+		(UINT_PTR)GetProp(host,A4S_HOST_ATTEMPT_COOKIE_PROPERTY_W)!=attemptCookie)
+		return false;
+
+	AcquireSRWLockExclusive(&g_A4SAttemptLock);
+	g_A4SAttemptHost=host;
+	g_A4SAttemptCookie=attemptCookie;
+	g_A4SAttemptHostProcess=hostProcess;
+	ReleaseSRWLockExclusive(&g_A4SAttemptLock);
+	return true;
+}
+
+static bool GetBoundA4SAttempt( HWND &host, UINT_PTR &attemptCookie )
+{
+	AcquireSRWLockShared(&g_A4SAttemptLock);
+	host=g_A4SAttemptHost;
+	attemptCookie=g_A4SAttemptCookie;
+	const DWORD expectedHostProcess=g_A4SAttemptHostProcess;
+	ReleaseSRWLockShared(&g_A4SAttemptLock);
+
+	DWORD hostProcess=0;
+	return host && attemptCookie && IsWindow(host) &&
+		GetWindowThreadProcessId(host,&hostProcess) && hostProcess==expectedHostProcess &&
+		(UINT_PTR)GetProp(host,A4S_HOST_ATTEMPT_COOKIE_PROPERTY_W)==attemptCookie;
+}
+
+static HWND GetBoundA4SHost( void )
+{
+	HWND host=NULL;
+	UINT_PTR attemptCookie=0;
+	return GetBoundA4SAttempt(host,attemptCookie)?host:NULL;
+}
+
+static bool NotifyA4SHost( A4SMenuDllStatus status )
+{
+	HWND host=NULL;
+	UINT_PTR attemptCookie=0;
+	if (!GetBoundA4SAttempt(host,attemptCookie))
+		return false;
+
+	UINT message=RegisterWindowMessage(A4S_DLL_STATUS_MESSAGE_W);
+	const UINT64 payload=((UINT64)GetCurrentProcessId()<<32)|(UINT32)status;
+	return message && PostMessage(host,message,(WPARAM)payload,(LPARAM)attemptCookie)!=FALSE;
+}
+#endif
+
 static void FindWindowsMenu( void );
 static void RecreateStartButton( size_t taskbarId );
 static bool WindowsMenuOpened( void );
+static DWORD WINAPI ExitThreadProc( void *param );
 
 static tSetWindowCompositionAttribute SetWindowCompositionAttribute;
 
@@ -295,7 +391,7 @@ static bool CreateImmersiveShell( CComPtr<IUnknown> &ptr )
 class COwnerWindow: public CWindowImpl<COwnerWindow>
 {
 public:
-	DECLARE_WND_CLASS_EX(L"OpenShell.COwnerWindow",0,COLOR_MENU)
+	DECLARE_WND_CLASS_EX(A4S_MENU_OWNER_WINDOW_CLASS,0,COLOR_MENU)
 
 	// message handlers
 	BEGIN_MSG_MAP( COwnerWindow )
@@ -544,7 +640,7 @@ static void FindTaskBar( void )
 {
 	if (!g_TaskBar)
 	{
-		g_StartMenuMsg=RegisterWindowMessage(L"OpenShellMenu.StartMenuMsg");
+		g_StartMenuMsg=RegisterWindowMessage(A4S_MENU_START_MESSAGE);
 		FindTaskBar(GetCurrentProcessId());
 		if (g_TaskBar)
 		{
@@ -2979,19 +3075,42 @@ HMODULE GetModuleHandleByPrefix(const WCHAR* prefix)
 // The A4S product owns only popup activation. Keep the hook set deliberately
 // small and reversible: one taskbar-thread message hook and (on Windows 11)
 // one mouse hook used only for the native Start button's left-click gesture.
-static void ClearA4SActivationHooks( void )
+static bool ClearA4SActivationHooks( void )
 {
+	bool cleared=true;
 	if (g_StartMouseHook)
-		UnhookWindowsHookEx(g_StartMouseHook);
-	g_StartMouseHook=NULL;
+	{
+		if (UnhookWindowsHookEx(g_StartMouseHook))
+			g_StartMouseHook=NULL;
+		else
+		{
+			cleared=false;
+			LogToFile(STARTUP_LOG,L"A4S mouse hook removal failed: %u",GetLastError());
+		}
+	}
 	if (g_StartHook)
-		UnhookWindowsHookEx(g_StartHook);
-	g_StartHook=NULL;
+	{
+		if (UnhookWindowsHookEx(g_StartHook))
+			g_StartHook=NULL;
+		else
+		{
+			cleared=false;
+			LogToFile(STARTUP_LOG,L"A4S message hook removal failed: %u",GetLastError());
+		}
+	}
 	if (g_ProgHook)
-		UnhookWindowsHookEx(g_ProgHook);
-	g_ProgHook=NULL;
+	{
+		if (UnhookWindowsHookEx(g_ProgHook))
+			g_ProgHook=NULL;
+		else
+		{
+			cleared=false;
+			LogToFile(STARTUP_LOG,L"A4S Programs hook removal failed: %u",GetLastError());
+		}
+	}
 	g_bA4SStartLeftCapture=false;
 	g_bA4SQueuedStartLeftCapture=false;
+	return cleared;
 }
 
 static bool InstallA4SActivationHooks( void )
@@ -3020,25 +3139,82 @@ failed:
 static bool PinA4SMenuModule( void )
 {
 	HMODULE module=NULL;
-	return GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
-		(LPCTSTR)(ULONG_PTR)&HookInject,&module)!=FALSE;
+	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+#ifdef A4S_PRODUCT
+		(LPCTSTR)(ULONG_PTR)&A4SMenu_HookInject,&module))
+		return false;
+	HMODULE previous=(HMODULE)InterlockedCompareExchangePointer(
+		(PVOID volatile *)&g_A4SPinnedModule,module,NULL);
+	if (previous)
+		FreeLibrary(module); // The existing retained reference already owns the pin.
+	return true;
+#else
+		(LPCTSTR)(ULONG_PTR)&HookInject,&module))
+		return false;
+	return true;
+#endif
 }
 
 static void AbortA4SInitialization( HWND hookWindow )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(hookWindow);
+	// Gate every activation callback before dismantling anything. This also
+	// covers the narrow READY -> host-notification-failed rollback path.
+	InterlockedExchange(&g_A4SInitializationState,A4S_INIT_DISARMING);
+#endif
 	ClearA4SActivationHooks();
 	g_TaskbarInfos.clear();
 	if (g_Owner.m_hWnd)
 		g_Owner.DestroyWindow();
+#ifdef A4S_PRODUCT
+	const bool managersClosed=CloseManagers(false);
+	if (managersClosed)
+		ClearIatHooks();
+	else
+		LogToFile(STARTUP_LOG,L"A4S initialization rollback retained manager and IAT state after the bounded worker-stop budget");
+	// Fixed settings and embedded translations are initialized exactly once for
+	// this mapping. Keep them alive until Explorer exits, but leave a failed
+	// mapping inert; only a fresh mapping in a new Explorer may initialize again.
+	g_TaskBar=NULL;
+	g_WinStartButton=NULL;
+	InterlockedExchange(&g_A4SInitializationState,A4S_INIT_FAILED);
+	NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
+#else
 	CloseManagers(false);
 	ClearIatHooks();
 	CloseSettings();
 	if (hookWindow)
 		PostMessage(hookWindow,WM_CLOSE,0,0);
+#endif
 }
 
 static void InitStartMenuDLL( void )
 {
+#ifdef A4S_PRODUCT
+	const LONG state=InterlockedCompareExchange(&g_A4SInitializationState,
+		A4S_INIT_INITIALIZING,A4S_INIT_UNINITIALIZED);
+	if (state!=A4S_INIT_UNINITIALIZED)
+		return;
+
+	if (!EnsureA4SRuntimeInitialized())
+	{
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_FAILED);
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
+		return;
+	}
+	// Pin before creating managers, workers, or activation hooks. If rollback
+	// cannot join a worker or physically remove an OS hook, the inert callback
+	// code and retained state must remain mapped until Explorer exits.
+	if (!PinA4SMenuModule())
+	{
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_FAILED);
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
+		return;
+	}
+
+	LogToFile(STARTUP_LOG,L"A4SMenu DLL: InitStartMenuDLL");
+#else
 	static bool initCalled = false;
 	if (initCalled)
 		return;
@@ -3047,8 +3223,19 @@ static void InitStartMenuDLL( void )
 
 	LogToFile(STARTUP_LOG, L"StartMenu DLL: InitStartMenuDLL");
 	WaitDllInitThread();
+#endif
 
+	#ifdef A4S_PRODUCT
+	if (!InitializeIatHooks())
+	{
+		LogToFile(STARTUP_LOG,L"A4S activation init aborted: IAT hook storage allocation failed");
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_FAILED);
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
+		return;
+	}
+	#else
 	InitializeIatHooks();
+	#endif
 	if (!A4SMenuProfile::IsEnabled() && IsWin81Update1())
 	{
 		HMODULE dwm=GetModuleHandle(L"dwmapi.dll");
@@ -3129,7 +3316,16 @@ static void InitStartMenuDLL( void )
 
 	g_TaskbarThreadId=GetCurrentThreadId();
 	g_bTrimHooks=GetWinVersion()==WIN_VER_WIN7 && (GetSettingInt(L"CompatibilityFixes")&COMPATIBILITY_TRIM_HOOKS);
+#ifdef A4S_PRODUCT
+	if (!InitManagers(false))
+	{
+		LogToFile(STARTUP_LOG,L"A4S activation init aborted: a required manager worker could not be created");
+		AbortA4SInitialization(GetBoundA4SHost());
+		return;
+	}
+#else
 	InitManagers(false);
+#endif
 	int level=GetSettingInt(L"CrashDump");
 	if (!A4SMenuProfile::IsEnabled() && level>=1 && level<=3)
 	{
@@ -3145,11 +3341,16 @@ static void InitStartMenuDLL( void )
 
 	if (A4SMenuProfile::IsEnabled())
 	{
-		HWND hookWindow=FindWindow(L"OpenShellMenu.CStartHookWindow",L"StartHookWindow");
+	#ifdef A4S_PRODUCT
+		HWND hookWindow=GetBoundA4SHost();
+	#else
+		HWND hookWindow=FindStartHookWindow();
+	#endif
 		HWND nativeStart=IsWindow(g_TaskBar)?FindWindowEx(g_TaskBar,NULL,L"Start",NULL):NULL;
-		if (!hookWindow || !nativeStart)
+		if (!hookWindow || !nativeStart || !IsWindow(g_OwnerWindow) || !g_StartMenuMsg)
 		{
-			LogToFile(STARTUP_LOG,L"A4S activation init aborted: hook window=%p, native Start=%p",hookWindow,nativeStart);
+			LogToFile(STARTUP_LOG,L"A4S activation init aborted: hook window=%p, native Start=%p, owner=%p, command message=%u",
+				hookWindow,nativeStart,g_OwnerWindow,g_StartMenuMsg);
 			AbortA4SInitialization(hookWindow);
 			return;
 		}
@@ -3164,7 +3365,7 @@ static void InitStartMenuDLL( void )
 		// replacement Start button.
 		taskBar.startButton=nativeStart;
 
-		if (!InstallA4SActivationHooks() || !PinA4SMenuModule())
+		if (!InstallA4SActivationHooks())
 		{
 			LogToFile(STARTUP_LOG,L"A4S activation init aborted before Explorer routing became active");
 			AbortA4SInitialization(hookWindow);
@@ -3174,7 +3375,17 @@ static void InitStartMenuDLL( void )
 		// Do not intercept/unregister TwinUI's Win or Ctrl+Esc hotkeys until an
 		// exact same-thread restoration path is proven. The preview therefore
 		// routes only native Start left-click and explicit StartMenu messages.
+#ifdef A4S_PRODUCT
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_READY);
+		if (!NotifyA4SHost(A4S_MENU_DLL_STATUS_READY))
+		{
+			LogToFile(STARTUP_LOG,L"A4S activation init aborted: host acknowledgement channel unavailable");
+			AbortA4SInitialization(hookWindow);
+			return;
+		}
+#else
 		PostMessage(hookWindow,WM_CLEAR,0,0);
+#endif
 		return;
 	}
 
@@ -3209,7 +3420,7 @@ static void InitStartMenuDLL( void )
 		}
 	}
 
-	HWND hwnd=FindWindow(L"OpenShellMenu.CStartHookWindow",L"StartHookWindow");
+	HWND hwnd=FindStartHookWindow();
 	LoadLibrary(L"StartMenuDLL.dll"); // keep the DLL from unloading
 	if (hwnd) PostMessage(hwnd,WM_CLEAR,0,0); // tell the exe to unhook this hook
 	if (GetWinVersion()>=WIN_VER_WIN8)
@@ -3384,16 +3595,30 @@ static void RecreateStartButton( size_t taskbarId )
 
 static DWORD WINAPI ExitThreadProc( void *param )
 {
+#ifdef A4S_PRODUCT
+	// Product hot-unload is deliberately unsupported in the first-half host.
+	// The accepted code can create detached workers outside the activation hooks,
+	// so callback-only rundown cannot prove that every DLL stack has returned.
+	// Disarm all behavior and keep the owned mapping until Explorer exits.
+	UNREFERENCED_PARAMETER(param);
+	return 0;
+#else
 	Sleep(1000); // wait a second! hopefully by then the hooks will be finished and no more of our code will be executing
 	// send WM_CLOSE to the window in StartMenu.exe to close that process
 	if (param) PostMessage((HWND)param,WM_CLOSE,0,0);
 	FreeLibraryAndExitThread(g_Instance,0);
+#endif
 }
 
 static void CleanStartMenuDLL( void )
 {
 	if (A4SMenuProfile::IsEnabled())
 	{
+#ifdef A4S_PRODUCT
+		if (InterlockedCompareExchange(&g_A4SInitializationState,
+			A4S_INIT_DISARMING,A4S_INIT_READY)!=A4S_INIT_READY)
+			return;
+#endif
 		// This branch is intentionally symmetric with the activation-only init.
 		// It never revokes a native drop target, removes an uninstalled subclass,
 		// asks Explorer to rebuild/repaint the taskbar, or touches hot corners.
@@ -3402,14 +3627,29 @@ static void CleanStartMenuDLL( void )
 		CMenuFader::ClearAll();
 		if (g_Owner.m_hWnd)
 			g_Owner.DestroyWindow();
+#ifdef A4S_PRODUCT
+		const bool managersClosed=CloseManagers(false);
+		if (managersClosed)
+			ClearIatHooks();
+		else
+			LogToFile(STARTUP_LOG,L"A4S logical disarm retained manager and IAT state after the bounded worker-stop budget");
+#else
 		CloseManagers(false);
 		ClearIatHooks();
+#endif
+#ifndef A4S_PRODUCT
 		CloseSettings();
+#endif
 		g_TaskbarInfos.clear();
 		g_WinStartButton=NULL;
 
-		HWND hwnd=FindWindow(L"OpenShellMenu.CStartHookWindow",L"StartHookWindow");
+		HWND hwnd=FindStartHookWindow();
+#ifdef A4S_PRODUCT
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_DISARMED);
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_DISARMED);
+#else
 		CreateThread(NULL,0,ExitThreadProc,(void*)hwnd,0,NULL);
+#endif
 		return;
 	}
 
@@ -3449,7 +3689,7 @@ static void CleanStartMenuDLL( void )
 	CMenuFader::ClearAll();
 	UnhookDropTarget();
 	EnableHotkeys(HOTKEYS_CLEAR);
-	HWND hwnd=FindWindow(L"OpenShellMenu.CStartHookWindow",L"StartHookWindow");
+	HWND hwnd=FindStartHookWindow();
 	UnhookWindowsHookEx(g_ProgHook);
 	UnhookWindowsHookEx(g_StartHook);
 	if (g_StartMouseHook) UnhookWindowsHookEx(g_StartMouseHook);
@@ -3747,6 +3987,11 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 // WH_MOUSE hook for taskbar thread (Win11+)
 static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM lParam)
 {
+#ifdef A4S_PRODUCT
+	if (InterlockedCompareExchange(&g_A4SInitializationState,
+		A4S_INIT_UNINITIALIZED,A4S_INIT_UNINITIALIZED)!=A4S_INIT_READY)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+#endif
 	if (A4SMenuProfile::IsEnabled())
 	{
 		if (code==HC_ACTION)
@@ -3771,9 +4016,12 @@ static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM l
 			{
 				if (wParam==WM_LBUTTONDOWN || wParam==WM_NCLBUTTONDOWN)
 				{
-					g_bA4SStartLeftCapture=true;
-					PostMessage(taskBar->taskBar,g_StartMenuMsg,MSG_TOGGLE,A4S_MOUSE_TOGGLE);
-					return 1;
+					if (PostMessage(taskBar->taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,A4S_MOUSE_TOGGLE))
+					{
+						g_bA4SStartLeftCapture=true;
+						return 1;
+					}
+					return CallNextHookEx(NULL,code,wParam,lParam);
 				}
 				if (wParam==WM_LBUTTONDBLCLK || wParam==WM_NCLBUTTONDBLCLK)
 				{
@@ -3814,6 +4062,11 @@ static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM l
 // WH_GETMESSAGE hook for the taskbar thread
 static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lParam )
 {
+#ifdef A4S_PRODUCT
+	if (InterlockedCompareExchange(&g_A4SInitializationState,
+		A4S_INIT_UNINITIALIZED,A4S_INIT_UNINITIALIZED)!=A4S_INIT_READY)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+#endif
 	if (code==HC_ACTION && wParam && !g_bInMenu)
 	{
 		MSG *msg=(MSG*)lParam;
@@ -3826,9 +4079,17 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 				const LPARAM commandData=msg->lParam;
 				msg->message=WM_NULL;
 				TaskbarInfo *taskBar=FindTaskBarInfoBar(g_TaskBar);
-				if (taskBar && (command==MSG_TOGGLE || (command==MSG_OPEN && !CMenuContainer::IsMenuOpened())))
+				if (taskBar && (command==A4S_COMMAND_TOGGLE
+#ifndef A4S_PRODUCT
+					|| (command==MSG_OPEN && !CMenuContainer::IsMenuOpened())
+#endif
+					))
 					ToggleStartMenu(taskBar->taskbarId,commandData!=A4S_MOUSE_TOGGLE);
-				else if (command==MSG_EXIT && CMenuContainer::CanShowMenu())
+				else if (command==A4S_COMMAND_EXIT
+#ifndef A4S_PRODUCT
+					&& CMenuContainer::CanShowMenu()
+#endif
+					)
 				{
 					LRESULT res=CallNextHookEx(NULL,code,wParam,lParam);
 					CleanStartMenuDLL();
@@ -4554,26 +4815,129 @@ HBITMAP GetStartScreenIcon( int size )
 	return bitmap;
 }
 
+#ifdef A4S_PRODUCT
+static BOOL WINAPI RequestA4SShutdown( HWND taskbarWindow )
+{
+	if (!IsWindow(taskbarWindow))
+		return FALSE;
+
+	UINT message=RegisterWindowMessage(A4S_MENU_COMMAND_MESSAGE_W);
+	if (!message)
+		return FALSE;
+	return PostMessage(taskbarWindow,message,A4S_MENU_COMMAND_EXIT,0)!=FALSE;
+}
+
+extern "C" const A4SMenuApi *WINAPI A4SMenu_GetApi( UINT32 requestedAbi )
+{
+	static const A4SMenuApi api=
+	{
+		sizeof(A4SMenuApi),
+		A4S_MENU_ABI_VERSION,
+		A4S_MENU_PRODUCT_VERSION,
+		0,
+		RequestA4SShutdown,
+	};
+	return requestedAbi==A4S_MENU_ABI_VERSION?&api:NULL;
+}
+
+extern "C" LRESULT CALLBACK A4SMenu_HookInject( int code, WPARAM wParam, LPARAM lParam )
+{
+	if (code!=HC_ACTION || wParam!=PM_REMOVE || !lParam)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+
+	MSG *bootstrap=(MSG *)lParam;
+	const UINT bootstrapMessage=RegisterWindowMessage(A4S_DLL_BOOTSTRAP_MESSAGE_W);
+	if (!bootstrapMessage || bootstrap->message!=bootstrapMessage)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+	const HWND bootstrapTarget=bootstrap->hwnd;
+	const HWND attemptHost=(HWND)bootstrap->wParam;
+	const UINT_PTR attemptCookie=(UINT_PTR)bootstrap->lParam;
+	// The bootstrap is hook-private and must never reach Explorer's taskbar
+	// window procedure after this callback has authenticated or rejected it.
+	bootstrap->message=WM_NULL;
+	bootstrap->wParam=0;
+	bootstrap->lParam=0;
+
+	// Fail closed inside the injected process as well as in the host. A target
+	// thread ID can be recycled in the narrow interval between host validation
+	// and SetWindowsHookEx; accept only the authenticated message delivered to
+	// the actual taskbar thread of this process.
+	DWORD taskbarProcess=0;
+	HWND taskbar=FindWindow(L"Shell_TrayWnd",NULL);
+	const DWORD taskbarThread=taskbar?
+		GetWindowThreadProcessId(taskbar,&taskbarProcess):0;
+	if (bootstrapTarget!=taskbar || taskbarThread!=GetCurrentThreadId() ||
+		taskbarProcess!=GetCurrentProcessId())
+		return CallNextHookEx(NULL,code,wParam,lParam);
+
+	const LONG state=InterlockedCompareExchange(&g_A4SInitializationState,
+		A4S_INIT_UNINITIALIZED,A4S_INIT_UNINITIALIZED);
+	if (state!=A4S_INIT_UNINITIALIZED && state!=A4S_INIT_READY &&
+		state!=A4S_INIT_FAILED && state!=A4S_INIT_DISARMED)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+	if (!BindA4SAttempt(attemptHost,attemptCookie))
+		return CallNextHookEx(NULL,code,wParam,lParam);
+
+	if (state==A4S_INIT_UNINITIALIZED)
+	{
+		InitStartMenuDLL();
+	}
+	else if (state==A4S_INIT_READY)
+	{
+		// A host may reinstall the bootstrap hook after a lost READY message or
+		// timeout. Re-advertise the committed state instead of leaving the host in
+		// a retry loop while this mapping already owns the activation hooks.
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_READY);
+	}
+	else if (state==A4S_INIT_FAILED)
+	{
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
+	}
+	else if (state==A4S_INIT_DISARMED)
+	{
+		// Manager restartability is not yet part of the first-half contract. A
+		// disarmed mapping remains inert until Explorer exits; never reinitialize
+		// containers that still own released shell/cache objects.
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_DISARMED);
+	}
+	return CallNextHookEx(NULL,code,wParam,lParam);
+}
+#endif
+
 // WH_GETMESSAGE hook for the explorer's GUI thread. The start menu exe uses this hook to inject code into the explorer process
 STARTMENUAPI LRESULT CALLBACK HookInject( int code, WPARAM wParam, LPARAM lParam )
 {
+#ifdef A4S_PRODUCT
+	return A4SMenu_HookInject(code,wParam,lParam);
+#else
 	if (code==HC_ACTION && !g_TaskBar)
 		InitStartMenuDLL();
 	return CallNextHookEx(NULL,code,wParam,lParam);
+#endif
 }
 
-STARTMENUAPI void InitManagers( bool bNohook )
+STARTMENUAPI bool InitManagers( bool bNohook )
 {
 	InitializeSkinManager(bNohook);
-	g_ItemManager.Init(); // must be after skin manager because it uses the metro colors
-	g_SearchManager.Init();
+	if (!g_ItemManager.Init()) // must be after skin manager because it uses the metro colors
+		return false;
+	if (!g_SearchManager.Init())
+		return false;
+	return true;
 }
 
-STARTMENUAPI void CloseManagers( bool bNohook )
+STARTMENUAPI bool CloseManagers( bool bNohook )
 {
-	g_SearchManager.Close();
-	g_ItemManager.Close();
+	const bool searchClosed=g_SearchManager.Close();
+	// Search workers dereference the item manager. If a bounded product stop
+	// cannot join them, retain the entire dependency chain intact and inert.
+	if (!searchClosed)
+		return false;
+	const bool itemsClosed=g_ItemManager.Close();
+	if (!itemsClosed)
+		return false;
 	CloseSkinManager(bNohook);
+	return true;
 }
 
 STARTMENUAPI bool DllGetSettingBool( const wchar_t *name )

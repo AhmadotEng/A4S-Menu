@@ -7,7 +7,9 @@
 #include "MenuContainer.h"
 #include "MetroLinkManager.h"
 #include "Settings.h"
+#ifndef A4S_PRODUCT
 #include "SettingsUIHelper.h"
+#endif
 #include "SettingsUI.h"
 #include "FNVHash.h"
 #include "ResourceHelper.h"
@@ -51,30 +53,68 @@ CSearchManager::~CSearchManager( void )
 	Close();
 }
 
-void CSearchManager::Init( void )
+bool CSearchManager::Init( void )
 {
 	m_bInitialized=true;
 	for (int i=0;i<LOCK_COUNT;i++)
 		InitializeCriticalSection(&m_CriticalSections[i]);
 	m_SearchEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
 	m_ExitEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
+#ifdef A4S_PRODUCT
+	if (!m_SearchEvent || !m_ExitEvent)
+	{
+		Close();
+		return false;
+	}
+#endif
 	for (int i=0;i<_countof(m_SearchThreads);i++)
+	{
 		m_SearchThreads[i]=CreateThread(NULL,0,StaticSearchThread,this,0,NULL);
+#ifdef A4S_PRODUCT
+		if (!m_SearchThreads[i])
+		{
+			Close();
+			return false;
+		}
+#endif
+	}
 	m_MainThreadId=GetCurrentThreadId();
 	LoadItemRanks();
+	return true;
 }
 
-void CSearchManager::Close( void )
+bool CSearchManager::Close( void )
 {
-	if (!m_bInitialized) return;
-	SetEvent(m_ExitEvent);
-	WaitForMultipleObjects(_countof(m_SearchThreads),m_SearchThreads,TRUE,INFINITE);
-	CloseHandle(m_SearchEvent);
+	if (!m_bInitialized) return true;
+	if (m_ExitEvent)
+		SetEvent(m_ExitEvent);
+#ifdef A4S_PRODUCT
+	const DWORD closeBudget=1500;
+	const DWORD closeStart=GetTickCount();
 	for (int i=0;i<_countof(m_SearchThreads);i++)
-		CloseHandle(m_SearchThreads[i]);
+	{
+		if (!m_SearchThreads[i])
+			continue;
+		const DWORD elapsed=GetTickCount()-closeStart;
+		const DWORD remaining=elapsed<closeBudget?closeBudget-elapsed:0;
+		if (WaitForSingleObject(m_SearchThreads[i],remaining)!=WAIT_OBJECT_0)
+			return false;
+	}
+#else
+	WaitForMultipleObjects(_countof(m_SearchThreads),m_SearchThreads,TRUE,INFINITE);
+#endif
+	if (m_SearchEvent) CloseHandle(m_SearchEvent);
+	if (m_ExitEvent) CloseHandle(m_ExitEvent);
+	m_SearchEvent=m_ExitEvent=NULL;
+	for (int i=0;i<_countof(m_SearchThreads);i++)
+	{
+		if (m_SearchThreads[i]) CloseHandle(m_SearchThreads[i]);
+		m_SearchThreads[i]=NULL;
+	}
 	for (int i=0;i<LOCK_COUNT;i++)
 		DeleteCriticalSection(&m_CriticalSections[i]);
 	m_bInitialized=false;
+	return true;
 }
 
 static CString ParseAutoCompletePath( const CString &searchText )

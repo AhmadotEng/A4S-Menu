@@ -34,6 +34,10 @@ void InitLog( int categories, const wchar_t *fname );
 void CloseLog( void );
 void LogMessage( const wchar_t *text, ... );
 
+#ifdef A4S_PRODUCT
+#define STARTUP_LOG A4S_MENU_STARTUP_LOG
+#else
 #define STARTUP_LOG L"Software\\OpenShell\\StartMenu\\Settings|LogStartup|%LOCALAPPDATA%\\OpenShell\\StartupLog.txt"
+#endif
 
 void LogPropertyStore(TLogCategory category, IPropertyStore* store);

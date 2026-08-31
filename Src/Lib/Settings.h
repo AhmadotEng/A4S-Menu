@@ -126,6 +126,11 @@ public:
 };
 
 void InitSettings( CSetting *pSettings, TSettingsComponent component, ICustomSettings *pCustom );
+const wchar_t *GetSettingsRegPath( void );
+// Overrides the registry and policy paths used by one component. The caller
+// must set the override before InitSettings. Passing NULL restores the
+// component's built-in paths.
+void SetSettingsRegPathOverride( TSettingsComponent component, const wchar_t *regPath, const wchar_t *gpPath );
 void LoadSettings( void );
 void SaveSettings( void );
 void UpdateDefaultSettings( void );

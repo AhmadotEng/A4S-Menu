@@ -196,7 +196,7 @@ class CUserWindow: public CWindowImpl<CUserWindow>
 {
 public:
 	CUserWindow( void ) { m_pOwner=NULL; m_Bits=NULL; m_bDefaultImage=true; m_Bitmap=m_UserBitmap=m_TimerBitmap=NULL; m_Timer=0; m_Size.cx=m_Size.cy=0; }
-	DECLARE_WND_CLASS_EX(L"OpenShell.CUserWindow",0,COLOR_MENU)
+	DECLARE_WND_CLASS_EX(A4S_MENU_USER_WINDOW_CLASS,0,COLOR_MENU)
 
 	// message handlers
 	BEGIN_MSG_MAP( CUserWindow )
@@ -260,7 +260,7 @@ public:
 	{
 		static ATL::CWndClassInfo wc =
 		{
-			{sizeof(WNDCLASSEX),CS_DROPSHADOW|CS_DBLCLKS,StartWindowProc,0,0,NULL,NULL,NULL,(HBRUSH)(COLOR_MENU+1),NULL,L"OpenShell.CMenuContainer",NULL},
+			{sizeof(WNDCLASSEX),CS_DROPSHADOW|CS_DBLCLKS,StartWindowProc,0,0,NULL,NULL,NULL,(HBRUSH)(COLOR_MENU+1),NULL,A4S_MENU_CONTAINER_CLASS,NULL},
 			NULL,NULL,IDC_ARROW,TRUE,0,_T("")
 		};
 		return wc;
@@ -1113,7 +1113,7 @@ public:
 	{
 		static ATL::CWndClassInfo wc =
 		{
-			{sizeof(WNDCLASSEX),CS_DROPSHADOW|CS_DBLCLKS,StartWindowProc,0,0,NULL,NULL,NULL,(HBRUSH)(COLOR_MENU+1),NULL,L"OpenShell.CMenuContainer",NULL},
+			{sizeof(WNDCLASSEX),CS_DROPSHADOW|CS_DBLCLKS,StartWindowProc,0,0,NULL,NULL,NULL,(HBRUSH)(COLOR_MENU+1),NULL,A4S_MENU_CONTAINER_CLASS,NULL},
 			NULL,NULL,IDC_ARROW,TRUE,0,_T("")
 		};
 		return wc;
@@ -1129,7 +1129,7 @@ class CMenuFader: public CWindowImpl<CMenuFader>
 public:
 	CMenuFader( HBITMAP bmp, HRGN region, int duration, RECT &rect );
 	~CMenuFader( void );
-	DECLARE_WND_CLASS_EX(L"OpenShell.CMenuFader",0,COLOR_MENU)
+	DECLARE_WND_CLASS_EX(A4S_MENU_FADER_CLASS,0,COLOR_MENU)
 
 	// message handlers
 	BEGIN_MSG_MAP( CMenuFader )

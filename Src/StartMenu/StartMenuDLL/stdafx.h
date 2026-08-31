@@ -25,3 +25,4 @@
 #include "StringUtils.h"
 #include "TrackResources.h"
 #include "Assert.h"
+#include "A4SProductRuntime.h"

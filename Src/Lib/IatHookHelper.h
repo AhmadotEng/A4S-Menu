@@ -17,7 +17,7 @@ struct IatHookData
 	IMAGE_THUNK_DATA *thunk; // the IAT thunk
 };
 
-void InitializeIatHooks( void );
+bool InitializeIatHooks( void );
 IatHookData *SetIatHook( HMODULE hPatchedModule, const char *targetModule, const char *targetProc, void *newProc );
 void ClearIatHook( IatHookData *hook );
 void ClearIatHooks( void );

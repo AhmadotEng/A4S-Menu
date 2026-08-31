@@ -3288,6 +3288,10 @@ bool g_CustomScrollbarActive;
 
 static HRESULT STDAPICALLTYPE DrawThemeBackgroundSkin( HTHEME hTheme, HDC hdc, int iPartId, int iStateId, LPCRECT pRect, LPCRECT pClipRect )
 {
+#ifdef A4S_PRODUCT
+	if (!IsA4SRuntimeReady())
+		return DrawThemeBackground(hTheme,hdc,iPartId,iStateId,pRect,pClipRect);
+#endif
 	if (g_CustomScrollbarThread && g_CustomScrollbarThread==GetCurrentThreadId() && hTheme==g_CustomScrollbarTheme)
 	{
 		CProgramsTree::DrawScrollbarBackground(hdc,iPartId,iStateId,pRect);
@@ -3299,7 +3303,7 @@ static HRESULT STDAPICALLTYPE DrawThemeBackgroundSkin( HTHEME hTheme, HDC hdc, i
 void InitializeSkinManager( bool bInitIat )
 {
 	if (bInitIat)
-		InitializeIatHooks();
+		(void)InitializeIatHooks();
 	HMODULE hComCtl32=GetModuleHandle(L"comctl32.dll");
 	if (hComCtl32)
 		g_DrawThemeBackgroundHook=SetIatHook(hComCtl32,"uxtheme.dll","DrawThemeBackground",DrawThemeBackgroundSkin);
@@ -3346,9 +3350,24 @@ void InitializeSkinManager( bool bInitIat )
 
 void CloseSkinManager( bool bCloseIat )
 {
+#ifdef A4S_PRODUCT
+	// DISARMING is published before this taskbar-thread cleanup begins, so new
+	// callbacks already pass through. Clear the custom-scrollbar observation
+	// state and neutralize the IAT trampoline before releasing skin resources.
+	g_CustomScrollbarThread=0;
+	g_CustomScrollbarTheme=NULL;
+	g_CustomScrollbarBackground=NULL;
+	g_CustomScrollbarWindow=NULL;
+	g_CustomScrollbarOwnerWindow=NULL;
+	g_CustomScrollbarActive=false;
+	ClearIatHook(g_DrawThemeBackgroundHook);
+	g_DrawThemeBackgroundHook=NULL;
+	CMenuContainer::s_Skin.Reset();
+#else
 	CMenuContainer::s_Skin.Reset();
 	ClearIatHook(g_DrawThemeBackgroundHook);
 	g_DrawThemeBackgroundHook=NULL;
+#endif
 	if (bCloseIat)
 		ClearIatHooks();
 }

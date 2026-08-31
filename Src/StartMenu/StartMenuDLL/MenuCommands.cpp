@@ -10,7 +10,9 @@
 #include "StartMenuDLL.h"
 #include "Settings.h"
 #include "SettingsUI.h"
+#ifndef A4S_PRODUCT
 #include "SettingsUIHelper.h"
+#endif
 #include "FileHelper.h"
 #include "Translations.h"
 #include "LogManager.h"
@@ -219,7 +221,11 @@ void CMenuContainer::ExecuteCommand( const wchar_t *command, bool bElevated, boo
 		wchar_t exe[_MAX_PATH];
 		GetModuleFileName(_AtlBaseModule.GetModuleInstance(),exe,_countof(exe));
 		PathRemoveFileSpec(exe);
+#ifdef A4S_PRODUCT
+		PathAppend(exe,A4S_PRODUCT_HOST_FILENAME_W);
+#else
 		PathAppend(exe,L"StartMenu.exe");
+#endif
 
 		RECT rc;
 		if (m_bDestroyed)
@@ -958,7 +964,13 @@ static bool ProceedWithShutdown(DWORD flags)
 	WCHAR message[MAX_PATH]{};
 	LoadString(GetModuleHandle(L"user32.dll"), msgId, message, _countof(message));
 
-	return MessageBox(NULL, message, L"Open-Shell", MB_YESNO | MB_ICONEXCLAMATION | MB_DEFBUTTON1 | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_SERVICE_NOTIFICATION) != IDNO;
+	return MessageBox(NULL, message,
+#ifdef A4S_PRODUCT
+		A4S_PRODUCT_NAME_W,
+#else
+		L"Open-Shell",
+#endif
+		MB_YESNO | MB_ICONEXCLAMATION | MB_DEFBUTTON1 | MB_SYSTEMMODAL | MB_SETFOREGROUND | MB_SERVICE_NOTIFICATION) != IDNO;
 }
 
 static bool ExecuteShutdownCommand(TMenuID menuCommand)
@@ -2497,7 +2509,12 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 					if (n>0)
 						InsertMenu(menu,insertBefore++,MF_BYPOSITION|MF_SEPARATOR,0,0);
 					if (bPin)
-						InsertMenu(menu,insertBefore++,MF_BYPOSITION|MF_STRING,CMD_PINSETTING,FindTranslation(L"Menu.PinStartCs",L"Pin to Start menu (Open-Shell)"));
+						InsertMenu(menu,insertBefore++,MF_BYPOSITION|MF_STRING,CMD_PINSETTING,FindTranslation(L"Menu.PinStartCs",
+#ifdef A4S_PRODUCT
+							L"Pin to start menu"));
+#else
+							L"Pin to Start menu (Open-Shell)"));
+#endif
 					if (bExplore)
 						InsertMenu(menu,insertBefore++,MF_BYPOSITION|MF_STRING,CMD_EXPLORE,FindTranslation(L"Menu.Explore",L"&Explore"));
 					if (!last)
@@ -3022,8 +3039,8 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 			if (m_FolderHash[0])
 			{
 				CRegKey regOrder;
-				if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order")!=ERROR_SUCCESS)
-					regOrder.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order");
+				if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER)!=ERROR_SUCCESS)
+					regOrder.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER);
 				wchar_t name[100];
 				Sprintf(name,_countof(name),L"%08X",m_FolderHash[0]);
 				if (m_Options&CONTAINER_AUTOSORT)

@@ -6,7 +6,11 @@
 
 #include <vector>
 
-#ifdef CLASSICSTARTMENUDLL_EXPORTS
+#ifdef A4S_PRODUCT
+// The product DLL exposes only the versioned C ABI from A4SProductApi.h.  The
+// legacy C++ surface remains internal to the reused sources.
+#define STARTMENUAPI
+#elif defined(CLASSICSTARTMENUDLL_EXPORTS)
 #define STARTMENUAPI __declspec(dllexport)
 #else
 #define STARTMENUAPI __declspec(dllimport)
@@ -21,9 +25,14 @@ STARTMENUAPI LRESULT CALLBACK HookInject( int code, WPARAM wParam, LPARAM lParam
 // Toggle the start menu. bKeyboard - set to true to show the keyboard cues
 STARTMENUAPI HWND ToggleStartMenu( int taskbarId, bool bKeyboard );
 
-STARTMENUAPI void InitManagers( bool bNohook );
-STARTMENUAPI void CloseManagers( bool bNohook );
+STARTMENUAPI bool InitManagers( bool bNohook );
+STARTMENUAPI bool CloseManagers( bool bNohook );
 STARTMENUAPI void WaitDllInitThread( void );
+#ifdef A4S_PRODUCT
+// Initializes fixed settings and embedded translations on the calling thread.
+// This must be called from the injected hook, never from DllMain.
+bool EnsureA4SRuntimeInitialized( void );
+#endif
 
 STARTMENUAPI bool DllGetSettingBool( const wchar_t *name );
 STARTMENUAPI int DllGetSettingInt( const wchar_t *name );

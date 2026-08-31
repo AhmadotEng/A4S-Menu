@@ -94,7 +94,11 @@ void CProgramsTree::Create( CMenuContainer *pOwner )
 {
 	m_pOwner=pOwner;
 	const DWORD tooltipStyle=A4SMenuProfile::IsEnabled()?TVS_NOTOOLTIPS:(CMenuContainer::s_TipHideTime?TVS_INFOTIP:0);
-	HWND hWnd=CreateWindowEx(0,WC_TREEVIEW,NULL,WS_CHILD|TVS_EDITLABELS|TVS_FULLROWSELECT|tooltipStyle|TVS_NOHSCROLL|TVS_SHOWSELALWAYS|TVS_NONEVENHEIGHT,0,0,0,0,pOwner->m_hWnd,NULL,g_Instance,NULL);
+	DWORD treeStyle=WS_CHILD|TVS_EDITLABELS|TVS_FULLROWSELECT|tooltipStyle|TVS_NOHSCROLL|TVS_SHOWSELALWAYS|TVS_NONEVENHEIGHT;
+#ifdef A4S_PRODUCT
+	treeStyle|=TVS_DISABLEDRAGDROP;
+#endif
+	HWND hWnd=CreateWindowEx(0,WC_TREEVIEW,NULL,treeStyle,0,0,0,0,pOwner->m_hWnd,NULL,g_Instance,NULL);
 	TreeView_SetExtendedStyle(hWnd,TVS_EX_AUTOHSCROLL,TVS_EX_AUTOHSCROLL);
 	const MenuSkin &skin=CMenuContainer::s_Skin;
 	m_TreeTheme=OpenThemeData(hWnd,L"treeview");
@@ -115,8 +119,10 @@ void CProgramsTree::Create( CMenuContainer *pOwner )
 	m_DropLocation=DROP_NOWHERE;
 	m_DropTarget=NULL;
 	m_bRefreshPosted=false;
+#ifndef A4S_PRODUCT
 	m_pDropTargetProxy=new CDropTargetProxy(this);
 	RegisterDragDrop(hWnd,m_pDropTargetProxy);
+#endif
 	m_LastMousePos.x=m_LastMousePos.y=-1;
 	s_bFoldersFirst=GetSettingBool(L"FoldersFirst");
 
@@ -265,9 +271,12 @@ LRESULT CProgramsTree::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 		RemoveProp(m_hWnd,L"A4SMenu.ScrollbarPulse");
 		RemoveProp(m_hWnd,L"A4SMenu.ScrollbarInputCount");
 	}
-	m_pDropTargetProxy->Reset();
+#ifndef A4S_PRODUCT
+	if (m_pDropTargetProxy)
+		m_pDropTargetProxy->Reset();
 	m_pDropTargetProxy=NULL;
 	RevokeDragDrop(m_hWnd);
+#endif
 	ImageList_Destroy(m_ImageList);
 	m_ImageList=NULL;
 	if (m_TreeTheme)
@@ -311,6 +320,12 @@ LRESULT CProgramsTree::OnSingleExpand( int idCtrl, LPNMHDR pnmh, BOOL& bHandled 
 
 LRESULT CProgramsTree::OnBeginDrag( int idCtrl, LPNMHDR pnmh, BOOL& bHandled )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(idCtrl);
+	UNREFERENCED_PARAMETER(pnmh);
+	bHandled=TRUE;
+	return 0;
+#else
 	NMTREEVIEW *pDrag=(NMTREEVIEW*)pnmh;
 	CTreeItem *pItem=(CTreeItem*)pDrag->itemNew.lParam;
 	if (!pItem) return 0;
@@ -327,6 +342,7 @@ LRESULT CProgramsTree::OnBeginDrag( int idCtrl, LPNMHDR pnmh, BOOL& bHandled )
 	m_DropLocation=DROP_NOWHERE;
 	m_DragItem=NULL;
 	return 0;
+#endif
 }
 
 LRESULT CProgramsTree::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
@@ -1073,8 +1089,8 @@ void CProgramsTree::AddMetroApps( std::vector<CTreeItem*> &items )
 	ULONGLONG curTime;
 	GetSystemTimeAsFileTime((FILETIME*)&curTime);
 	CRegKey regKey;
-	if (regKey.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu",KEY_WRITE)!=ERROR_SUCCESS)
-		regKey.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu");
+	if (regKey.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT,KEY_WRITE)!=ERROR_SUCCESS)
+		regKey.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT);
 	regKey.SetQWORDValue(L"LastAppsTime",curTime);
 }
 
@@ -1202,7 +1218,7 @@ void CProgramsTree::GetFolderItems( std::vector<CTreeItem*> &items, HTREEITEM hP
 		pTreeItem->bAutoSort=false;
 	else
 		m_bAutoSort=false;
-	if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order",KEY_READ)==ERROR_SUCCESS)
+	if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER,KEY_READ)==ERROR_SUCCESS)
 	{
 		wchar_t name[100];
 		{
@@ -1913,8 +1929,8 @@ void CProgramsTree::OrderElements( HTREEITEM hChild, HTREEITEM hParent, const st
 	// save order
 	CRegKey regOrder;
 	wchar_t name[100];
-	if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order")!=ERROR_SUCCESS)
-		regOrder.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order");
+	if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER)!=ERROR_SUCCESS)
+		regOrder.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER);
 
 	Sprintf(name,_countof(name),L"%08X",folderHash);
 	if (bAutoSort)
@@ -1977,8 +1993,8 @@ void CProgramsTree::SaveRenamedOrder( HTREEITEM hItem, const CItemManager::ItemI
 	// save order
 	CRegKey regOrder;
 	wchar_t name[100];
-	if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order")!=ERROR_SUCCESS)
-		regOrder.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order");
+	if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER)!=ERROR_SUCCESS)
+		regOrder.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER);
 
 	Sprintf(name,_countof(name),L"%08X",folderHash);
 	regOrder.SetBinaryValue(name,&order[0],(int)order.size()*4);

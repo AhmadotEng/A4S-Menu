@@ -15,7 +15,9 @@
 #include "LogManager.h"
 #include "FNVHash.h"
 #include "ResourceHelper.h"
+#ifndef A4S_PRODUCT
 #include "SettingsUIHelper.h"
+#endif
 #include "SettingsUI.h"
 #include "A4SMenuProfile.h"
 #include "MetroLinkManager.h"
@@ -4723,8 +4725,8 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 		ULONGLONG curTime;
 		GetSystemTimeAsFileTime((FILETIME*)&curTime);
 		CRegKey regKey;
-		if (regKey.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu",KEY_WRITE)!=ERROR_SUCCESS)
-			regKey.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu");
+		if (regKey.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT,KEY_WRITE)!=ERROR_SUCCESS)
+			regKey.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT);
 
 		if (m_pParent->m_Items[m_ParentIndex].id==MENU_PROGRAMS)
 			regKey.SetQWORDValue(L"LastProgramsTime",curTime);
@@ -4910,8 +4912,10 @@ LRESULT CMenuContainer::OnCreate( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 		}
 		NotifyWinEvent(EVENT_SYSTEM_MENUPOPUPSTART,m_hWnd,OBJID_CLIENT,CHILDID_SELF);
 	}
+#ifndef A4S_PRODUCT
 	m_pDropTargetProxy=new CDropTargetProxy(this);
 	RegisterDragDrop(m_hWnd,m_pDropTargetProxy);
+#endif
 	if (!m_bSubMenu && s_pFrameworkInputPane)
 		s_pFrameworkInputPane->AdviseWithHWND(m_hWnd,this,&m_InputCookie);
 	PlayMenuSound(m_bSubMenu?SOUND_POPUP:SOUND_MAIN);
@@ -5972,7 +5976,7 @@ LRESULT CMenuContainer::OnTimer( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& 
 			else
 				name[0]=0;
 
-			if (_wcsicmp(name,L"OpenShell.CMenuContainer")!=0)
+			if (_wcsicmp(name,A4S_MENU_CONTAINER_CLASS)!=0)
 			{
 				int dt=GetMessageTime()-m_DragTime;
 				if (dt>GetSettingInt(L"DragHideDelay"))
@@ -6790,9 +6794,12 @@ LRESULT CMenuContainer::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 	}
 	m_pDragObject=NULL;
 	m_pDropTargetHelper=NULL;
-	m_pDropTargetProxy->Reset();
+#ifndef A4S_PRODUCT
+	if (m_pDropTargetProxy)
+		m_pDropTargetProxy->Reset();
 	m_pDropTargetProxy=NULL;
 	RevokeDragDrop(m_hWnd);
+#endif
 	// remember the scroll position
 	if (m_ScrollHeight>0 && m_FolderHash[0])
 		s_MenuScrolls[m_FolderHash[0]]=m_ScrollOffset;
@@ -7629,8 +7636,8 @@ void CMenuContainer::SaveItemOrder( const std::vector<SortMenuItem> &items )
 		// save item names in the registry
 		CRegKey regOrder;
 		wchar_t name[100];
-		if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order")!=ERROR_SUCCESS)
-			regOrder.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order");
+		if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER)!=ERROR_SUCCESS)
+			regOrder.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER);
 		std::vector<unsigned int> hashes[2];
 		for (std::vector<SortMenuItem>::const_iterator it=items.begin();it!=items.end();++it)
 		{
@@ -7664,7 +7671,7 @@ void CMenuContainer::LoadItemOrder( void )
 		// load item names from the registry
 		std::vector<unsigned int> hashes[2];
 		CRegKey regOrder;
-		if (regOrder.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Order",KEY_READ)==ERROR_SUCCESS)
+		if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER,KEY_READ)==ERROR_SUCCESS)
 		{
 			wchar_t name[100];
 			{
@@ -7828,8 +7835,8 @@ void CMenuContainer::SaveMRUShortcuts( void )
 {
 	Assert(s_bMRULoaded);
 	CRegKey regMRU;
-	if (regMRU.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\MRU",KEY_READ|KEY_WRITE)!=ERROR_SUCCESS)
-		regMRU.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\MRU");
+	if (regMRU.Open(HKEY_CURRENT_USER,A4S_MENU_REG_MRU,KEY_READ|KEY_WRITE)!=ERROR_SUCCESS)
+		regMRU.Create(HKEY_CURRENT_USER,A4S_MENU_REG_MRU);
 
 	bool bDelete=false;
 	for (int i=0;i<MRU_PROGRAMS_COUNT;i++)
@@ -7856,7 +7863,7 @@ void CMenuContainer::LoadMRUShortcuts( void )
 	for (int i=0;i<MRU_PROGRAMS_COUNT;i++)
 		s_MRUShortcuts[i].Empty();
 	CRegKey regMRU;
-	if (regMRU.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\MRU",KEY_READ)==ERROR_SUCCESS)
+	if (regMRU.Open(HKEY_CURRENT_USER,A4S_MENU_REG_MRU,KEY_READ)==ERROR_SUCCESS)
 	{
 		for (int i=0;i<MRU_PROGRAMS_COUNT;i++)
 		{
@@ -8180,7 +8187,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_bWin7Style=GetSettingInt(L"MenuStyle")==MENU_WIN7;
 
 	if (!s_StartMenuMsg)
-		s_StartMenuMsg=RegisterWindowMessage(L"OpenShellMenu.StartMenuMsg");
+		s_StartMenuMsg=RegisterWindowMessage(A4S_MENU_START_MESSAGE);
 	s_StartMenuParams.uEdge=0xFFFFFFFF;
 	s_TaskBarId=taskbarId;
 	TaskbarInfo *taskBar=GetTaskbarInfo(taskbarId);
@@ -8201,7 +8208,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	int categories=0;
 	{
 		CRegKey regKey;
-		if (regKey.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu\\Settings",KEY_READ|KEY_WOW64_64KEY)==ERROR_SUCCESS)
+		if (regKey.Open(HKEY_CURRENT_USER,A4S_MENU_REG_SETTINGS,KEY_READ|KEY_WOW64_64KEY)==ERROR_SUCCESS)
 		{
 			DWORD log;
 			if (regKey.QueryDWORDValue(L"LogCategories",log)==ERROR_SUCCESS)
@@ -8213,7 +8220,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #endif
 	if (categories!=0)
 	{
-		wchar_t path[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell";
+		wchar_t path[_MAX_PATH]=A4S_MENU_DATA_DIR;
 		DoEnvironmentSubst(path,_MAX_PATH);
 		SHCreateDirectory(NULL,path);
 		Strcat(path,_countof(path),L"\\StartMenuLog.txt");
@@ -8266,7 +8273,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_ShellUrlFormat=RegisterClipboardFormat(CFSTR_INETURL);
 	s_DescriptorFormat=RegisterClipboardFormat(CFSTR_FILEDESCRIPTOR);
 	s_ContentsFormat=RegisterClipboardFormat(CFSTR_FILECONTENTS);
-	s_MetroLinkFormat=RegisterClipboardFormat(L"OpenShell.MetroLink");
+	s_MetroLinkFormat=RegisterClipboardFormat(A4S_MENU_METRO_CLIPBOARD);
 	s_PreferredEffectFormat=RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT);
 	s_DropDescriptionFormat=RegisterClipboardFormat(CFSTR_DROPDESCRIPTION);
 	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
@@ -8277,7 +8284,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_bDisableHover=false;
 	s_bDragClosed=false;
 	s_bPendingSearchEnter=false;
+#ifndef A4S_PRODUCT
 	InitTouchHelper();
+#endif
 
 	bool bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
 	wchar_t wabPath[_MAX_PATH]=L"%ProgramFiles%\\Windows Mail\\wab.exe";
@@ -9507,8 +9516,13 @@ void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )
 		ULONGLONG curTime;
 		GetSystemTimeAsFileTime((FILETIME*)&curTime);
 		CRegKey regKey;
+#ifdef A4S_PRODUCT
+		if (regKey.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT,KEY_WRITE)!=ERROR_SUCCESS)
+			regKey.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT);
+#else
 		if (regKey.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StarMenu",KEY_WRITE)!=ERROR_SUCCESS)
 			regKey.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu");
+#endif
 		regKey.SetQWORDValue(L"LastProgramsTime",curTime);
 		if (s_OldMenuState.mode!=MODE_SEARCH)
 			m_pProgramsTree->SetFocus();

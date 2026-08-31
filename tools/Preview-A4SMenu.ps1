@@ -38,4 +38,4 @@ if ($CenterBottom) {
 
 $preview = Start-Process -FilePath $previewExe -ArgumentList $previewArgs -PassThru
 $placement = if ($CenterBottom) { 'center-bottom comparison mode' } else { 'bottom-left mode' }
-Write-Host "A4S Menu standalone preview started in $placement (PID $($preview.Id)). StartAllBack remains active."
+Write-Host "A4S Menu standalone preview started in $placement (PID $($preview.Id)). Explorer remains untouched."

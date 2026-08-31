@@ -534,7 +534,7 @@ CItemManager::~CItemManager( void )
 	Close();
 }
 
-void CItemManager::Init( void )
+bool CItemManager::Init( void )
 {
 	m_MainThreadId=GetCurrentThreadId();
 
@@ -630,6 +630,7 @@ void CItemManager::Init( void )
 		InitializeSRWLock(&m_RWLocks[i]);
 	for (int i=0;i<LOCK_COUNT;i++)
 		InitializeCriticalSection(&m_CriticalSections[i]);
+	m_bInitialized=true;
 	m_bPreloadIcons=GetSettingBool(L"PreCacheIcons");
 	m_bPreloadFavorites=(GetSettingInt(L"Favorites")==2);
 
@@ -639,35 +640,72 @@ void CItemManager::Init( void )
 	m_ExitEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 	m_DoneEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 
+#ifdef A4S_PRODUCT
+	if (!m_StartEvent || !m_WorkEvent || !m_ExitEvent || !m_DoneEvent)
+	{
+		Close();
+		return false;
+	}
+#endif
+
 	m_PreloadItemsThread=CreateThread(NULL,0,StaticPreloadItemsThread,this,0,&m_PreloadItemsThreadId);
 	m_RefreshInfoThread=CreateThread(NULL,0,StaticRefreshInfoThread,this,0,&m_RefreshInfoThreadId);
 
+#ifdef A4S_PRODUCT
+	if (!m_PreloadItemsThread || !m_RefreshInfoThread)
+	{
+		Close();
+		return false;
+	}
+#endif
+
 	LoadOldItems();
 
-	m_bInitialized=true;
+	return true;
 }
 
-void CItemManager::Close( void )
+bool CItemManager::Close( void )
 {
-	if (!m_bInitialized) return;
+	if (!m_bInitialized) return true;
 
 	m_LoadingStage=LOAD_STOPPING;
-	SetEvent(m_ExitEvent);
+	if (m_ExitEvent)
+		SetEvent(m_ExitEvent);
+#ifdef A4S_PRODUCT
+	const DWORD closeBudget=1500;
+	const DWORD closeStart=GetTickCount();
+	HANDLE threads[]={m_PreloadItemsThread,m_RefreshInfoThread,m_SaveCacheThread};
+	for (int i=0;i<_countof(threads);i++)
+	{
+		if (!threads[i])
+			continue;
+		const DWORD elapsed=GetTickCount()-closeStart;
+		const DWORD remaining=elapsed<closeBudget?closeBudget-elapsed:0;
+		if (WaitForSingleObject(threads[i],remaining)!=WAIT_OBJECT_0)
+			return false;
+	}
+#endif
 	if (m_PreloadItemsThread)
 	{
+#ifndef A4S_PRODUCT
 		WaitForSingleObject(m_PreloadItemsThread,INFINITE);
+#endif
 		CloseHandle(m_PreloadItemsThread);
 		m_PreloadItemsThread=NULL;
 	}
 	if (m_RefreshInfoThread)
 	{
+#ifndef A4S_PRODUCT
 		WaitForSingleObject(m_RefreshInfoThread,INFINITE);
+#endif
 		CloseHandle(m_RefreshInfoThread);
 		m_RefreshInfoThread=NULL;
 	}
 	if (m_SaveCacheThread)
 	{
+#ifndef A4S_PRODUCT
 		WaitForSingleObject(m_SaveCacheThread,INFINITE);
+#endif
 		CloseHandle(m_SaveCacheThread);
 		m_SaveCacheThread=NULL;
 	}
@@ -682,12 +720,14 @@ void CItemManager::Close( void )
 	for (int i=0;i<LOCK_COUNT;i++)
 		DeleteCriticalSection(&m_CriticalSections[i]);
 	g_pAppResolver=NULL;
-	CloseHandle(m_StartEvent);
-	CloseHandle(m_WorkEvent);
-	CloseHandle(m_ExitEvent);
-	CloseHandle(m_DoneEvent);
+	if (m_StartEvent) CloseHandle(m_StartEvent);
+	if (m_WorkEvent) CloseHandle(m_WorkEvent);
+	if (m_ExitEvent) CloseHandle(m_ExitEvent);
+	if (m_DoneEvent) CloseHandle(m_DoneEvent);
+	m_StartEvent=m_WorkEvent=m_ExitEvent=m_DoneEvent=NULL;
 	m_LoadIconData[0].Close();
 	m_bInitialized=false;
+	return true;
 }
 
 void CItemManager::CreateDefaultIcons( void )
@@ -1597,7 +1637,7 @@ void CItemManager::UpdateNewPrograms( const POINT &balloonPos )
 	{
 		CRegKey regKey;
 		ULONGLONG val1, val2;
-		if (regKey.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu",KEY_READ)==ERROR_SUCCESS)
+		if (regKey.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT,KEY_READ)==ERROR_SUCCESS)
 		{
 			if (regKey.QueryQWORDValue(L"LastProgramsTime",val1)!=ERROR_SUCCESS)
 				val1=0;
@@ -1678,7 +1718,7 @@ void CItemManager::LoadOldItems( void )
 {
 	m_OldItemInfos.clear();
 	CRegKey regItems;
-	if (regItems.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu",KEY_READ)==ERROR_SUCCESS)
+	if (regItems.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT,KEY_READ)==ERROR_SUCCESS)
 	{
 		ULONG size=0;
 		regItems.QueryBinaryValue(L"OldItems",NULL,&size);
@@ -1791,8 +1831,8 @@ void CItemManager::AddOldItems( const std::vector<unsigned> &hashes )
 	}
 
 	CRegKey regItems;
-	if (regItems.Open(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu")!=ERROR_SUCCESS)
-		regItems.Create(HKEY_CURRENT_USER,L"Software\\OpenShell\\StartMenu");
+	if (regItems.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT)!=ERROR_SUCCESS)
+		regItems.Create(HKEY_CURRENT_USER,A4S_MENU_REG_ROOT);
 
 	if (m_OldItemInfos.empty())
 		regItems.SetBinaryValue(L"OldItems",NULL,0);
@@ -3235,7 +3275,7 @@ void CItemManager::LoadCacheFile( void )
 		return;
 #endif
 	// load cached icons and info
-	wchar_t path[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell\\DataCache.db";
+	wchar_t path[_MAX_PATH]=A4S_MENU_CACHE_DB;
 	DoEnvironmentSubst(path,_MAX_PATH);
 
 	HANDLE file=CreateFile(path,GENERIC_READ,0,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
@@ -3396,7 +3436,7 @@ void CItemManager::LoadCacheFile( void )
 DWORD CALLBACK CItemManager::SaveCacheFileThread( void *param )
 {
 	CItemManager *pThis=(CItemManager*)param;
-	wchar_t path[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell";
+	wchar_t path[_MAX_PATH]=A4S_MENU_DATA_DIR;
 	DoEnvironmentSubst(path,_MAX_PATH);
 	SHCreateDirectory(NULL,path);
 	Strcat(path,_countof(path),L"\\DataCache.tmp");
@@ -3469,7 +3509,7 @@ DWORD CALLBACK CItemManager::SaveCacheFileThread( void *param )
 	FILE *log=NULL;
 	if (g_LogCategories&LOG_CACHE)
 	{
-		wchar_t path3[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell\\DataCache.txt";
+		wchar_t path3[_MAX_PATH]=A4S_MENU_CACHE_LOG;
 		DoEnvironmentSubst(path3,_countof(path3));
 		if (_wfopen_s(&log,path3,L"wb")==0)
 		{
@@ -3534,7 +3574,7 @@ DWORD CALLBACK CItemManager::SaveCacheFileThread( void *param )
 	if (log) fclose(log);
 
 	CloseHandle(file);
-	wchar_t path2[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell\\DataCache.db";
+	wchar_t path2[_MAX_PATH]=A4S_MENU_CACHE_DB;
 	DoEnvironmentSubst(path2,_MAX_PATH);
 	MoveFileEx(path,path2,MOVEFILE_REPLACE_EXISTING);
 	return 0;
@@ -3570,7 +3610,7 @@ void CItemManager::ClearCache( void )
 	RWLock itemLock(this,true,RWLOCK_ITEMS);
 	RWLock iconLock(this,true,RWLOCK_ICONS);
 
-	wchar_t path[_MAX_PATH]=L"%LOCALAPPDATA%\\OpenShell\\DataCache.db";
+	wchar_t path[_MAX_PATH]=A4S_MENU_CACHE_DB;
 	DoEnvironmentSubst(path,_MAX_PATH);
 	DeleteFile(path);
 
