@@ -57,10 +57,33 @@ $guestSource = [IO.File]::ReadAllText($guestPath)
 $hostAst = Parse-Script $hostPath
 $guestAst = Parse-Script $guestPath
 
+foreach ($entry in @(
+        [ordered]@{ Ast = $hostAst; Name = 'Read-Utf8JsonSnapshot'; Label = 'host' },
+        [ordered]@{ Ast = $guestAst; Name = 'Read-Utf8JsonSnapshot'; Label = 'guest' },
+        [ordered]@{ Ast = $guestAst; Name = 'Get-WindowsSandboxIdentity'; Label = 'guest' })) {
+    $definitions = @($entry.Ast.FindAll({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ieq $entry.Name
+    }, $true))
+    Assert-Contract ($definitions.Count -eq 1) `
+        "$($entry.Label) must define exactly one executable $($entry.Name) function"
+    if ($entry.Name -ieq 'Read-Utf8JsonSnapshot') {
+        $readerText = $definitions[0].Extent.Text
+        foreach ($readerMarker in @('[IO.File]::Open', '[IO.FileShare]::Read',
+                'ComputeHash($bytes)', '$text | ConvertFrom-Json')) {
+            Assert-ContainsOrdinal $readerText $readerMarker `
+                "$($entry.Label) single-read JSON snapshot"
+        }
+    }
+}
+
 foreach ($marker in @(
         '[switch] $AllowSandboxLaunch',
         "if (-not `$AllowSandboxLaunch)",
         "Get-Command WindowsSandbox.exe",
+        "Join-Path ([Environment]::SystemDirectory)",
+        'resolved outside the canonical System32 path',
         "Where-Object { `$_.ProcessName -match '^WindowsSandbox' }",
         'Get-HostProductSnapshot',
         '$hostBeforeSha256 = Get-ObjectSha256 $hostBefore',
@@ -69,6 +92,12 @@ foreach ($marker in @(
         '$launchRecord.ExplorerPidUnchanged',
         'RequestSha256',
         'EvidenceSha256',
+        'Read-Utf8JsonSnapshot -Path $completionPath',
+        'Read-Utf8JsonSnapshot -Path $guestEvidencePath',
+        '$guestEvidence.Environment.WindowsIdentity.Sid',
+        '$guestEvidence.Environment.Configuration.ControlReadOnly',
+        "[string]`$completion.Status -ceq 'Failed'",
+        'The Sandbox guest reported failure:',
         'Windows Sandbox exited without publishing a completion record',
         'The runner did not terminate Windows Sandbox')) {
     Assert-ContainsOrdinal $hostSource $marker 'host launch/result safety'
@@ -77,6 +106,8 @@ Assert-OrderedMarkers $hostSource @(
     "if (-not `$AllowSandboxLaunch)",
     '$hostBefore = Get-HostProductSnapshot',
     '[IO.Directory]::CreateDirectory($sessionDirectory)',
+    '[IO.Directory]::CreateDirectory($controlDirectory)',
+    '[IO.Directory]::CreateDirectory($resultDirectory)',
     'Start-Process -FilePath $sandboxCommand.Source',
     '$hostAfter = Get-HostProductSnapshot') 'host opt-in and before/after boundary'
 
@@ -88,8 +119,10 @@ foreach ($marker in @(
         '<ProtectedClient>Enable</ProtectedClient>',
         '<PrinterRedirection>Disable</PrinterRedirection>',
         '<ClipboardRedirection>Disable</ClipboardRedirection>',
+        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
         '<SandboxFolder>C:\A4S\Repo</SandboxFolder>',
         '<ReadOnly>true</ReadOnly>',
+        '<SandboxFolder>C:\A4S\Control</SandboxFolder>',
         '<SandboxFolder>C:\A4S\Evidence</SandboxFolder>',
         '<ReadOnly>false</ReadOnly>')) {
     Assert-ContainsOrdinal $hostSource $marker 'Sandbox isolation configuration'
@@ -100,6 +133,10 @@ Assert-ContainsOrdinal $hostSource `
 Assert-ContainsOrdinal $hostSource `
     'The V2 setup must be inside the read-only repository mapping' `
     'V2 fixture confinement'
+Assert-ContainsOrdinal $hostSource `
+    'C:\A4S\Control\request.json' 'read-only control-channel request path'
+Assert-ContainsOrdinal $hostSource `
+    'if ($candidateFull.TrimEnd(' 'mapping equality is rejected as overlap'
 
 foreach ($forbidden in @('Stop-Process', 'Restart-Computer', 'Restart-Service',
         'taskkill', 'shutdown.exe', 'Remove-Item', 'Set-ItemProperty',
@@ -120,24 +157,32 @@ Assert-Contract ($hostStartProcesses[0].Extent.Text.IndexOf('$sandboxCommand.Sou
     'host Start-Process target is not the resolved WindowsSandbox.exe'
 
 foreach ($marker in @(
-        "`$env:USERNAME -ine 'WDAGUtilityAccount'",
-        "`$requestFullPath -ine 'C:\A4S\Evidence\request.json'",
+        '[Security.Principal.WindowsIdentity]::GetCurrent()',
+        "`$sid -notmatch '^S-1-5-21-(?:[0-9]+-){3}504$'",
+        "`$requestFullPath -ine 'C:\A4S\Control\request.json'",
+        'Read-Utf8JsonSnapshot -Path $requestFullPath',
         'Assert-SandboxConfiguration',
         'Assert-NetworkDisabled',
+        'An operational non-loopback network path is present in Sandbox.',
         'Assert-CleanDisposableStart',
         'The reviewed V1 DLL was not observed in the unchanged taskbar Explorer process.',
         'Explorer PID changed at',
         '--restart-explorer is forbidden in the Sandbox lifecycle matrix.',
         'User-owned Config/Menu/legacy state changed',
         'DataCache.db changed',
+        'retained an incomplete servicing journal or recovery continuation',
+        'Unexpected cleanup continuation at',
+        'exact identity-bound cleanup RunOnce command',
+        'retained its Windows Settings uninstall registration',
         'LogicallyUninstalledPhysicalCleanupPendingExplorerExit',
         'completion.json')) {
     Assert-ContainsOrdinal $guestSource $marker 'guest isolation/evidence safety'
 }
 Assert-OrderedMarkers $guestSource @(
-    "`$env:USERNAME -ine 'WDAGUtilityAccount'",
+    '$sandboxIdentity = Get-WindowsSandboxIdentity',
+    '$requestSnapshot = Read-Utf8JsonSnapshot',
     'Assert-CleanDisposableStart',
-    'Set-SentinelUserState',
+    'Set-SentinelUserState -Nonce',
     "Name = 'install-v1'",
     "Name = 'update-v1-to-v2'",
     "Name = 'rollback-v2-to-v1'",
@@ -167,6 +212,9 @@ foreach ($forbidden in @('Restart-Computer', 'Restart-Service', 'Stop-Process',
             [StringComparison]::OrdinalIgnoreCase) -lt 0) `
         "guest contains forbidden host/session control '$forbidden'"
 }
+Assert-Contract ($guestSource.IndexOf('NetworkInterfaceType]::Tunnel',
+        [StringComparison]::Ordinal) -lt 0) `
+    'guest network guard excludes tunnel interfaces from the fail-closed check'
 
 & $hostPath -ContractSelfTest
 & $guestPath -ContractSelfTest

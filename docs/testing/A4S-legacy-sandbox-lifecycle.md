@@ -3,15 +3,21 @@
 `Invoke-A4SLegacySandboxLifecycle.ps1` qualifies the frozen `1.0.0.0`
 installer against one reviewed `1.1.0.0` installer without installing V1 in the
 real user profile. The repository (including the frozen fixture and reviewed V2
-setup) is mapped read-only. A fresh, per-run evidence directory is the only
-writable host mapping.
+setup) and a fresh per-run control directory are mapped read-only. A separate
+per-run results directory is the only writable host mapping. The request,
+Sandbox configuration, and host result therefore are not writable from the
+guest.
 
 The Sandbox configuration disables networking, vGPU, microphone and camera
 input, printers, clipboard sharing, and enables Protected Client. The runner
 will not launch without the explicit `-AllowSandboxLaunch` switch. It also
 refuses an existing Sandbox session, mapped/reparse fixture paths, a V2 setup
 outside the repository, or a writable evidence path that overlaps the
-read-only repository mapping.
+read-only repository mapping. The guest additionally requires the real process
+token to be the local `WDAGUtilityAccount` SID ending in RID 504; environment
+variables alone cannot authorize destructive guest operations. The host binds
+the launcher to the canonical x64 `%SystemRoot%\System32\WindowsSandbox.exe`
+instead of trusting PATH resolution.
 
 Run the offline parser and safety contracts first:
 
@@ -63,7 +69,12 @@ then discards the entire guest. This run does not claim that post-Explorer-exit
 physical cleanup was observed.
 
 The guest publishes `progress.json`, then atomically publishes `evidence.json`
-and `completion.json`. The host validates the request nonce and both JSON
-hashes, captures the real profile's A4S state before and after, and fails if
-that state or the host Explorer PID changed. Windows Sandbox is left open after
+and `completion.json`. The host reads each final JSON file once under a
+non-writable file handle, hashes and parses the same bytes, and validates the
+request/session nonce and evidence hash. These checks reject stale, partial,
+cross-run, or post-publication file replacement; they are correlation and
+integrity checks between the reviewed host and guest scripts, not a security
+boundary against another process already running as the same host user. The
+host captures the real profile's A4S state before and after and fails if that
+state or the host Explorer PID changed. Windows Sandbox is left open after
 completion for inspection; close it manually.

@@ -46,6 +46,27 @@ function Get-RandomHex {
     return ([BitConverter]::ToString($buffer)).Replace('-', '')
 }
 
+function Get-WindowsSandboxIdentity {
+    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        if ($null -eq $identity.User) {
+            throw 'The current process token has no user SID.'
+        }
+        $name = [string]$identity.Name
+        $sid = [string]$identity.User.Value
+        if ($name -notmatch '(?i)\\WDAGUtilityAccount$' -or
+            $sid -notmatch '^S-1-5-21-(?:[0-9]+-){3}504$') {
+            throw "The process token is not the Windows Sandbox WDAGUtilityAccount (identity=$name, SID=$sid)."
+        }
+        if ($env:USERNAME -ine 'WDAGUtilityAccount' -or
+            $env:USERPROFILE -inotlike 'C:\Users\WDAGUtilityAccount*') {
+            throw 'The Windows Sandbox token and profile environment do not agree.'
+        }
+        return [ordered]@{ Name = $name; Sid = $sid }
+    }
+    finally { $identity.Dispose() }
+}
+
 function Get-FixedProductVersion {
     param([Parameter(Mandatory)][string] $Path)
     $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
@@ -131,6 +152,53 @@ public static class A4SSandboxAtomicFile
     }
 }
 
+function Read-Utf8JsonSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [ValidateRange(1, 16777216)][int] $MaximumBytes = 1048576
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        throw "Missing JSON control file: $full"
+    }
+    $item = Get-Item -LiteralPath $full -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "A JSON control file may not be a reparse point: $full"
+    }
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 2 -or $stream.Length -gt $MaximumBytes) {
+            throw "JSON control-file length is outside the accepted range: $full"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "Unexpected end of JSON control file: $full" }
+            $offset += $read
+        }
+    }
+    finally { $stream.Dispose() }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "JSON control files must be UTF-8 without a BOM: $full"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $text = $encoding.GetString($bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sha256 = ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '')
+    }
+    finally { $algorithm.Dispose() }
+    return [ordered]@{
+        Path = $full
+        Length = $bytes.Length
+        Sha256 = $sha256
+        Value = ($text | ConvertFrom-Json -ErrorAction Stop)
+    }
+}
+
 function ConvertTo-RegistryValueRecord {
     param(
         [Parameter(Mandatory)][Microsoft.Win32.RegistryKey] $Key,
@@ -208,8 +276,8 @@ function Get-RegistryString {
     )
     $record = Get-RegistryValueRecord -SubKey $SubKey -Name $Name
     if (-not $record.Present) { return $null }
-    if ($record.Value.Kind -notin @('String', 'ExpandString')) {
-        throw "$SubKey\\$Name is not a string value."
+    if ($record.Value.Kind -cne 'String') {
+        throw "$SubKey\\$Name is not an exact REG_SZ value."
     }
     return [string]$record.Value.Data
 }
@@ -453,6 +521,20 @@ function Assert-UserStateAndCache {
     }
 }
 
+function Assert-NoServicingJournal {
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $journalNodes = @($Checkpoint.Product.Nodes | Where-Object {
+        [string]$_.RelativePath -ieq 'Servicing' -or
+        [string]$_.RelativePath -ilike 'Servicing\*'
+    })
+    if ($journalNodes.Count -ne 0 -or $Checkpoint.RecoveryRunOnce.Present) {
+        throw "$Label retained an incomplete servicing journal or recovery continuation."
+    }
+}
+
 function Assert-InstalledCheckpoint {
     param(
         [Parameter(Mandatory)] $Checkpoint,
@@ -467,6 +549,10 @@ function Assert-InstalledCheckpoint {
     Assert-UserStateAndCache -Checkpoint $Checkpoint `
         -ExpectedUserStateSha256 $ExpectedUserStateSha256 `
         -ExpectedCacheSha256 $ExpectedCacheSha256
+    Assert-NoServicingJournal -Checkpoint $Checkpoint -Label $Checkpoint.Label
+    if ($Checkpoint.CleanupRunOnce.Present) {
+        throw "Unexpected cleanup continuation at $($Checkpoint.Label)."
+    }
     $activePath = Get-RegistryString 'Software\A4SMenu' 'ActiveSlot'
     $previousPath = Get-RegistryString 'Software\A4SMenu' 'PreviousSlot'
     $installVersion = Get-RegistryString 'Software\A4SMenu' 'InstallVersion'
@@ -523,9 +609,11 @@ function Assert-QualificationTokenCommitted {
         [Parameter(Mandatory)][string] $Token,
         [Parameter(Mandatory)][string] $Label
     )
-    $last = Get-RegistryString 'Software\A4SMenuLifecycle' 'LastOperation'
+    $lastRecord = Get-RegistryValueRecord 'Software\A4SMenuLifecycle' 'LastOperation'
+    $last = if ($lastRecord.Present) { [string]$lastRecord.Value.Data } else { $null }
     $highWater = Get-RegistryValueRecord 'Software\A4SMenuLifecycle' 'ServicingSequence'
-    if ([string]::IsNullOrWhiteSpace($last) -or
+    if (-not $lastRecord.Present -or [string]$lastRecord.Value.Kind -cne 'String' -or
+        [string]::IsNullOrWhiteSpace($last) -or
         $last -notmatch '^(?<sequence>[0-9]{20}):(?<token>[0-9A-F]{64})$' -or
         $Matches.token -cne $Token -or -not $highWater.Present -or
         [string]$highWater.Value.Kind -cne 'QWord') {
@@ -535,10 +623,14 @@ function Assert-QualificationTokenCommitted {
         [Globalization.CultureInfo]::InvariantCulture)
     $highWaterBits = [UInt64]::Parse([string]$highWater.Value.Data,
         [Globalization.CultureInfo]::InvariantCulture)
-    if ($sequence -ne $highWaterBits) {
+    if ($sequence -eq 0 -or $sequence -ne $highWaterBits) {
         throw "$Label LastOperation sequence does not equal ServicingSequence."
     }
-    return [ordered]@{ Sequence = $sequence.ToString(); Token = $Token }
+    return [ordered]@{
+        Sequence = $sequence.ToString([Globalization.CultureInfo]::InvariantCulture)
+        Token = $Token
+        Encoded = [string]$Matches.sequence + ':' + $Token
+    }
 }
 
 function Quote-ProcessArgument {
@@ -682,13 +774,18 @@ function Assert-CleanDisposableStart {
         (Get-A4SProcessInventory).Count -ne 0) {
         throw 'Windows Sandbox did not start with a clean A4S product state.'
     }
+    $explorerPid = Get-TaskbarExplorerPid
+    $modules = Get-ExplorerModuleInventory $explorerPid
+    if (-not $modules.Complete -or @($modules.Modules).Count -ne 0) {
+        throw 'Windows Sandbox did not start with a clean taskbar Explorer module state.'
+    }
 }
 
 function Assert-SandboxConfiguration {
-    param([Parameter(Mandatory)][string] $EvidenceRoot)
-    $path = Join-Path $EvidenceRoot 'A4SLegacyLifecycle.wsb'
+    param([Parameter(Mandatory)][string] $ControlRoot)
+    $path = Join-Path $ControlRoot 'A4SLegacyLifecycle.wsb'
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
-        throw 'The host Sandbox configuration is not visible in the evidence mapping.'
+        throw 'The host Sandbox configuration is not visible in the read-only control mapping.'
     }
     [xml]$xml = Get-Content -Raw -LiteralPath $path
     foreach ($name in @('vGPU', 'Networking', 'AudioInput', 'VideoInput',
@@ -700,12 +797,19 @@ function Assert-SandboxConfiguration {
     if ([string]$xml.Configuration.ProtectedClient -cne 'Enable') {
         throw 'ProtectedClient is not enabled.'
     }
+    $expectedLogonCommand =
+        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Control\request.json"'
+    if ([string]$xml.Configuration.LogonCommand.Command -cne $expectedLogonCommand) {
+        throw 'Sandbox LogonCommand does not name the exact reviewed guest entry point.'
+    }
     $mappings = @($xml.Configuration.MappedFolders.MappedFolder)
-    if ($mappings.Count -ne 2 -or
+    if ($mappings.Count -ne 3 -or
         [string]$mappings[0].SandboxFolder -cne 'C:\A4S\Repo' -or
         [string]$mappings[0].ReadOnly -cne 'true' -or
-        [string]$mappings[1].SandboxFolder -cne 'C:\A4S\Evidence' -or
-        [string]$mappings[1].ReadOnly -cne 'false') {
+        [string]$mappings[1].SandboxFolder -cne 'C:\A4S\Control' -or
+        [string]$mappings[1].ReadOnly -cne 'true' -or
+        [string]$mappings[2].SandboxFolder -cne 'C:\A4S\Evidence' -or
+        [string]$mappings[2].ReadOnly -cne 'false') {
         throw 'Sandbox folder mapping permissions do not match the qualification contract.'
     }
     return [ordered]@{
@@ -714,6 +818,7 @@ function Assert-SandboxConfiguration {
         NetworkingDisabled = $true
         HostIntegrationsDisabled = $true
         RepositoryReadOnly = $true
+        ControlReadOnly = $true
         EvidenceWritable = $true
         ProtectedClient = $true
     }
@@ -723,14 +828,16 @@ function Assert-NetworkDisabled {
     $up = @([Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
         Where-Object {
             $_.OperationalStatus -eq [Net.NetworkInformation.OperationalStatus]::Up -and
-            $_.NetworkInterfaceType -notin @(
-                [Net.NetworkInformation.NetworkInterfaceType]::Loopback,
-                [Net.NetworkInformation.NetworkInterfaceType]::Tunnel)
+            $_.NetworkInterfaceType -ne
+                [Net.NetworkInformation.NetworkInterfaceType]::Loopback
         } | ForEach-Object {
             [ordered]@{ Name = $_.Name; Type = $_.NetworkInterfaceType.ToString() }
         })
-    if ($up.Count -ne 0) { throw 'An operational non-loopback network interface is present in Sandbox.' }
-    return [ordered]@{ OperationalNonLoopbackInterfaces = @(); NetworkAvailable = [Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable() }
+    $networkAvailable = [Net.NetworkInformation.NetworkInterface]::GetIsNetworkAvailable()
+    if ($up.Count -ne 0 -or $networkAvailable) {
+        throw 'An operational non-loopback network path is present in Sandbox.'
+    }
+    return [ordered]@{ OperationalNonLoopbackInterfaces = @(); NetworkAvailable = $false }
 }
 
 function Write-ProgressEvidence {
@@ -761,20 +868,27 @@ if ($ContractSelfTest) {
 }
 
 if ([string]::IsNullOrWhiteSpace($RequestPath)) { throw '-RequestPath is required in the Sandbox guest.' }
-if ($env:USERNAME -ine 'WDAGUtilityAccount' -or
-    $env:USERPROFILE -inotlike 'C:\Users\WDAGUtilityAccount*') {
-    throw 'This destructive lifecycle guest may run only as Windows Sandbox WDAGUtilityAccount.'
-}
+$sandboxIdentity = Get-WindowsSandboxIdentity
 if (-not [Environment]::Is64BitProcess) { throw 'The Sandbox guest requires 64-bit PowerShell.' }
 
 $requestFullPath = [IO.Path]::GetFullPath($RequestPath)
-if ($requestFullPath -ine 'C:\A4S\Evidence\request.json') {
-    throw 'The request must come from the dedicated Sandbox evidence mapping.'
+if ($requestFullPath -ine 'C:\A4S\Control\request.json') {
+    throw 'The request must come from the dedicated read-only Sandbox control mapping.'
 }
-$requestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $requestFullPath).Hash.ToUpperInvariant()
-$request = Get-Content -Raw -LiteralPath $requestFullPath | ConvertFrom-Json
+$requestSnapshot = Read-Utf8JsonSnapshot -Path $requestFullPath -MaximumBytes 1048576
+$requestSha256 = [string]$requestSnapshot.Sha256
+$request = $requestSnapshot.Value
+$requestProperties = @($request.PSObject.Properties.Name | Sort-Object)
+$expectedRequestProperties = @('CreatedUtc', 'ExplorerRestartAuthorized',
+    'GuestControlRoot', 'GuestEvidenceRoot', 'GuestRepoRoot', 'HostPreflight',
+    'Nonce', 'Purpose', 'RequiredMatrix', 'SchemaVersion', 'SessionId', 'V1',
+    'V1SetupRelativePath', 'V2', 'V2SetupRelativePath') | Sort-Object
+if (($requestProperties -join '|') -cne ($expectedRequestProperties -join '|')) {
+    throw 'The Sandbox request has unexpected or missing top-level properties.'
+}
 if ([int]$request.SchemaVersion -ne 1 -or
     [string]$request.GuestRepoRoot -cne 'C:\A4S\Repo' -or
+    [string]$request.GuestControlRoot -cne 'C:\A4S\Control' -or
     [string]$request.GuestEvidenceRoot -cne 'C:\A4S\Evidence' -or
     [string]$request.SessionId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
     [string]$request.Nonce -notmatch '^[0-9A-F]{64}$' -or
@@ -799,6 +913,7 @@ foreach ($hash in @($request.V2.SetupSha256, $request.V2.HostSha256, $request.V2
 }
 
 $repoRoot = [IO.Path]::GetFullPath([string]$request.GuestRepoRoot).TrimEnd('\')
+$controlRoot = [IO.Path]::GetFullPath([string]$request.GuestControlRoot).TrimEnd('\')
 $script:evidenceRoot = [IO.Path]::GetFullPath([string]$request.GuestEvidenceRoot).TrimEnd('\')
 $v1Source = [IO.Path]::GetFullPath((Join-Path $repoRoot [string]$request.V1SetupRelativePath))
 $v2Source = [IO.Path]::GetFullPath((Join-Path $repoRoot [string]$request.V2SetupRelativePath))
@@ -836,7 +951,7 @@ $script:evidence = [ordered]@{
 $failure = $null
 
 try {
-    $configuration = Assert-SandboxConfiguration -EvidenceRoot $script:evidenceRoot
+    $configuration = Assert-SandboxConfiguration -ControlRoot $controlRoot
     $network = Assert-NetworkDisabled
     Assert-CleanDisposableStart
     $initialExplorerPid = Get-TaskbarExplorerPid
@@ -848,6 +963,7 @@ try {
         SessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
         ExplorerPid = $initialExplorerPid
         Is64BitProcess = [Environment]::Is64BitProcess
+        WindowsIdentity = $sandboxIdentity
         Configuration = $configuration
         Network = $network
     }
@@ -1007,6 +1123,7 @@ try {
     $uninstallIdentity = Assert-QualificationTokenCommitted -Token $uninstallToken `
         -Label 'uninstall-v2'
     Assert-ExplorerUnchanged $uninstallCheckpoint $initialExplorerPid
+    Assert-NoServicingJournal -Checkpoint $uninstallCheckpoint -Label 'uninstall-v2'
     Assert-UserStateAndCache -Checkpoint $uninstallCheckpoint `
         -ExpectedUserStateSha256 $seedUserStateSha256 -ExpectedCacheSha256 $cacheSha256
     foreach ($name in @('ActiveSlot', 'PreviousSlot', 'InstallVersion')) {
@@ -1020,6 +1137,16 @@ try {
     if (-not $uninstallCheckpoint.CleanupRunOnce.Present -or
         $uninstallCheckpoint.RecoveryRunOnce.Present) {
         throw 'Logical uninstall did not leave exactly the expected deferred-cleanup continuation.'
+    }
+    $expectedCleanupRunOnce = '"' +
+        (Join-Path ([IO.Path]::GetTempPath()) 'A4SMenuCleanup.exe') +
+        '" --cleanup --silent --cleanup-identity ' + [string]$uninstallIdentity.Encoded
+    if ([string]$uninstallCheckpoint.CleanupRunOnce.Value.Kind -cne 'String' -or
+        [string]$uninstallCheckpoint.CleanupRunOnce.Value.Data -cne $expectedCleanupRunOnce) {
+        throw 'Logical uninstall did not leave the exact identity-bound cleanup RunOnce command.'
+    }
+    if ($uninstallCheckpoint.Uninstall.Present) {
+        throw 'Logical uninstall retained its Windows Settings uninstall registration.'
     }
     $cleanupHelper = Get-FileIdentity (Join-Path ([IO.Path]::GetTempPath()) 'A4SMenuCleanup.exe')
     if ($cleanupHelper.Sha256 -cne (Normalize-Sha256 ([string]$request.V2.SetupSha256)) -or

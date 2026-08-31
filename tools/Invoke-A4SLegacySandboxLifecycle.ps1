@@ -3,9 +3,10 @@
 Launches the legacy A4S installer lifecycle matrix in a disposable Windows Sandbox.
 
 .DESCRIPTION
-The host side is deliberately fail-closed. It maps this repository read-only,
-maps one newly-created evidence session read/write, launches Windows Sandbox only
-with -AllowSandboxLaunch, and verifies that the host A4S product state and
+The host side is deliberately fail-closed. It maps this repository and a
+per-run control directory read-only, maps only the per-run results directory
+read/write, launches Windows Sandbox only with -AllowSandboxLaunch, and verifies
+that the host A4S product state and
 Explorer PID did not change while the guest ran. It never executes either
 installer on the host and never restarts Explorer.
 
@@ -70,7 +71,12 @@ function Test-PathWithin {
         [Parameter(Mandatory)][string] $Parent
     )
     $candidateFull = [IO.Path]::GetFullPath($Candidate)
-    $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd('\') + '\'
+    $parentExact = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
+    if ($candidateFull.TrimEnd('\').Equals($parentExact,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        return $true
+    }
+    $parentFull = $parentExact + '\'
     return $candidateFull.StartsWith($parentFull, [StringComparison]::OrdinalIgnoreCase)
 }
 
@@ -302,12 +308,14 @@ function ConvertTo-GuestRelativePath {
 function New-SandboxConfigurationText {
     param(
         [Parameter(Mandatory)][string] $HostRepo,
+        [Parameter(Mandatory)][string] $HostControl,
         [Parameter(Mandatory)][string] $HostEvidence
     )
     $repo = [Security.SecurityElement]::Escape($HostRepo)
+    $control = [Security.SecurityElement]::Escape($HostControl)
     $evidence = [Security.SecurityElement]::Escape($HostEvidence)
     $command = [Security.SecurityElement]::Escape(
-        'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Evidence\request.json"')
+        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Control\request.json"')
     return @"
 <Configuration>
   <vGPU>Disable</vGPU>
@@ -322,6 +330,11 @@ function New-SandboxConfigurationText {
     <MappedFolder>
       <HostFolder>$repo</HostFolder>
       <SandboxFolder>C:\A4S\Repo</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>$control</HostFolder>
+      <SandboxFolder>C:\A4S\Control</SandboxFolder>
       <ReadOnly>true</ReadOnly>
     </MappedFolder>
     <MappedFolder>
@@ -348,9 +361,50 @@ function Write-Utf8NoBomAtomic {
     [IO.File]::Move($temporary, $Path)
 }
 
+function Read-Utf8JsonSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [ValidateRange(1, 16777216)][int] $MaximumBytes = 1048576
+    )
+    $full = Assert-RegularFile $Path
+    $stream = [IO.File]::Open($full, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        if ($stream.Length -lt 2 -or $stream.Length -gt $MaximumBytes) {
+            throw "JSON evidence length is outside the accepted range: $full"
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "Unexpected end of JSON evidence: $full" }
+            $offset += $read
+        }
+    }
+    finally { $stream.Dispose() }
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "JSON evidence must be UTF-8 without a BOM: $full"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $text = $encoding.GetString($bytes)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        $sha256 = ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '')
+    }
+    finally { $algorithm.Dispose() }
+    return [ordered]@{
+        Path = $full
+        Length = $bytes.Length
+        Sha256 = $sha256
+        Value = ($text | ConvertFrom-Json -ErrorAction Stop)
+    }
+}
+
 function Assert-ContractModel {
     $xmlText = New-SandboxConfigurationText -HostRepo 'C:\Qualification\Repo' `
-        -HostEvidence 'D:\Qualification Evidence\Session'
+        -HostControl 'D:\Qualification Evidence\Session\control' `
+        -HostEvidence 'D:\Qualification Evidence\Session\results'
     [xml]$xml = $xmlText
     if ($xml.Configuration.Networking -cne 'Disable' -or
         $xml.Configuration.ClipboardRedirection -cne 'Disable' -or
@@ -362,13 +416,21 @@ function Assert-ContractModel {
         throw 'The in-memory Sandbox isolation contract is incomplete.'
     }
     $mappings = @($xml.Configuration.MappedFolders.MappedFolder)
-    if ($mappings.Count -ne 2 -or $mappings[0].ReadOnly -cne 'true' -or
-        $mappings[1].ReadOnly -cne 'false') {
+    if ($mappings.Count -ne 3 -or $mappings[0].ReadOnly -cne 'true' -or
+        $mappings[0].SandboxFolder -cne 'C:\A4S\Repo' -or
+        $mappings[1].ReadOnly -cne 'true' -or
+        $mappings[1].SandboxFolder -cne 'C:\A4S\Control' -or
+        $mappings[2].ReadOnly -cne 'false' -or
+        $mappings[2].SandboxFolder -cne 'C:\A4S\Evidence') {
         throw 'The in-memory Sandbox mapping contract is incomplete.'
     }
     if ($xml.Configuration.LogonCommand.Command -notmatch
-        'Invoke-A4SLegacySandboxGuest\.ps1.*request\.json') {
+        'Invoke-A4SLegacySandboxGuest\.ps1.*C:\\A4S\\Control\\request\.json') {
         throw 'The guest entry point is missing from the Sandbox configuration.'
+    }
+    if (-not (Test-PathWithin -Candidate 'C:\Qualification\Repo' `
+            -Parent 'C:\Qualification\Repo')) {
+        throw 'Equal paths must be treated as overlapping mappings.'
     }
     Write-Host 'A4S legacy Sandbox host in-memory contract passed.'
 }
@@ -422,7 +484,23 @@ if ($v2Identity.Sha256 -cne $expectedV2Setup -or
     throw 'The V2 setup identity does not match the reviewed 1.1.0.0 input.'
 }
 
+$canonicalSandboxPath = Assert-RegularFile (Join-Path ([Environment]::SystemDirectory) `
+    'WindowsSandbox.exe')
+if ((Get-PeMachine $canonicalSandboxPath) -ne 0x8664) {
+    throw "The canonical Windows Sandbox launcher is not x64: $canonicalSandboxPath"
+}
 $sandboxCommand = Get-Command WindowsSandbox.exe -CommandType Application -ErrorAction Stop
+$resolvedSandboxPath = [IO.Path]::GetFullPath($sandboxCommand.Source)
+if (-not $resolvedSandboxPath.Equals($canonicalSandboxPath,
+        [StringComparison]::OrdinalIgnoreCase)) {
+    throw "WindowsSandbox.exe resolved outside the canonical System32 path: $resolvedSandboxPath"
+}
+$sandboxIdentity = [ordered]@{
+    Path = $canonicalSandboxPath
+    Length = [long](Get-Item -LiteralPath $canonicalSandboxPath -Force).Length
+    Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $canonicalSandboxPath).Hash.ToUpperInvariant()
+    ProductVersion = Get-FixedProductVersion $canonicalSandboxPath
+}
 $existingSandboxes = @(Get-Process -ErrorAction SilentlyContinue |
     Where-Object { $_.ProcessName -match '^WindowsSandbox' })
 if ($existingSandboxes.Count -ne 0) {
@@ -466,6 +544,12 @@ $sessionDirectory = Join-Path $evidenceRootFull $sessionId
 if (Test-Path -LiteralPath $sessionDirectory) { throw "Evidence session collision: $sessionDirectory" }
 [IO.Directory]::CreateDirectory($sessionDirectory) | Out-Null
 Assert-NoReparsePointInExistingChain $sessionDirectory
+$controlDirectory = Join-Path $sessionDirectory 'control'
+$resultDirectory = Join-Path $sessionDirectory 'results'
+[IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
+[IO.Directory]::CreateDirectory($resultDirectory) | Out-Null
+Assert-NoReparsePointInExistingChain $controlDirectory
+Assert-NoReparsePointInExistingChain $resultDirectory
 
 $request = [ordered]@{
     SchemaVersion = 1
@@ -473,6 +557,7 @@ $request = [ordered]@{
     SessionId = $sessionId
     Nonce = $nonce
     GuestRepoRoot = 'C:\A4S\Repo'
+    GuestControlRoot = 'C:\A4S\Control'
     GuestEvidenceRoot = 'C:\A4S\Evidence'
     V1SetupRelativePath = $v1SetupRelativePath
     V2SetupRelativePath = $v2RelativePath
@@ -492,7 +577,7 @@ $request = [ordered]@{
     HostPreflight = [ordered]@{
         ExplorerPid = $hostExplorerPid
         ProductStateSha256 = $hostBeforeSha256
-        WindowsSandboxExecutable = $sandboxCommand.Source
+        WindowsSandboxExecutable = $sandboxIdentity
         OptionalFeatureState = $featureState
         RepositoryPath = $repoRoot
         GuestScriptSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $guestScript).Hash.ToUpperInvariant()
@@ -500,12 +585,13 @@ $request = [ordered]@{
         V2Setup = $v2Identity
     }
 }
-$requestPath = Join-Path $sessionDirectory 'request.json'
+$requestPath = Join-Path $controlDirectory 'request.json'
 Write-Utf8NoBomAtomic -Path $requestPath `
     -Text ($request | ConvertTo-Json -Depth 100)
 $requestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $requestPath).Hash.ToUpperInvariant()
-$configurationText = New-SandboxConfigurationText -HostRepo $repoRoot -HostEvidence $sessionDirectory
-$configurationPath = Join-Path $sessionDirectory 'A4SLegacyLifecycle.wsb'
+$configurationText = New-SandboxConfigurationText -HostRepo $repoRoot `
+    -HostControl $controlDirectory -HostEvidence $resultDirectory
+$configurationPath = Join-Path $controlDirectory 'A4SLegacyLifecycle.wsb'
 Write-Utf8NoBomAtomic -Path $configurationPath -Text $configurationText
 $configurationSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $configurationPath).Hash.ToUpperInvariant()
 
@@ -518,6 +604,7 @@ $launchRecord = [ordered]@{
     StartedUtc = [DateTime]::UtcNow.ToString('o')
     SandboxProcessId = $null
     Completion = $null
+    CompletionSha256 = $null
     HostBefore = $hostBefore
     HostAfter = $null
     HostStateUnchanged = $false
@@ -525,7 +612,7 @@ $launchRecord = [ordered]@{
     Succeeded = $false
     Failure = $null
 }
-$hostResultPath = Join-Path $sessionDirectory 'host-result.json'
+$hostResultPath = Join-Path $controlDirectory 'host-result.json'
 Write-Utf8NoBomAtomic -Path $hostResultPath `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
 
@@ -536,18 +623,20 @@ $startedHostResult = "$hostResultPath.started"
 Write-Utf8NoBomAtomic -Path $startedHostResult `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
 [IO.File]::Replace($startedHostResult, $hostResultPath, $null)
-$completionPath = Join-Path $sessionDirectory 'completion.json'
+$completionPath = Join-Path $resultDirectory 'completion.json'
 $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
 $processExitObservedUtc = $null
 $completion = $null
-$guestEvidencePath = Join-Path $sessionDirectory 'evidence.json'
+$completionSnapshot = $null
+$guestEvidencePath = Join-Path $resultDirectory 'evidence.json'
 $hostFailure = $null
 try {
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
             try {
-                $completion = Get-Content -Raw -LiteralPath $completionPath |
-                    ConvertFrom-Json -ErrorAction Stop
+                $completionSnapshot = Read-Utf8JsonSnapshot -Path $completionPath `
+                    -MaximumBytes 65536
+                $completion = $completionSnapshot.Value
                 break
             }
             catch {
@@ -575,10 +664,18 @@ try {
     if ($null -eq $completion) {
         throw "Timed out after $TimeoutMinutes minutes waiting for the guest completion record. The runner did not terminate Windows Sandbox."
     }
+    $completionProperties = @($completion.PSObject.Properties.Name | Sort-Object)
+    $expectedCompletionProperties = @('CompletedUtc', 'EvidenceFile',
+        'EvidenceSha256', 'Nonce', 'RequestSha256', 'SchemaVersion',
+        'SessionId', 'Status') | Sort-Object
+    if (($completionProperties -join '|') -cne ($expectedCompletionProperties -join '|')) {
+        throw 'The guest completion record schema has unexpected or missing properties.'
+    }
     if ([int]$completion.SchemaVersion -ne 1 -or
         [string]$completion.SessionId -cne $sessionId -or
         [string]$completion.Nonce -cne $nonce -or
         [string]$completion.RequestSha256 -cne $requestSha256 -or
+        [string]$completion.Status -notin @('Passed', 'Failed') -or
         [string]$completion.EvidenceFile -cne 'evidence.json' -or
         [string]$completion.EvidenceSha256 -notmatch '^[0-9A-F]{64}$') {
         throw 'The guest completion record does not authenticate this exact Sandbox request.'
@@ -586,18 +683,54 @@ try {
     if (-not (Test-Path -LiteralPath $guestEvidencePath -PathType Leaf)) {
         throw 'The guest completion record names missing evidence.json.'
     }
-    $actualGuestEvidenceSha256 =
-        (Get-FileHash -Algorithm SHA256 -LiteralPath $guestEvidencePath).Hash.ToUpperInvariant()
+    $guestEvidenceSnapshot = Read-Utf8JsonSnapshot -Path $guestEvidencePath `
+        -MaximumBytes 16777216
+    $actualGuestEvidenceSha256 = $guestEvidenceSnapshot.Sha256
     if ($actualGuestEvidenceSha256 -cne [string]$completion.EvidenceSha256) {
         throw 'Guest evidence.json does not match the completion-record SHA-256.'
     }
-    $guestEvidence = Get-Content -Raw -LiteralPath $guestEvidencePath |
-        ConvertFrom-Json -ErrorAction Stop
+    $guestEvidence = $guestEvidenceSnapshot.Value
+    $guestEvidenceProperties = @($guestEvidence.PSObject.Properties.Name | Sort-Object)
+    $requiredGuestEvidenceProperties = @('CompletedUtc', 'Environment', 'Failure',
+        'FinalDisposition', 'Inputs', 'LastUpdatedUtc', 'Nonce', 'RequestSha256',
+        'SchemaVersion', 'Seed', 'SessionId', 'StartedUtc', 'Steps', 'Succeeded',
+        'Test') | Sort-Object
+    $allowedGuestEvidenceProperties = @($requiredGuestEvidenceProperties +
+        'FailureCheckpoint') | Sort-Object
+    $unexpectedEvidenceProperties = @($guestEvidenceProperties |
+        Where-Object { $_ -notin $allowedGuestEvidenceProperties })
+    $missingEvidenceProperties = @($requiredGuestEvidenceProperties |
+        Where-Object { $_ -notin $guestEvidenceProperties })
+    if ($unexpectedEvidenceProperties.Count -ne 0 -or
+        $missingEvidenceProperties.Count -ne 0) {
+        throw 'Guest evidence.json schema has unexpected or missing top-level properties.'
+    }
     if ([int]$guestEvidence.SchemaVersion -ne 1 -or
         [string]$guestEvidence.SessionId -cne $sessionId -or
         [string]$guestEvidence.Nonce -cne $nonce -or
-        [string]$guestEvidence.RequestSha256 -cne $requestSha256 -or
-        -not [bool]$guestEvidence.Succeeded -or
+        [string]$guestEvidence.RequestSha256 -cne $requestSha256) {
+        throw 'Guest evidence content does not correlate to the exact requested Sandbox run.'
+    }
+    if ([string]$completion.Status -ceq 'Failed') {
+        if ([bool]$guestEvidence.Succeeded -or $null -eq $guestEvidence.Failure -or
+            [string]::IsNullOrWhiteSpace([string]$guestEvidence.Failure.Message)) {
+            throw 'The guest published an inconsistent failure record.'
+        }
+        throw "The Sandbox guest reported failure: $([string]$guestEvidence.Failure.Message)"
+    }
+    if (-not [bool]$guestEvidence.Succeeded -or
+        $null -ne $guestEvidence.Failure -or
+        @($guestEvidenceProperties | Where-Object { $_ -ceq 'FailureCheckpoint' }).Count -ne 0 -or
+        -not [bool]$guestEvidence.Environment.Is64BitProcess -or
+        [string]$guestEvidence.Environment.WindowsIdentity.Name -notmatch
+            '(?i)\\WDAGUtilityAccount$' -or
+        [string]$guestEvidence.Environment.WindowsIdentity.Sid -notmatch
+            '^S-1-5-21-(?:[0-9]+-){3}504$' -or
+        [bool]$guestEvidence.Environment.Network.NetworkAvailable -or
+        @($guestEvidence.Environment.Network.OperationalNonLoopbackInterfaces).Count -ne 0 -or
+        -not [bool]$guestEvidence.Environment.Configuration.RepositoryReadOnly -or
+        -not [bool]$guestEvidence.Environment.Configuration.ControlReadOnly -or
+        -not [bool]$guestEvidence.Environment.Configuration.EvidenceWritable -or
         [string]$guestEvidence.Environment.Configuration.Sha256 -cne $configurationSha256 -or
         (@($guestEvidence.Steps | ForEach-Object { [string]$_.Name }) -join '|') -cne
             (@($request.RequiredMatrix) -join '|') -or
@@ -636,6 +769,9 @@ catch {
     }
 }
 $launchRecord.Completion = $completion
+$launchRecord.CompletionSha256 = if ($null -eq $completionSnapshot) {
+    $null
+} else { [string]$completionSnapshot.Sha256 }
 $launchRecord.CompletedUtc = [DateTime]::UtcNow.ToString('o')
 $launchRecord.Succeeded = $null -eq $hostFailure -and
     $launchRecord.HostStateUnchanged -and $launchRecord.ExplorerPidUnchanged -and
