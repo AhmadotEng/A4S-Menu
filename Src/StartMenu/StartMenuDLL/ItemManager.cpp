@@ -3880,16 +3880,16 @@ static int FindA4SDirectoryWatch( const A4SDirectoryWatch *watches,
 	return -1;
 }
 
-static bool VerifyA4SRequiredWatchConfiguration( DWORD requiredMask,
+static bool VerifyA4SWatchConfiguration( DWORD watchMask,
 	const A4SDirectoryWatch *watches, int watchCount,
 	A4SDirectoryIdentity *verifiedByIndex, ULONGLONG &aggregateIdentity )
 {
 	aggregateIdentity=A4SCacheState::MixWatchIdentityWord(
-		A4SCacheState::WATCH_PATH_HASH_OFFSET,requiredMask);
+		A4SCacheState::WATCH_PATH_HASH_OFFSET,watchMask);
 	for (int index=0;index<NUM_WATCHED_DIRS;index++)
 	{
 		const DWORD watchBit=1U<<index;
-		if (!(requiredMask&watchBit))
+		if (!(watchMask&watchBit))
 			continue;
 		const int watchIndex=FindA4SDirectoryWatch(watches,watchCount,watchBit);
 		if (watchIndex<0)
@@ -4036,6 +4036,7 @@ void CItemManager::PreloadItemsThread( void )
 	ULONGLONG setupIdentityHash=0;
 	DWORD baselineRequestedLoadMask=0;
 	DWORD baselineCompletedLoadMask=0;
+	DWORD rebuildOptionalLoadMask=0;
 	DWORD dirMask=0xFFFFFFFF;
 	DWORD retryDelay=WATCH_RETRY_MIN_MS;
 	bool bBuildWatches=true;
@@ -4046,6 +4047,13 @@ void CItemManager::PreloadItemsThread( void )
 
 	auto CloseWatches=[&]()
 	{
+		// Swapping the watch set creates a small interval in which optional
+		// notifications cannot be attributed safely. Carry every previously armed
+		// non-required root into the next load transaction instead of allowing a
+		// required-only rebuild to serialize stale optional metadata.
+		const DWORD currentRequiredMask=static_cast<DWORD>(
+			InterlockedCompareExchange(&m_A4SRequiredWatchMask,0,0));
+		rebuildOptionalLoadMask|=armedMask&~currentRequiredMask;
 		for (int i=0;i<watchCount;i++)
 			CloseA4SDirectoryWatch(watches[i]);
 		watchCount=0;
@@ -4058,6 +4066,49 @@ void CItemManager::PreloadItemsThread( void )
 		DWORD wait=WaitForMultipleObjects(_countof(retryHandles),retryHandles,
 			FALSE,timeout);
 		return wait==WAIT_TIMEOUT || wait==WAIT_OBJECT_0+1;
+	};
+
+	auto IsA4SDiskCacheSnapshotQuiet=[&]()->bool
+	{
+		if (watchCount<=0 || !IsFolderWatchBaselineReady())
+			return false;
+
+		// SaveCacheFile serializes the complete shared cache, not only the root
+		// reloaded in this pass. A required notification can arrive while an
+		// optional root is being enumerated, so prove every live watch is quiet
+		// before allowing that optional transaction to replace the last good file.
+		HANDLE quietHandles[NUM_WATCHED_DIRS+1];
+		for (int i=0;i<watchCount;i++)
+			quietHandles[i]=watches[i].eventHandle;
+		quietHandles[watchCount]=m_ExitEvent;
+		if (WaitForMultipleObjects(watchCount+1,quietHandles,FALSE,0)!=WAIT_TIMEOUT)
+			return false;
+
+		const DWORD currentRequiredMask=static_cast<DWORD>(
+			InterlockedCompareExchange(&m_A4SRequiredWatchMask,0,0));
+		const ULONGLONG currentConfigurationGeneration=
+			static_cast<ULONGLONG>(InterlockedCompareExchange64(
+				&m_A4SWatchConfigurationGeneration,0,0));
+		ULONGLONG currentIdentityHash=0;
+		if (!VerifyA4SWatchConfiguration(currentRequiredMask,watches,
+			watchCount,NULL,currentIdentityHash))
+			return false;
+		A4SCacheState::WatchConfigurationIdentity published={
+			setupRequiredMask,setupIdentityHash,setupConfigurationGeneration};
+		A4SCacheState::WatchConfigurationIdentity observed={
+			currentRequiredMask,currentIdentityHash,
+			currentConfigurationGeneration};
+		if (!A4SCacheState::WatchConfigurationMatches(published,observed))
+			return false;
+		ULONGLONG ignoredArmedIdentity=0;
+		if (!VerifyA4SWatchConfiguration(armedMask,watches,watchCount,NULL,
+			ignoredArmedIdentity))
+			return false;
+
+		// Close the identity-query window without consuming the manual-reset
+		// directory events. The outer wait remains responsible for rearming them.
+		return WaitForMultipleObjects(watchCount+1,quietHandles,FALSE,0)==
+			WAIT_TIMEOUT && IsFolderWatchBaselineReady();
 	};
 
 	while (1)
@@ -4089,6 +4140,10 @@ void CItemManager::PreloadItemsThread( void )
 				armedMask|=watchBit;
 				watchCount++;
 			}
+			// A root newly available after the previous watch set was built has no
+			// trustworthy carried metadata either. Include every live non-required
+			// source in this rebuild transaction; completed roots are cleared below.
+			rebuildOptionalLoadMask|=armedMask&~setupRequiredMask;
 		}
 
 		DWORD requestedLoadMask=0;
@@ -4103,7 +4158,8 @@ void CItemManager::PreloadItemsThread( void )
 			if (g_CacheFolders[i].folder==FOLDERID_Favorites &&
 				!m_bPreloadFavorites) continue;
 			const bool bShouldLoad=bInitialPreload || !bBuildWatches ||
-				((setupRequiredMask&loadBit)!=0);
+				((setupRequiredMask&loadBit)!=0) ||
+				((rebuildOptionalLoadMask&loadBit)!=0);
 			if (!bShouldLoad)
 				continue;
 			int refreshFlags=g_CacheFolders[i].refreshFlags;
@@ -4154,6 +4210,7 @@ void CItemManager::PreloadItemsThread( void )
 		const bool bRequestedLoadsComplete=
 			A4SCacheState::RequestedFolderLoadsComplete(
 				transactionRequestedLoadMask,transactionCompletedLoadMask);
+		rebuildOptionalLoadMask&=~completedLoadMask;
 
 		if (bInitialPreload)
 		{
@@ -4217,7 +4274,7 @@ void CItemManager::PreloadItemsThread( void )
 			A4SDirectoryIdentity verifiedByIndex[NUM_WATCHED_DIRS];
 			ULONGLONG confirmedIdentityHash=0;
 			bool bCanonicalIdentityStable=bRequirementsStable &&
-				VerifyA4SRequiredWatchConfiguration(currentRequiredMask,watches,
+				VerifyA4SWatchConfiguration(currentRequiredMask,watches,
 					watchCount,verifiedByIndex,confirmedIdentityHash);
 			const DWORD finalRequiredMask=static_cast<DWORD>(
 				InterlockedCompareExchange(&m_A4SRequiredWatchMask,0,0));
@@ -4294,6 +4351,25 @@ void CItemManager::PreloadItemsThread( void )
 						WATCH_RETRY_MAX_MS:retryDelay*2;
 					continue;
 				}
+				ULONGLONG ignoredOptionalIdentity=0;
+				if (!VerifyA4SWatchConfiguration(pendingMask,watches,watchCount,
+					NULL,ignoredOptionalIdentity))
+				{
+					// An optional known-folder/reparse target changed while its old
+					// handle remained valid. Rebuild the handle and explicitly reload
+					// that optional source; otherwise all future notifications would
+					// continue to describe the abandoned target.
+					RevokeA4SFolderWatchBaseline();
+					CloseWatches();
+					bBuildWatches=true;
+					bEstablishingBaseline=true;
+					dirMask=0xFFFFFFFF;
+					if (!WaitForWatchRetry(retryDelay))
+						break;
+					retryDelay=retryDelay>WATCH_RETRY_MAX_MS/2?
+						WATCH_RETRY_MAX_MS:retryDelay*2;
+					continue;
+				}
 				dirMask=pendingMask;
 				bBuildWatches=false;
 				continue;
@@ -4341,7 +4417,7 @@ void CItemManager::PreloadItemsThread( void )
 			retryDelay=WATCH_RETRY_MIN_MS;
 		}
 
-		if (bSaveCacheThisPass)
+		if (bSaveCacheThisPass && IsA4SDiskCacheSnapshotQuiet())
 		{
 			// Every selected root, including optional metadata roots, participates in
 			// the transaction. Partial runtime data may remain useful, but it must not
@@ -4367,15 +4443,18 @@ void CItemManager::PreloadItemsThread( void )
 				static_cast<ULONGLONG>(InterlockedCompareExchange64(
 					&m_A4SWatchConfigurationGeneration,0,0));
 			ULONGLONG currentIdentityHash=0;
-			const bool bIdentityCertain=VerifyA4SRequiredWatchConfiguration(
+			const bool bIdentityCertain=VerifyA4SWatchConfiguration(
 				currentRequiredMask,watches,watchCount,NULL,currentIdentityHash);
+			ULONGLONG ignoredArmedIdentity=0;
+			const bool bAllArmedIdentitiesCertain=VerifyA4SWatchConfiguration(
+				armedMask,watches,watchCount,NULL,ignoredArmedIdentity);
 			A4SCacheState::WatchConfigurationIdentity published={
 				setupRequiredMask,setupIdentityHash,
 				setupConfigurationGeneration};
 			A4SCacheState::WatchConfigurationIdentity observed={
 				currentRequiredMask,currentIdentityHash,
 				currentConfigurationGeneration};
-			if (!bIdentityCertain ||
+			if (!bIdentityCertain || !bAllArmedIdentitiesCertain ||
 				!A4SCacheState::WatchConfigurationMatches(published,observed))
 			{
 				// A redirected/reparsed path, same-mask source update, or identity
@@ -4504,6 +4583,32 @@ void CItemManager::PreloadItemsThread( void )
 				WATCH_RETRY_MAX_MS:retryDelay*2;
 			continue;
 		}
+		requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
+			&m_A4SRequiredWatchMask,0,0));
+		if (!bRequiredChange && (dirMask&requiredMask)!=0)
+		{
+			bRequiredChange=true;
+			RevokeA4SFolderWatchBaseline();
+		}
+		if (!bRequiredChange)
+		{
+			const DWORD optionalMask=dirMask&~requiredMask;
+			ULONGLONG ignoredOptionalIdentity=0;
+			if (!VerifyA4SWatchConfiguration(optionalMask,watches,watchCount,
+				NULL,ignoredOptionalIdentity))
+			{
+				RevokeA4SFolderWatchBaseline();
+				CloseWatches();
+				bBuildWatches=true;
+				bEstablishingBaseline=true;
+				dirMask=0xFFFFFFFF;
+				if (!WaitForWatchRetry(retryDelay))
+					break;
+				retryDelay=retryDelay>WATCH_RETRY_MAX_MS/2?
+					WATCH_RETRY_MAX_MS:retryDelay*2;
+				continue;
+			}
+		}
 		if (bRequiredChange)
 		{
 			CloseWatches();
@@ -4566,9 +4671,9 @@ void CItemManager::PreloadItemsThread( void )
 				if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pFolder)) || !pFolder) continue;
 			}
 
-			wchar_t path[_MAX_PATH];
+			wchar_t path[_MAX_PATH]={};
 			if (i<NUM_WATCHED_DIRS && dirMask==0xFFFFFFFF &&
-				SUCCEEDED(SHGetPathFromIDList(pidl,path)))
+				SHGetPathFromIDList(pidl,path) && path[0])
 			{
 				handles[dirCount]=FindFirstChangeNotification(path,TRUE,
 					FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_LAST_WRITE);

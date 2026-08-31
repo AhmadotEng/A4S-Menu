@@ -31,6 +31,35 @@ const wchar_t *MetroAppClassId=L"Launcher.ImmersiveApplication";
 
 // Returns a list of links for all metro apps
 #ifdef A4S_PRODUCT
+class A4SMetroOutputTransaction
+{
+public:
+	A4SMetroOutputTransaction( std::vector<MetroLink> &links,
+		std::vector<CString> *pNonApps )
+		: m_Links(links), m_pNonApps(pNonApps), m_LinkCount(links.size()),
+		m_NonAppCount(pNonApps?pNonApps->size():0), m_bCommitted(false)
+	{
+	}
+
+	~A4SMetroOutputTransaction( void )
+	{
+		if (m_bCommitted)
+			return;
+		m_Links.resize(m_LinkCount);
+		if (m_pNonApps)
+			m_pNonApps->resize(m_NonAppCount);
+	}
+
+	void Commit( void ) { m_bCommitted=true; }
+
+private:
+	std::vector<MetroLink> &m_Links;
+	std::vector<CString> *m_pNonApps;
+	size_t m_LinkCount;
+	size_t m_NonAppCount;
+	bool m_bCommitted;
+};
+
 static HRESULT GetRequiredMetroString( IPropertyStore *pStore,
 	REFPROPERTYKEY key, CString &value )
 {
@@ -53,6 +82,11 @@ static HRESULT GetRequiredMetroString( IPropertyStore *pStore,
 
 HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10 )
 {
+	// Every fallible COM/property step belongs to one output transaction. Some
+	// UI callers intentionally ignore the HRESULT for legacy call-site shape;
+	// rolling back here prevents them from rendering an arbitrary prefix after a
+	// mid-enumeration failure, while preserving any caller-owned prefix.
+	A4SMetroOutputTransaction outputTransaction(links,pNonApps10);
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (start)");
 	if (bLog && !(g_LogCategories&LOG_APPS))
 		bLog=false;
@@ -163,6 +197,7 @@ HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CSt
 		}
 	}
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (end)");
+	outputTransaction.Commit();
 	return S_OK;
 }
 #else

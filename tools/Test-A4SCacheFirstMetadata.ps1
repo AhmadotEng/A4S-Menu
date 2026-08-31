@@ -156,9 +156,15 @@ $constructor = Get-CppFunctionBody -Text $source -Signature 'CItemManager::CItem
 $generationGetter = Get-CppFunctionBody -Text $source -Signature 'ULONGLONG CItemManager::GetFolderContentGeneration( void ) const'
 $generationAdvance = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::AdvanceFolderContentGeneration( void )'
 $preload = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::PreloadItemsThread( void )'
+$quietDiskCache = Get-CppFunctionBody -Text $source -Signature 'auto IsA4SDiskCacheSnapshotQuiet=[&]()->bool'
 $upstreamBranchIndex = $preload.IndexOf('#else', [StringComparison]::Ordinal)
 Assert-Contract ($upstreamBranchIndex -gt 0) 'product/upstream preload split is missing'
 $productPreload = $preload.Substring(0, $upstreamBranchIndex)
+$upstreamPreload = $preload.Substring($upstreamBranchIndex)
+Assert-Contract ($upstreamPreload -match 'wchar_t\s+path\[_MAX_PATH\]=\{\}' -and
+    $upstreamPreload -match 'SHGetPathFromIDList\(pidl,path\)\s*&&\s*path\[0\]' -and
+    $upstreamPreload -notmatch 'SUCCEEDED\(SHGetPathFromIDList') `
+    'upstream BOOL path discovery can treat failure as a successful HRESULT or consume an uninitialized path'
 Assert-Contract ($constructor -match 'm_FolderContentGeneration\s*=\s*1\s*;') `
     'folder-content generation is not initialized to a nonzero value'
 Assert-Contract ($generationGetter -match 'InterlockedCompareExchange64\(') `
@@ -222,6 +228,11 @@ Assert-Contract ($metroLinks -match 'ShGetKnownFolderItem' -and
     $metroLinks -match 'if\s*\(result==S_FALSE\)\s*break' -and
     $metroLinks -match 'if\s*\(result!=S_OK\s*\|\|\s*!pChild\)') `
     'Apps known-folder, enumerator construction, or terminal failure can be mistaken for success'
+Assert-Contract ($metroSource -match 'class\s+A4SMetroOutputTransaction' -and
+    $metroSource -match '~A4SMetroOutputTransaction[\s\S]*m_Links\.resize\(m_LinkCount\)[\s\S]*m_pNonApps->resize\(m_NonAppCount\)' -and
+    $metroLinks -match 'A4SMetroOutputTransaction\s+outputTransaction\(links,pNonApps10\)' -and
+    $metroLinks -match 'outputTransaction\.Commit\(\)[\s\S]*return\s+S_OK') `
+    'a mid-stream Apps failure can expose a partial link/non-app prefix to callers'
 Assert-Contract ($stateHeader -match 'inline\s+bool\s+RequestedFolderLoadsComplete' -and
     $productPreload -match 'requestedLoadMask\|=loadBit' -and
     $productPreload -match 'completedLoadMask\|=loadBit' -and
@@ -230,8 +241,15 @@ Assert-Contract ($stateHeader -match 'inline\s+bool\s+RequestedFolderLoadsComple
     $productPreload -match '!bRequiredLoadsComplete' -and
     $productPreload -match 'RequestedFolderLoadsComplete\([\s\S]{0,120}transactionRequestedLoadMask,transactionCompletedLoadMask' -and
     $productPreload -match 'bSaveCacheThisPass=transactionRequestedLoadMask\s*&&[\s\S]{0,80}bRequestedLoadsComplete' -and
-    $productPreload -match 'if\s*\(bSaveCacheThisPass\)[\s\S]{0,500}SaveCacheFile\(\)') `
+    $productPreload -match 'if\s*\(bSaveCacheThisPass\s*&&\s*IsA4SDiskCacheSnapshotQuiet\(\)\)[\s\S]{0,500}SaveCacheFile\(\)') `
     'all selected required and optional roots are not one disk-cache transaction'
+Assert-Contract ($quietDiskCache -match 'IsFolderWatchBaselineReady\(\)' -and
+    $quietDiskCache -match 'WaitForMultipleObjects\(watchCount\+1,quietHandles,FALSE,0\)' -and
+    $quietDiskCache -match 'VerifyA4SWatchConfiguration\(currentRequiredMask' -and
+    $quietDiskCache -match 'VerifyA4SWatchConfiguration\(armedMask' -and
+    $quietDiskCache -match 'WatchConfigurationMatches\(published,observed\)' -and
+    ([Regex]::Matches($quietDiskCache, 'WaitForMultipleObjects\(watchCount\+1,quietHandles,FALSE,0\)').Count -eq 2)) `
+    'disk-cache publication does not prove all live watcher events quiet around source-identity validation'
 Assert-Contract ($productPreload -match 'Policy deliberately excludes this optional preload root' -and
     $requiredMask -notmatch 'WATCH_DESKTOP|WATCH_PUBLIC_DESKTOP|WATCH_TASKBAR_PINNED') `
     'optional preload failure semantics are no longer explicit'
@@ -327,7 +345,7 @@ $resolveFolder = Get-CppFunctionBody -Text $source -Signature 'static HRESULT Re
 $queryIdentity = Get-CppFunctionBody -Text $source -Signature 'static HRESULT QueryA4SHandleIdentity( HANDLE handle, DWORD watchBit,'
 $openWatch = Get-CppFunctionBody -Text $source -Signature 'static bool OpenA4SDirectoryWatch( const wchar_t *path, DWORD watchBit,'
 $closeWatch = Get-CppFunctionBody -Text $source -Signature 'static void CloseA4SDirectoryWatch( A4SDirectoryWatch &watch )'
-$verifyWatches = Get-CppFunctionBody -Text $source -Signature 'static bool VerifyA4SRequiredWatchConfiguration( DWORD requiredMask,'
+$verifyWatches = Get-CppFunctionBody -Text $source -Signature 'static bool VerifyA4SWatchConfiguration( DWORD watchMask,'
 $forceReconfigure = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::ForceA4SFolderWatchReconfigure( void )'
 Assert-Contract ($resolveFolder -match '!SHGetPathFromIDList\(pidl,path\)\s*\|\|\s*!path\[0\]' -and
     $resolveFolder -notmatch 'SUCCEEDED\(SHGetPathFromIDList') `
@@ -345,11 +363,19 @@ Assert-Contract ($openWatch -match 'OpenA4SDirectoryHandle\(path,true\)' -and
     $closeWatch -match 'GetOverlappedResult\(watch\.directory,&watch\.overlapped,&ignored,TRUE\)') `
     'watching, identity, cancellation, or lifetime is not tied to one directory handle'
 Assert-Contract ($productPreload -notmatch 'FindFirstChangeNotification|FindNextChangeNotification|FindCloseChangeNotification' -and
-    $productPreload -match 'VerifyA4SRequiredWatchConfiguration' -and
+    $productPreload -match 'VerifyA4SWatchConfiguration' -and
     $verifyWatches -match 'QueryA4SHandleIdentity\(watches\[watchIndex\]\.directory' -and
     $verifyWatches -match 'QueryA4SConfiguredDirectoryIdentity' -and
     $productPreload -match 'WatchConfigurationMatches\(published,observed\)') `
     'reparse/path uncertainty is not checked on exact live handles through steady state'
+Assert-Contract ($productPreload -match 'rebuildOptionalLoadMask\|=armedMask&~currentRequiredMask' -and
+    $productPreload -match 'rebuildOptionalLoadMask\|=armedMask&~setupRequiredMask' -and
+    $productPreload -match '\(rebuildOptionalLoadMask&loadBit\)!=0' -and
+    $productPreload -match 'rebuildOptionalLoadMask&=~completedLoadMask' -and
+    $productPreload -match 'bAllArmedIdentitiesCertain=VerifyA4SWatchConfiguration\(' -and
+    $productPreload -match 'VerifyA4SWatchConfiguration\(pendingMask' -and
+    $productPreload -match 'VerifyA4SWatchConfiguration\(optionalMask') `
+    'optional source retargets or watch-set swaps can leave metadata bound to an abandoned directory handle'
 Assert-Contract ($source -match 'OPEN_REPARSE_POINT is therefore intentionally omitted' -and
     $source -match 'FILE_FLAG_BACKUP_SEMANTICS[\s\S]{0,120}FILE_FLAG_OVERLAPPED') `
     'directory reparse handling is not explicit or overlapped'
