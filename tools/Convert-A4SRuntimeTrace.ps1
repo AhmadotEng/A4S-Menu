@@ -7,6 +7,12 @@ param(
     [uint32]$ExpectedProcessId = 0,
     [ValidateRange(0, 1000)]
     [int]$ColdSampleCount = 0,
+    [ValidateRange(0, 1000)]
+    [int]$ExpectedCycleCount = 0,
+    [ValidateRange(1, 1000)]
+    [int]$MinimumWarmSampleCount = 20,
+    [ValidateRange(1, 1000)]
+    [int]$MinimumCloseSampleCount = 20,
     [ValidateRange(1, 250)]
     [double]$WarmOpenTargetMilliseconds = 50,
     [ValidateRange(20, 1000)]
@@ -82,6 +88,8 @@ if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
 }
 
 $report = ConvertTo-A4SRuntimeReport -Events $events -ColdSampleCount $ColdSampleCount `
+    -ExpectedCycleCount $ExpectedCycleCount -MinimumWarmSampleCount $MinimumWarmSampleCount `
+    -MinimumCloseSampleCount $MinimumCloseSampleCount `
     -WarmOpenTargetMilliseconds $WarmOpenTargetMilliseconds -RefreshRateHz $RefreshRateHz `
     -SourceType $sourceType -SourcePath $sourcePath
 $report.source | Add-Member -NotePropertyName sha256 -NotePropertyValue $sourceHash

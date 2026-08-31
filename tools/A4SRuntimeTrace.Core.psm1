@@ -136,7 +136,8 @@ function ConvertFrom-A4STracerptXml {
         $providerGuid = Get-A4SXmlAttribute $provider @('Guid', 'ProviderGuid')
         $providerName = Get-A4SXmlAttribute $provider @('Name', 'EventSourceName')
         $normalizedGuid = if ($providerGuid) { $providerGuid.Trim('{}').ToLowerInvariant() } else { '' }
-        if ($normalizedGuid -ne $script:A4SProviderGuid -and $providerName -ne 'A4SMenu.Runtime') { continue }
+        if (($normalizedGuid -and $normalizedGuid -ne $script:A4SProviderGuid) -or
+            (-not $normalizedGuid -and $providerName -ne 'A4SMenu.Runtime')) { continue }
 
         $timeNode = $system.SelectSingleNode("./*[local-name()='TimeCreated']")
         $timestamp = Get-A4SXmlAttribute $timeNode @('SystemTime')
@@ -156,12 +157,10 @@ function ConvertFrom-A4STracerptXml {
             -not $payload.ContainsKey('Operation')) { continue }
 
         $execution = $system.SelectSingleNode("./*[local-name()='Execution']")
-        if (-not $payload.ContainsKey('ProcessId')) {
-            $payload['ProcessId'] = Get-A4SXmlAttribute $execution @('ProcessID', 'ProcessId')
-        }
-        if (-not $payload.ContainsKey('ThreadId')) {
-            $payload['ThreadId'] = Get-A4SXmlAttribute $execution @('ThreadID', 'ThreadId')
-        }
+        $systemProcessId = Get-A4SXmlAttribute $execution @('ProcessID', 'ProcessId')
+        $systemThreadId = Get-A4SXmlAttribute $execution @('ThreadID', 'ThreadId')
+        if ($systemProcessId) { $payload['ProcessId'] = $systemProcessId }
+        if ($systemThreadId) { $payload['ThreadId'] = $systemThreadId }
         $payload['TimestampUtc'] = $timestamp
         $sequence++
         $canonical = New-A4SCanonicalEvent -InputObject $payload -Sequence $sequence
@@ -221,6 +220,9 @@ function ConvertTo-A4SRuntimeReport {
     param(
         [Parameter(Mandatory)][object[]]$Events,
         [ValidateRange(0, 1000)][int]$ColdSampleCount = 0,
+        [ValidateRange(0, 1000)][int]$ExpectedCycleCount = 0,
+        [ValidateRange(1, 1000)][int]$MinimumWarmSampleCount = 20,
+        [ValidateRange(1, 1000)][int]$MinimumCloseSampleCount = 20,
         [ValidateRange(1, 250)][double]$WarmOpenTargetMilliseconds = 50,
         [ValidateRange(20, 1000)][double]$RefreshRateHz = 60,
         [string]$SourceType = 'events',
@@ -239,11 +241,28 @@ function ConvertTo-A4SRuntimeReport {
         }
     }
     $orderedEvents = @($canonicalEvents | Sort-Object timestampUtc, sequence)
+    $orderedSequence = 0
+    foreach ($event in $orderedEvents) {
+        $orderedSequence++
+        $event.sequence = $orderedSequence
+    }
     $diagnostics = [Collections.Generic.List[object]]::new()
+    $processIds = @($orderedEvents.processId | Sort-Object -Unique)
+    if ($processIds.Count -ne 1 -or $processIds[0] -eq 0) {
+        [void]$diagnostics.Add([pscustomobject][ordered]@{
+            kind = 'nonUniqueProcess'; processIds = @($processIds)
+        })
+    }
     $begins = @{}
     $phases = [Collections.Generic.List[object]]::new()
 
     foreach ($event in $orderedEvents) {
+        if ($event.stageId -ne 0 -and $event.operation -eq 0) {
+            [void]$diagnostics.Add([pscustomobject][ordered]@{
+                kind = 'zeroPhaseOperation'; eventName = $event.eventName
+                timestampUtc = $event.timestampUtc
+            })
+        }
         if ($event.stageId -eq 1) {
             $key = "$($event.eventId):$($event.operation)"
             if ($begins.ContainsKey($key)) {
@@ -262,11 +281,20 @@ function ConvertTo-A4SRuntimeReport {
                     operation = $event.operation
                     startUtc = $begin.timestampUtc
                     endUtc = $event.timestampUtc
+                    startSequence = $begin.sequence
+                    endSequence = $event.sequence
                     durationMilliseconds = Get-A4SDurationMilliseconds $begin.timestampUtc $event.timestampUtc
                     value = $event.value
                     cacheHit = $event.cacheHit
                     threadId = $begin.threadId
                 })
+                if ($begin.threadId -ne $event.threadId) {
+                    [void]$diagnostics.Add([pscustomobject][ordered]@{
+                        kind = 'phaseThreadMismatch'; eventName = $event.eventName
+                        operation = $event.operation; beginThreadId = $begin.threadId
+                        endThreadId = $event.threadId
+                    })
+                }
             }
         }
     }
@@ -281,27 +309,51 @@ function ConvertTo-A4SRuntimeReport {
     }
     $activationEvents = @($orderedEvents | Where-Object { $_.eventId -eq 1 -and $_.stageId -eq 0 })
     $cycles = [Collections.Generic.List[object]]::new()
-    $previousOpenStart = [DateTimeOffset]::MinValue
+    $previousCycleBoundarySequence = 0
     for ($index = 0; $index -lt $openBegins.Count; $index++) {
         $open = $openBegins[$index]
-        $nextOpenStart = if ($index + 1 -lt $openBegins.Count) { $openBegins[$index + 1].timestampUtc } else { [DateTimeOffset]::MaxValue }
-        $visible = @($orderedEvents | Where-Object { $_.eventId -eq 6 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and $_.timestampUtc -ge $open.timestampUtc } | Select-Object -First 1)
-        $paint = @($orderedEvents | Where-Object { $_.eventId -eq 7 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and $_.timestampUtc -ge $open.timestampUtc } | Select-Object -First 1)
-        $hidden = @($orderedEvents | Where-Object { $_.eventId -eq 11 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and $_.timestampUtc -ge $open.timestampUtc -and $_.timestampUtc -lt $nextOpenStart } | Select-Object -First 1)
-        $openPhase = @($phases | Where-Object { $_.eventId -eq 2 -and $_.operation -eq $open.operation } | Select-Object -First 1)
-        $boundary = if ($hidden.Count) { $hidden[0].timestampUtc } else { $nextOpenStart }
-        $closePhase = @($phases | Where-Object { $_.eventId -eq 10 -and $_.startUtc -ge $open.timestampUtc -and $_.startUtc -le $boundary } | Sort-Object startUtc | Select-Object -First 1)
-        $activation = @($activationEvents | Where-Object { $_.timestampUtc -ge $previousOpenStart -and $_.timestampUtc -le $open.timestampUtc } | Sort-Object timestampUtc | Select-Object -Last 1)
-        $closeActivation = @()
+        $nextOpenSequence = if ($index + 1 -lt $openBegins.Count) { $openBegins[$index + 1].sequence } else { [int]::MaxValue }
+        $visibleCandidates = @($orderedEvents | Where-Object {
+            $_.eventId -eq 6 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and
+            $_.sequence -ge $open.sequence -and $_.sequence -lt $nextOpenSequence
+        })
+        $paintCandidates = @($orderedEvents | Where-Object {
+            $_.eventId -eq 7 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and
+            $_.sequence -ge $open.sequence -and $_.sequence -lt $nextOpenSequence
+        })
+        $hiddenCandidates = @($orderedEvents | Where-Object {
+            $_.eventId -eq 11 -and $_.stageId -eq 0 -and $_.operation -eq $open.operation -and
+            $_.sequence -ge $open.sequence -and $_.sequence -lt $nextOpenSequence
+        })
+        $openPhaseCandidates = @($phases | Where-Object { $_.eventId -eq 2 -and $_.operation -eq $open.operation })
+        $visible = @($visibleCandidates | Select-Object -First 1)
+        $paint = @($paintCandidates | Select-Object -First 1)
+        $hidden = @($hiddenCandidates | Select-Object -First 1)
+        $openPhase = @($openPhaseCandidates | Select-Object -First 1)
+        $boundarySequence = if ($hidden.Count) { $hidden[0].sequence } else { $nextOpenSequence }
+        $closePhaseCandidates = @($phases | Where-Object {
+            $_.eventId -eq 10 -and $_.startSequence -ge $open.sequence -and
+            $_.startSequence -le $boundarySequence
+        } | Sort-Object startSequence)
+        $closePhase = @($closePhaseCandidates | Select-Object -First 1)
+        $activationCandidates = @($activationEvents | Where-Object {
+            $_.operation -eq 0 -and $_.sequence -gt $previousCycleBoundarySequence -and
+            $_.sequence -le $open.sequence
+        } | Sort-Object sequence)
+        $activation = @($activationCandidates | Select-Object -Last 1)
+        $closeActivationCandidates = @()
         if ($closePhase.Count) {
-            $closeActivation = @($activationEvents | Where-Object {
-                $_.timestampUtc -ge $open.timestampUtc -and $_.timestampUtc -le $closePhase[0].startUtc
-            } | Sort-Object timestampUtc | Select-Object -Last 1)
+            $closeActivationCandidates = @($activationEvents | Where-Object {
+                $_.operation -eq $open.operation -and $_.sequence -ge $open.sequence -and
+                $_.sequence -le $closePhase[0].startSequence
+            } | Sort-Object sequence)
         }
+        $closeActivation = @($closeActivationCandidates | Select-Object -Last 1)
         $sourceId = if ($open.activationSourceId -ne 0) { $open.activationSourceId } elseif ($activation.Count) { $activation[0].activationSourceId } else { 0 }
         $sourceName = if ($script:A4SActivationNames.ContainsKey([int]$sourceId)) { $script:A4SActivationNames[[int]$sourceId] } else { 'unknown' }
         $cyclePhases = @($phases | Where-Object {
-            $_.eventId -notin @(2, 10) -and $_.startUtc -ge $open.timestampUtc -and $_.startUtc -le $boundary
+            $_.eventId -notin @(2, 10) -and $_.startSequence -ge $open.sequence -and
+            $_.startSequence -le $boundarySequence
         } | Sort-Object startUtc)
         $missing = [Collections.Generic.List[string]]::new()
         if (-not $activation.Count) { [void]$missing.Add('activationRequested') }
@@ -311,6 +363,24 @@ function ConvertTo-A4SRuntimeReport {
         if (-not $closeActivation.Count) { [void]$missing.Add('closeActivationRequested') }
         if (-not $closePhase.Count) { [void]$missing.Add('closePath') }
         if (-not $hidden.Count) { [void]$missing.Add('windowHidden') }
+        $markerChecks = @(
+            [pscustomobject]@{ name = 'activationRequested'; count = $activationCandidates.Count }
+            [pscustomobject]@{ name = 'openPath'; count = $openPhaseCandidates.Count }
+            [pscustomobject]@{ name = 'windowVisible'; count = $visibleCandidates.Count }
+            [pscustomobject]@{ name = 'firstPaint'; count = $paintCandidates.Count }
+            [pscustomobject]@{ name = 'closeActivationRequested'; count = $closeActivationCandidates.Count }
+            [pscustomobject]@{ name = 'closePath'; count = $closePhaseCandidates.Count }
+            [pscustomobject]@{ name = 'windowHidden'; count = $hiddenCandidates.Count }
+        )
+        foreach ($marker in $markerChecks) {
+            if ([int]$marker.count -gt 1) {
+                [void]$diagnostics.Add([pscustomobject][ordered]@{
+                    kind = 'duplicateCycleMarker'; cycle = $index + 1
+                    operation = $open.operation; marker = [string]$marker.name
+                    count = [int]$marker.count
+                })
+            }
+        }
         if ($missing.Count) {
             [void]$diagnostics.Add([pscustomobject][ordered]@{ kind = 'incompleteCycle'; cycle = $index + 1; operation = $open.operation; missing = @($missing) })
         }
@@ -350,23 +420,34 @@ function ConvertTo-A4SRuntimeReport {
             missing = @($missing)
             phases = $cyclePhases
         })
-        $previousOpenStart = $open.timestampUtc
+        $previousCycleBoundarySequence = if ($hidden.Count) { $hidden[0].sequence } else { $open.sequence }
+    }
+
+    if ($ExpectedCycleCount -gt 0 -and $cycles.Count -ne $ExpectedCycleCount) {
+        [void]$diagnostics.Add([pscustomobject][ordered]@{
+            kind = 'cycleCountMismatch'; expected = $ExpectedCycleCount; actual = $cycles.Count
+        })
     }
 
     $warmCycles = @($cycles | Where-Object { $_.classification -eq 'warm' })
+    $completeWarmCycles = @($warmCycles | Where-Object { $_.complete })
+    $completeCycles = @($cycles | Where-Object { $_.complete })
     $allPhaseStats = [ordered]@{}
     foreach ($group in @($phases | Where-Object { $_.eventId -notin @(2, 10) } | Group-Object eventName | Sort-Object Name)) {
         $allPhaseStats[$group.Name] = Get-A4SStatistics @($group.Group.durationMilliseconds)
     }
-    $warmOpen = Get-A4SStatistics @($warmCycles.activationToVisibleMilliseconds)
-    $warmPaint = Get-A4SStatistics @($warmCycles.activationToFirstPaintMilliseconds)
-    $close = Get-A4SStatistics @($cycles.closeActivationToHiddenMilliseconds)
+    $warmOpen = Get-A4SStatistics @($completeWarmCycles | ForEach-Object { $_.activationToVisibleMilliseconds })
+    $warmPaint = Get-A4SStatistics @($completeWarmCycles | ForEach-Object { $_.activationToFirstPaintMilliseconds })
+    $close = Get-A4SStatistics @($completeCycles | ForEach-Object { $_.closeActivationToHiddenMilliseconds })
     $frameBudget = [Math]::Round(1000.0 / $RefreshRateHz, 3)
     $warmStatus = if ($warmOpen.count -eq 0) { 'notMeasured' } elseif ($warmOpen.p95Milliseconds -le $WarmOpenTargetMilliseconds) { 'pass' } else { 'fail' }
     $closeStatus = if ($close.count -eq 0) { 'notMeasured' } elseif ($close.p95Milliseconds -le $frameBudget) { 'pass' } else { 'fail' }
     $completeStatus = if ($diagnostics.Count -eq 0 -and $cycles.Count -gt 0) { 'pass' } else { 'fail' }
-    $measuredStatuses = @($warmStatus, $closeStatus, $completeStatus | Where-Object { $_ -ne 'notMeasured' })
-    $overallStatus = if ($measuredStatuses.Count -eq 0) { 'notMeasured' } elseif ($measuredStatuses -contains 'fail') { 'fail' } else { 'pass' }
+    $cycleCountStatus = if ($ExpectedCycleCount -eq 0) { 'notMeasured' } elseif ($cycles.Count -eq $ExpectedCycleCount) { 'pass' } else { 'fail' }
+    $warmSampleStatus = if ($completeWarmCycles.Count -ge $MinimumWarmSampleCount) { 'pass' } else { 'fail' }
+    $closeSampleStatus = if ($completeCycles.Count -ge $MinimumCloseSampleCount) { 'pass' } else { 'fail' }
+    $requiredStatuses = @($warmStatus, $closeStatus, $completeStatus, $cycleCountStatus, $warmSampleStatus, $closeSampleStatus)
+    $overallStatus = if ($requiredStatuses -contains 'fail') { 'fail' } elseif ($requiredStatuses -contains 'notMeasured') { 'notMeasured' } else { 'pass' }
 
     $serializedEvents = @($orderedEvents | ForEach-Object {
         [pscustomobject][ordered]@{
@@ -388,25 +469,39 @@ function ConvertTo-A4SRuntimeReport {
     })
 
     return [pscustomobject][ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         generatedUtc = [DateTimeOffset]::UtcNow.ToString('o')
         provider = [pscustomobject][ordered]@{ name = 'A4SMenu.Runtime'; guid = $script:A4SProviderGuid }
         source = [pscustomobject][ordered]@{ type = $SourceType; path = $SourcePath }
-        samplePolicy = [pscustomobject][ordered]@{ coldSampleCount = $ColdSampleCount; warmSampleCount = $warmCycles.Count }
-        counts = [pscustomobject][ordered]@{ events = $orderedEvents.Count; operations = $phases.Count; cycles = $cycles.Count; diagnostics = $diagnostics.Count }
+        samplePolicy = [pscustomobject][ordered]@{
+            coldSampleCount = $ColdSampleCount
+            warmSampleCount = $warmCycles.Count
+            completeWarmSampleCount = $completeWarmCycles.Count
+            expectedCycleCount = if ($ExpectedCycleCount -gt 0) { $ExpectedCycleCount } else { $null }
+            minimumWarmSampleCount = $MinimumWarmSampleCount
+            minimumCloseSampleCount = $MinimumCloseSampleCount
+        }
+        counts = [pscustomobject][ordered]@{
+            events = $orderedEvents.Count; operations = $phases.Count; cycles = $cycles.Count
+            completeCycles = $completeCycles.Count; processes = $processIds.Count
+            diagnostics = $diagnostics.Count
+        }
         statistics = [pscustomobject][ordered]@{
             warmActivationToVisible = $warmOpen
             warmActivationToFirstPaint = $warmPaint
             allCloseActivationToHidden = $close
-            allCloseBeginToHidden = Get-A4SStatistics @($cycles.closeBeginToHiddenMilliseconds)
-            allOpenPath = Get-A4SStatistics @($cycles.openPathMilliseconds)
-            allClosePath = Get-A4SStatistics @($cycles.closePathMilliseconds)
+            allCloseBeginToHidden = Get-A4SStatistics @($cycles | ForEach-Object { $_.closeBeginToHiddenMilliseconds })
+            allOpenPath = Get-A4SStatistics @($cycles | ForEach-Object { $_.openPathMilliseconds })
+            allClosePath = Get-A4SStatistics @($cycles | ForEach-Object { $_.closePathMilliseconds })
             phases = [pscustomobject]$allPhaseStats
         }
         targetEvaluation = [pscustomobject][ordered]@{
             overallCustomTraceStatus = $overallStatus
             warmOpen = [pscustomobject][ordered]@{ metric = 'activationRequested to windowVisible'; p95Milliseconds = $warmOpen.p95Milliseconds; targetMilliseconds = $WarmOpenTargetMilliseconds; status = $warmStatus }
             close = [pscustomobject][ordered]@{ metric = 'close activationRequested to windowHidden'; p95Milliseconds = $close.p95Milliseconds; refreshRateHz = $RefreshRateHz; frameBudgetMilliseconds = $frameBudget; status = $closeStatus }
+            cycleCount = [pscustomobject][ordered]@{ expected = if ($ExpectedCycleCount -gt 0) { $ExpectedCycleCount } else { $null }; actual = $cycles.Count; status = $cycleCountStatus }
+            warmSampleSufficiency = [pscustomobject][ordered]@{ minimum = $MinimumWarmSampleCount; actual = $completeWarmCycles.Count; status = $warmSampleStatus }
+            closeSampleSufficiency = [pscustomobject][ordered]@{ minimum = $MinimumCloseSampleCount; actual = $completeCycles.Count; status = $closeSampleStatus }
             completeness = [pscustomobject][ordered]@{ requiredDiagnostics = 0; actualDiagnostics = $diagnostics.Count; status = $completeStatus }
             presentedFrame = [pscustomobject][ordered]@{ status = 'notMeasured'; reason = 'windowVisible and firstPaint are application markers, not compositor presentation timestamps' }
             physicalWarmDiskIo = [pscustomobject][ordered]@{ status = 'notMeasured'; reason = 'the custom provider does not capture physical file I/O' }

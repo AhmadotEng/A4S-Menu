@@ -28,6 +28,11 @@ $captureText = Get-Content -LiteralPath $capturePath -Raw
 Assert-A4S ($captureText -match '\[switch\]\$AllowMenuAutomation') 'capture tool has no explicit AllowMenuAutomation switch'
 Assert-A4S ($captureText -match 'if \(-not \$AllowMenuAutomation\)') 'capture gate is not enforced before preflight'
 Assert-A4S ($captureText -notmatch '(?i)Start-Process|Stop-Process|Restart-Computer|Stop-Computer|--rehook|--reset-safety|Invoke-WebRequest|Invoke-RestMethod') 'capture tool contains a forbidden process, injection, restart, or network primitive'
+Assert-A4S ($captureText -notmatch 'VisibleMenuWindows\(0\)') 'capture cleanup can inspect or toggle based on a menu from an unvalidated process'
+Assert-A4S ($captureText -match 'LoadedImageIdentity' -and $captureText -match 'FileImageIdentity') 'capture preflight does not compare resident and staged PE build identities'
+Assert-A4S ($captureText -match 'ExpectedCycleCount\s*=\s*\$CapturedCycles') 'capture does not bind report completeness to the requested cycle count'
+Assert-A4S ($captureText -match '\$sessionCreateAttempted\s*=\s*\$true[\s\S]+Invoke-A4SLogman -Arguments \$startArguments') 'ETW create attempts are not armed for unconditional cleanup before logman runs'
+Assert-A4S ($captureText -match 'Invoke-A4SLogman -Arguments @\(''stop'', \$sessionName, ''-ets''\)') 'ETW session teardown is missing'
 
 $captureTokens = $null
 $captureParseErrors = $null
@@ -43,6 +48,15 @@ if (-not ('A4SRuntimeTraceNative' -as [type])) {
     Add-Type -TypeDefinition $interopSources[0].Value
 }
 Assert-A4S ($null -ne ('A4SRuntimeTraceNative' -as [type])) 'embedded native interop source did not compile'
+
+$stagedProduct = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\build\stage\A4SProduct'))
+foreach ($stagedName in @('A4SMenuHost.exe', 'A4SMenu.dll')) {
+    $stagedPath = Join-Path $stagedProduct $stagedName
+    if (Test-Path -LiteralPath $stagedPath -PathType Leaf) {
+        $identity = [A4SRuntimeTraceNative]::FileImageIdentity($stagedPath)
+        Assert-A4S ($identity -match '^timestamp=[0-9a-f]{8};size=[0-9a-f]{8};checksum=[0-9a-f]{8};rsds=[0-9a-f]{32};age=[1-9][0-9]*$') "$stagedName has no strong parseable PE/RSDS identity"
+    }
+}
 
 $gateWorked = $false
 try { & $capturePath } catch {
@@ -120,8 +134,10 @@ try {
     $outputPath = Join-Path $tempRoot 'report.json'
     @($synthetic) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
     [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
-        -ExpectedProcessId 4242 -ColdSampleCount 1 -RefreshRateHz 60 -OutputPath $outputPath)
+        -ExpectedProcessId 4242 -ColdSampleCount 1 -ExpectedCycleCount 3 `
+        -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60 -OutputPath $outputPath)
     $report = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+    Assert-A4S ($report.schemaVersion -eq 2) 'runtime report schema was not advanced for strict completeness fields'
     Assert-A4S ($report.counts.cycles -eq 3) 'synthetic JSON did not correlate three cycles'
     Assert-A4S ($report.counts.diagnostics -eq 0) 'complete synthetic JSON produced diagnostics'
     Assert-A4S ($report.samplePolicy.coldSampleCount -eq 1 -and $report.samplePolicy.warmSampleCount -eq 2) 'cold/warm sample policy is wrong'
@@ -156,7 +172,9 @@ try {
             foreach ($field in @('Event', 'Stage', 'Operation', 'Value', 'CacheHit', 'ActivationSource', 'Window', 'ProcessId', 'ThreadId')) {
                 $writer.WriteStartElement('Data')
                 $writer.WriteAttributeString('Name', $field)
-                $writer.WriteString([string]$event.$field)
+                # The ETW System/Execution identity is authoritative. A payload
+                # field with the same name must not override it.
+                $writer.WriteString($(if ($field -eq 'ProcessId') { '9999' } else { [string]$event.$field }))
                 $writer.WriteEndElement()
             }
             $writer.WriteEndElement()
@@ -168,17 +186,82 @@ try {
 
     $xmlEvents = @(ConvertFrom-A4STracerptXml -Path $xmlPath -ExpectedProcessId 4242)
     Assert-A4S ($xmlEvents.Count -eq $synthetic.Count) 'tracerpt XML parser lost synthetic events'
-    $xmlReport = ConvertTo-A4SRuntimeReport -Events $xmlEvents -ColdSampleCount 1 -RefreshRateHz 60
+    $xmlReport = ConvertTo-A4SRuntimeReport -Events $xmlEvents -ColdSampleCount 1 `
+        -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60
     Assert-A4S ($xmlReport.counts.cycles -eq 3 -and $xmlReport.counts.diagnostics -eq 0) 'tracerpt XML correlation disagrees with JSON correlation'
+
+    [xml]$wrongProviderDocument = Get-Content -LiteralPath $xmlPath -Raw
+    $wrongProviderFirstEvent = $wrongProviderDocument.SelectSingleNode("//*[local-name()='Event']")
+    $wrongProviderNode = $wrongProviderFirstEvent.SelectSingleNode("./*[local-name()='System']/*[local-name()='Provider']")
+    $wrongProviderNode.SetAttribute('Guid', '{11111111-2222-3333-4444-555555555555}')
+    $wrongProviderPath = Join-Path $tempRoot 'wrong-provider.xml'
+    $wrongProviderDocument.Save($wrongProviderPath)
+    $wrongProviderEvents = @(ConvertFrom-A4STracerptXml -Path $wrongProviderPath -ExpectedProcessId 4242)
+    Assert-A4S ($wrongProviderEvents.Count -eq $synthetic.Count - 1) 'provider-name fallback accepted an event carrying the wrong provider GUID'
+
+    $missingWholeCycleReport = ConvertTo-A4SRuntimeReport -Events $xmlEvents -ColdSampleCount 1 `
+        -ExpectedCycleCount 4 -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60
+    Assert-A4S (@($missingWholeCycleReport.diagnostics | Where-Object { $_.kind -eq 'cycleCountMismatch' }).Count -eq 1) 'a wholly missing cycle was not diagnosed'
+    Assert-A4S ($missingWholeCycleReport.targetEvaluation.overallCustomTraceStatus -eq 'fail') 'a wholly missing cycle could still pass targets'
+
+    $noWarmReport = ConvertTo-A4SRuntimeReport -Events $xmlEvents -ColdSampleCount 3 `
+        -ExpectedCycleCount 3 -MinimumWarmSampleCount 1 -MinimumCloseSampleCount 3 -RefreshRateHz 60
+    Assert-A4S ($noWarmReport.targetEvaluation.warmOpen.status -eq 'notMeasured') 'a trace with no warm sample fabricated a warm metric'
+    Assert-A4S ($noWarmReport.targetEvaluation.overallCustomTraceStatus -ne 'pass') 'a trace with no warm sample could pass targets'
+
+    $missingOpenActivationEvents = @($xmlEvents | Where-Object {
+        -not ($_.eventId -eq 1 -and $_.operation -eq 0 -and $_.timestampUtc -eq $baseTime.AddMilliseconds(200))
+    })
+    $missingOpenActivationReport = ConvertTo-A4SRuntimeReport -Events $missingOpenActivationEvents `
+        -ColdSampleCount 1 -ExpectedCycleCount 3 -MinimumWarmSampleCount 1 `
+        -MinimumCloseSampleCount 2 -RefreshRateHz 60
+    Assert-A4S (@($missingOpenActivationReport.diagnostics | Where-Object {
+        $_.kind -eq 'incompleteCycle' -and $_.cycle -eq 2 -and $_.missing -contains 'activationRequested'
+    }).Count -eq 1) 'a prior close activation was incorrectly reused as the next open activation'
+
+    $mixedProcessEvents = @($xmlEvents) + [pscustomobject][ordered]@{
+        sequence = 999; timestampUtc = $baseTime.AddMilliseconds(390); eventId = 1
+        eventName = 'activationRequested'; stageId = 0; stageName = 'instant'; operation = 0
+        value = 0; cacheHit = $false; activationSourceId = 1; activationSource = 'host'
+        window = 0; processId = 8484; threadId = 17
+    }
+    $mixedProcessReport = ConvertTo-A4SRuntimeReport -Events $mixedProcessEvents -ColdSampleCount 1 `
+        -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60
+    Assert-A4S (@($mixedProcessReport.diagnostics | Where-Object { $_.kind -eq 'nonUniqueProcess' }).Count -eq 1) 'events from multiple processes were not diagnosed'
+
+    $duplicateVisibleEvents = @($xmlEvents) + [pscustomobject][ordered]@{
+        TimestampUtc = $baseTime.AddMilliseconds(221.1).ToString('o'); Event = 6
+        Stage = 0; Operation = 200; Value = 0; CacheHit = $false; ActivationSource = 0
+        Window = '0x100'; ProcessId = 4242; ThreadId = 17
+    }
+    $duplicateVisibleReport = ConvertTo-A4SRuntimeReport -Events $duplicateVisibleEvents `
+        -ColdSampleCount 1 -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 `
+        -MinimumCloseSampleCount 3 -RefreshRateHz 60
+    Assert-A4S (@($duplicateVisibleReport.diagnostics | Where-Object {
+        $_.kind -eq 'duplicateCycleMarker' -and $_.cycle -eq 2 -and $_.marker -eq 'windowVisible'
+    }).Count -eq 1) 'a duplicate visibility marker was not diagnosed'
+    Assert-A4S ($duplicateVisibleReport.targetEvaluation.overallCustomTraceStatus -eq 'fail') 'duplicate cycle markers could still pass targets'
 
     $incomplete = @($xmlEvents) + [pscustomobject][ordered]@{
         TimestampUtc = $baseTime.AddMilliseconds(400).ToString('o')
         Event = 12; Stage = 1; Operation = 999; Value = 0; CacheHit = $false
         ActivationSource = 0; Window = '0x0'; ProcessId = 4242; ThreadId = 17
     }
-    $badReport = ConvertTo-A4SRuntimeReport -Events $incomplete -ColdSampleCount 1 -RefreshRateHz 60
+    $badReport = ConvertTo-A4SRuntimeReport -Events $incomplete -ColdSampleCount 1 `
+        -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60
     Assert-A4S (@($badReport.diagnostics | Where-Object { $_.kind -eq 'beginWithoutEnd' -and $_.operation -eq 999 }).Count -eq 1) 'unmatched phase begin was not diagnosed'
     Assert-A4S ($badReport.targetEvaluation.completeness.status -eq 'fail') 'incomplete trace did not fail completeness target'
+
+    $missingExpectedOutput = Join-Path $tempRoot 'missing-expected.json'
+    $enforcementRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+            -ExpectedProcessId 4242 -ColdSampleCount 1 -MinimumWarmSampleCount 2 `
+            -MinimumCloseSampleCount 3 -RefreshRateHz 60 -OutputPath $missingExpectedOutput -EnforceTargets)
+    } catch {
+        if ($_.Exception.Message -match 'did not pass') { $enforcementRejected = $true }
+    }
+    Assert-A4S $enforcementRejected 'target enforcement passed without an expected cycle count'
 } finally {
     $resolvedTempRoot = [IO.Path]::GetFullPath($tempRoot)
     if ($resolvedTempRoot.StartsWith($tempBase, [StringComparison]::OrdinalIgnoreCase) -and
@@ -187,4 +270,4 @@ try {
     }
 }
 
-Write-Output 'PASS: A4S runtime trace scripts parse cleanly, fail closed without automation consent, decode synthetic tracerpt XML, correlate operations, compute targets, and diagnose incomplete traces without starting or injecting the product.'
+Write-Output 'PASS: A4S runtime trace scripts parse cleanly, fail closed without automation consent, validate staged PE/RSDS identities when present, decode synthetic tracerpt XML, reject truncated/mixed/ambiguous traces, enforce sample sufficiency, and diagnose incomplete operations without starting or injecting the product.'

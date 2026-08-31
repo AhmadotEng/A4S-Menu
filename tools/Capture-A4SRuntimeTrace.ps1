@@ -44,6 +44,8 @@ if (-not ('A4SRuntimeTraceNative' -as [type])) {
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Globalization;
+using System.IO;
 using System.Runtime.InteropServices;
 using System.Text;
 
@@ -107,6 +109,16 @@ public static class A4SRuntimeTraceNative
 
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr OpenProcess(uint desiredAccess, bool inheritHandle, uint processId);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool ReadProcessMemory(IntPtr process, IntPtr address, [Out] byte[] buffer,
+        UIntPtr size, out UIntPtr bytesRead);
+
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFOEX info);
@@ -179,6 +191,164 @@ public static class A4SRuntimeTraceNative
         if (!EnumDisplaySettingsW(info.DeviceName, -1, ref mode)) return 0;
         return mode.DisplayFrequency >= 20 && mode.DisplayFrequency <= 1000 ? mode.DisplayFrequency : 0;
     }
+
+    private static ushort U16(byte[] bytes, int offset)
+    {
+        if (offset < 0 || offset > bytes.Length - 2) throw new InvalidDataException("Truncated PE image.");
+        return BitConverter.ToUInt16(bytes, offset);
+    }
+
+    private static uint U32(byte[] bytes, int offset)
+    {
+        if (offset < 0 || offset > bytes.Length - 4) throw new InvalidDataException("Truncated PE image.");
+        return BitConverter.ToUInt32(bytes, offset);
+    }
+
+    private static byte[] ReadRemote(IntPtr process, IntPtr address, int count)
+    {
+        byte[] bytes = new byte[count];
+        UIntPtr read;
+        if (!ReadProcessMemory(process, address, bytes, new UIntPtr((uint)count), out read) ||
+            read.ToUInt64() != (ulong)count)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not read the resident PE image");
+        return bytes;
+    }
+
+    private sealed class PeHeaders
+    {
+        public int PeOffset;
+        public int OptionalOffset;
+        public int SectionOffset;
+        public ushort SectionCount;
+        public ushort OptionalSize;
+        public uint TimeDateStamp;
+        public uint SizeOfImage;
+        public uint Checksum;
+        public uint DebugRva;
+        public uint DebugSize;
+    }
+
+    private static PeHeaders ParseHeaders(byte[] bytes)
+    {
+        if (bytes.Length < 0x100 || U16(bytes, 0) != 0x5a4d)
+            throw new InvalidDataException("The image has no valid DOS header.");
+        int pe = checked((int)U32(bytes, 0x3c));
+        if (pe < 0x40 || pe > bytes.Length - 24 || U32(bytes, pe) != 0x00004550)
+            throw new InvalidDataException("The image has no valid PE header.");
+        ushort sections = U16(bytes, pe + 6);
+        ushort optionalSize = U16(bytes, pe + 20);
+        int optional = checked(pe + 24);
+        int sectionOffset = checked(optional + optionalSize);
+        if (sections == 0 || sections > 96 || sectionOffset > bytes.Length - (sections * 40))
+            throw new InvalidDataException("The image has an invalid section table.");
+        ushort magic = U16(bytes, optional);
+        int directoryBase;
+        int directoryCountOffset;
+        if (magic == 0x20b) { directoryBase = optional + 112; directoryCountOffset = optional + 108; }
+        else if (magic == 0x10b) { directoryBase = optional + 96; directoryCountOffset = optional + 92; }
+        else throw new InvalidDataException("The image has an unsupported optional header.");
+        uint directoryCount = U32(bytes, directoryCountOffset);
+        uint debugRva = 0, debugSize = 0;
+        if (directoryCount > 6 && directoryBase + 56 <= optional + optionalSize)
+        {
+            debugRva = U32(bytes, directoryBase + 48);
+            debugSize = U32(bytes, directoryBase + 52);
+        }
+        return new PeHeaders {
+            PeOffset = pe, OptionalOffset = optional, SectionOffset = sectionOffset,
+            SectionCount = sections, OptionalSize = optionalSize,
+            TimeDateStamp = U32(bytes, pe + 8), SizeOfImage = U32(bytes, optional + 56),
+            Checksum = U32(bytes, optional + 64), DebugRva = debugRva, DebugSize = debugSize
+        };
+    }
+
+    private static int RvaToFileOffset(byte[] bytes, PeHeaders headers, uint rva)
+    {
+        uint sizeOfHeaders = U32(bytes, headers.OptionalOffset + 60);
+        if (rva < sizeOfHeaders) return checked((int)rva);
+        for (int index = 0; index < headers.SectionCount; index++)
+        {
+            int section = headers.SectionOffset + index * 40;
+            uint virtualSize = U32(bytes, section + 8);
+            uint virtualAddress = U32(bytes, section + 12);
+            uint rawSize = U32(bytes, section + 16);
+            uint rawOffset = U32(bytes, section + 20);
+            uint extent = Math.Max(virtualSize, rawSize);
+            if (rva >= virtualAddress && (ulong)rva < (ulong)virtualAddress + extent)
+                return checked((int)(rawOffset + (rva - virtualAddress)));
+        }
+        throw new InvalidDataException("A PE data-directory RVA does not map to a file section.");
+    }
+
+    private static string Identity(uint stamp, uint sizeOfImage, uint checksum, byte[] codeView)
+    {
+        if (codeView == null || codeView.Length < 24 || U32(codeView, 0) != 0x53445352)
+            throw new InvalidDataException("The image has no strong RSDS build identity; refusing path-only validation.");
+        byte[] guidBytes = new byte[16];
+        Buffer.BlockCopy(codeView, 4, guidBytes, 0, 16);
+        Guid guid = new Guid(guidBytes);
+        uint age = U32(codeView, 20);
+        if (guid == Guid.Empty || age == 0)
+            throw new InvalidDataException("The image has an invalid RSDS build identity.");
+        return String.Format(CultureInfo.InvariantCulture,
+            "timestamp={0:x8};size={1:x8};checksum={2:x8};rsds={3:N};age={4}",
+            stamp, sizeOfImage, checksum, guid, age);
+    }
+
+    public static string FileImageIdentity(string path)
+    {
+        byte[] bytes = File.ReadAllBytes(path);
+        PeHeaders headers = ParseHeaders(bytes);
+        if (headers.DebugRva == 0 || headers.DebugSize < 28 || headers.DebugSize > 0x10000)
+            throw new InvalidDataException("The staged image has no usable debug directory.");
+        int debugOffset = RvaToFileOffset(bytes, headers, headers.DebugRva);
+        int debugCount = checked((int)(headers.DebugSize / 28));
+        for (int index = 0; index < debugCount; index++)
+        {
+            int entry = checked(debugOffset + index * 28);
+            if (entry > bytes.Length - 28) break;
+            if (U32(bytes, entry + 12) != 2) continue;
+            uint dataSize = U32(bytes, entry + 16);
+            uint rawOffset = U32(bytes, entry + 24);
+            if (dataSize < 24 || rawOffset > bytes.Length - 24) continue;
+            byte[] codeView = new byte[24];
+            Buffer.BlockCopy(bytes, checked((int)rawOffset), codeView, 0, 24);
+            return Identity(headers.TimeDateStamp, headers.SizeOfImage, headers.Checksum, codeView);
+        }
+        throw new InvalidDataException("The staged image has no RSDS CodeView record.");
+    }
+
+    public static string LoadedImageIdentity(uint processId, IntPtr baseAddress)
+    {
+        const uint PROCESS_QUERY_INFORMATION = 0x0400;
+        const uint PROCESS_VM_READ = 0x0010;
+        IntPtr process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, false, processId);
+        if (process == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "Could not open the resident product process");
+        try
+        {
+            byte[] initial = ReadRemote(process, baseAddress, 0x1000);
+            int pe = checked((int)U32(initial, 0x3c));
+            int required = checked(pe + 24 + U16(initial, pe + 20) + U16(initial, pe + 6) * 40);
+            byte[] headers = required <= initial.Length ? initial : ReadRemote(process, baseAddress, required);
+            PeHeaders parsed = ParseHeaders(headers);
+            if (parsed.DebugRva == 0 || parsed.DebugSize < 28 || parsed.DebugSize > 0x10000)
+                throw new InvalidDataException("The resident image has no usable debug directory.");
+            byte[] debug = ReadRemote(process, new IntPtr(baseAddress.ToInt64() + parsed.DebugRva),
+                checked((int)parsed.DebugSize));
+            for (int entry = 0; entry <= debug.Length - 28; entry += 28)
+            {
+                if (U32(debug, entry + 12) != 2) continue;
+                uint dataSize = U32(debug, entry + 16);
+                uint dataRva = U32(debug, entry + 20);
+                if (dataSize < 24 || dataRva == 0) continue;
+                byte[] codeView = ReadRemote(process, new IntPtr(baseAddress.ToInt64() + dataRva), 24);
+                return Identity(parsed.TimeDateStamp, parsed.SizeOfImage, parsed.Checksum, codeView);
+            }
+            throw new InvalidDataException("The resident image has no RSDS CodeView record.");
+        }
+        finally { CloseHandle(process); }
+    }
 }
 '@
 }
@@ -238,6 +408,42 @@ function Invoke-A4SLogman {
     return [pscustomobject]@{ exitCode = $exitCode; output = @($output | ForEach-Object { [string]$_ }) }
 }
 
+function Assert-A4SResidentContext {
+    param(
+        [Parameter(Mandatory)][IntPtr]$ExpectedHostWindow,
+        [Parameter(Mandatory)][uint32]$ExpectedHostProcessId,
+        [Parameter(Mandatory)][int64]$ExpectedHostStartTicks,
+        [Parameter(Mandatory)][uint32]$ExpectedExplorerProcessId,
+        [Parameter(Mandatory)][int64]$ExpectedExplorerStartTicks
+    )
+    $currentHostWindow = [A4SRuntimeTraceNative]::HostWindow()
+    if ($currentHostWindow -eq [IntPtr]::Zero -or $currentHostWindow -ne $ExpectedHostWindow) {
+        throw 'The validated A4S host window disappeared or was replaced during capture.'
+    }
+    [uint32]$currentHostProcessId = 0
+    [void][A4SRuntimeTraceNative]::GetWindowThreadProcessId($currentHostWindow, [ref]$currentHostProcessId)
+    if ($currentHostProcessId -ne $ExpectedHostProcessId) {
+        throw "The A4S host window owner changed from PID $ExpectedHostProcessId to PID $currentHostProcessId."
+    }
+    $currentTaskbar = [A4SRuntimeTraceNative]::FindWindowW('Shell_TrayWnd', $null)
+    if ($currentTaskbar -eq [IntPtr]::Zero) { throw 'Explorer taskbar disappeared during capture.' }
+    [uint32]$currentExplorerProcessId = 0
+    [void][A4SRuntimeTraceNative]::GetWindowThreadProcessId($currentTaskbar, [ref]$currentExplorerProcessId)
+    if ($currentExplorerProcessId -ne $ExpectedExplorerProcessId) {
+        throw "Explorer changed from PID $ExpectedExplorerProcessId to PID $currentExplorerProcessId during capture."
+    }
+    $currentHost = [Diagnostics.Process]::GetProcessById([int]$ExpectedHostProcessId)
+    $currentExplorer = [Diagnostics.Process]::GetProcessById([int]$ExpectedExplorerProcessId)
+    if ($currentHost.StartTime.ToUniversalTime().Ticks -ne $ExpectedHostStartTicks -or
+        $currentExplorer.StartTime.ToUniversalTime().Ticks -ne $ExpectedExplorerStartTicks) {
+        throw 'A validated process exited and its PID was reused during capture.'
+    }
+    if ([A4SRuntimeTraceNative]::HostStatus($currentHostWindow, 2500) -ne 3) {
+        throw 'A4SMenuHost is no longer READY.'
+    }
+    return $currentTaskbar
+}
+
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $ProductDirectory) { $ProductDirectory = Join-Path $repoRoot 'build\stage\A4SProduct' }
 $resolvedProductDirectory = Resolve-A4SUnresolvedPath $ProductDirectory
@@ -260,17 +466,50 @@ if ($residentHostProcessId -eq 0 -or $explorerProcessId -eq 0) { throw 'Could no
 
 $residentHost = [Diagnostics.Process]::GetProcessById([int]$residentHostProcessId)
 $explorer = [Diagnostics.Process]::GetProcessById([int]$explorerProcessId)
+$residentHostStartTicks = $residentHost.StartTime.ToUniversalTime().Ticks
+$explorerStartTicks = $explorer.StartTime.ToUniversalTime().Ticks
 $observerSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 if ($residentHost.SessionId -ne $observerSessionId -or $explorer.SessionId -ne $observerSessionId) {
     throw "Observer, resident host, and Explorer must share the interactive session. observer=$observerSessionId host=$($residentHost.SessionId) explorer=$($explorer.SessionId)."
+}
+$startAllBackRegistryPath = 'Registry::HKEY_CURRENT_USER\Software\StartIsBack'
+$startAllBackDisabledState = $null
+if (Test-Path -LiteralPath $startAllBackRegistryPath) {
+    $startAllBackDisabledState = Get-ItemPropertyValue -LiteralPath $startAllBackRegistryPath -Name Disabled -ErrorAction SilentlyContinue
+    if ($null -eq $startAllBackDisabledState -or [int]$startAllBackDisabledState -ne 1) {
+        throw 'StartAllBack is not authoritatively disabled for the qualification trace.'
+    }
 }
 $actualHost = [IO.Path]::GetFullPath($residentHost.MainModule.FileName)
 if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHost, $expectedHost)) {
     throw "The resident host is not the exact staged host. Expected '$expectedHost'; found '$actualHost'."
 }
-$mappedDlls = @($explorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' } | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
-if ($mappedDlls.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDlls[0], $expectedDll)) {
-    throw "Expected exactly one staged A4SMenu.dll mapping in Explorer PID $explorerProcessId; found '$($mappedDlls -join '; ')'."
+$mappedDlls = @($explorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
+$mappedDllPaths = @($mappedDlls | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
+if ($mappedDlls.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDllPaths[0], $expectedDll)) {
+    throw "Expected exactly one staged A4SMenu.dll mapping in Explorer PID $explorerProcessId; found '$($mappedDllPaths -join '; ')'."
+}
+$initialHostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
+$initialDllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
+$hostFileIdentity = [A4SRuntimeTraceNative]::FileImageIdentity($expectedHost)
+$hostLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
+    $residentHostProcessId, $residentHost.MainModule.BaseAddress)
+if (-not [StringComparer]::Ordinal.Equals($hostFileIdentity, $hostLoadedIdentity)) {
+    throw "The resident host image is older or different from the staged file at the same path. file='$hostFileIdentity'; memory='$hostLoadedIdentity'. Restart the exact staged host before capture."
+}
+$dllFileIdentity = [A4SRuntimeTraceNative]::FileImageIdentity($expectedDll)
+$dllLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
+    $explorerProcessId, $mappedDlls[0].BaseAddress)
+if (-not [StringComparer]::Ordinal.Equals($dllFileIdentity, $dllLoadedIdentity)) {
+    throw "Explorer has an older or different A4SMenu.dll image mapped at the staged path. file='$dllFileIdentity'; memory='$dllLoadedIdentity'. Restart Explorer through the approved product lifecycle before capture."
+}
+$preflightHostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
+$preflightDllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($initialHostSha256, $preflightHostSha256) -or
+    -not [StringComparer]::OrdinalIgnoreCase.Equals($initialDllSha256, $preflightDllSha256) -or
+    -not [StringComparer]::Ordinal.Equals($hostFileIdentity, [A4SRuntimeTraceNative]::FileImageIdentity($expectedHost)) -or
+    -not [StringComparer]::Ordinal.Equals($dllFileIdentity, [A4SRuntimeTraceNative]::FileImageIdentity($expectedDll))) {
+    throw 'A staged product binary changed during resident-image preflight.'
 }
 if (@([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId)).Count -ne 0) {
     throw 'Close the A4S menu before capture. The tool refuses to guess or alter the initial state.'
@@ -290,10 +529,13 @@ New-Item -ItemType Directory -Path $resolvedOutputDirectory | Out-Null
 $etlPath = Join-Path $resolvedOutputDirectory 'A4SMenu.Runtime.etl'
 $reportPath = Join-Path $resolvedOutputDirectory 'A4SMenu.Runtime.json'
 $sessionName = "A4SRuntime-$PID-$([DateTime]::UtcNow.ToString('yyyyMMddHHmmssfff'))-$([Guid]::NewGuid().ToString('N').Substring(0, 8))"
+$sessionCreateAttempted = $false
 $sessionStarted = $false
 $captureError = $null
 $cleanupError = $null
 $stopError = $null
+$integrityError = $null
+$artifactErrors = [Collections.Generic.List[string]]::new()
 $startedUtc = $null
 $stoppedUtc = $null
 $completedCycles = 0
@@ -311,12 +553,15 @@ try {
         '-rt', '-ets'
     )
     $startedUtc = [DateTimeOffset]::UtcNow
+    $sessionCreateAttempted = $true
     $startResult = Invoke-A4SLogman -Arguments $startArguments
-    $startResult.output | Set-Content -LiteralPath (Join-Path $resolvedOutputDirectory 'session-start.txt') -Encoding UTF8
+    if ($startResult.exitCode -eq 0) { $sessionStarted = $true }
+    try {
+        $startResult.output | Set-Content -LiteralPath (Join-Path $resolvedOutputDirectory 'session-start.txt') -Encoding UTF8
+    } catch { [void]$artifactErrors.Add("Could not write session-start.txt: $($_.Exception.Message)") }
     if ($startResult.exitCode -ne 0) {
         throw "logman could not start ETW session '$sessionName' (exit $($startResult.exitCode)): $($startResult.output -join ' ')"
     }
-    $sessionStarted = $true
     for ($cycle = 0; $cycle -lt $CapturedCycles; $cycle++) {
         [void](Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId)
         $completedCycles++
@@ -325,31 +570,85 @@ try {
     $captureError = $_
 } finally {
     try {
-        $visible = @([A4SRuntimeTraceNative]::VisibleMenuWindows(0))
-        if ($visible.Count -eq 1 -and [A4SRuntimeTraceNative]::HostStatus($hostWindow, 2500) -eq 3) {
-            [uint32]$cleanupOwnerProcessId = 0
-            [void][A4SRuntimeTraceNative]::GetWindowThreadProcessId($visible[0], [ref]$cleanupOwnerProcessId)
+        [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
+            -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
+            -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks)
+        $visible = @([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId))
+        if ($visible.Count -eq 1) {
             [A4SRuntimeTraceNative]::Toggle($hostWindow, 2500)
-            [void](Wait-A4SMenuVisibility -Visible $false -ExplorerProcessId $cleanupOwnerProcessId -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
-        } elseif ($visible.Count -eq 1) {
-            throw 'One A4S menu window remains visible, but the resident host is not READY for an unambiguous cleanup toggle.'
+            [void](Wait-A4SMenuVisibility -Visible $false -ExplorerProcessId $explorerProcessId -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
         } elseif ($visible.Count -gt 1) {
-            throw "Cleanup found $($visible.Count) A4S menu windows and refused an ambiguous toggle."
+            throw "Cleanup found $($visible.Count) A4S menu windows in validated Explorer PID $explorerProcessId and refused an ambiguous toggle."
         }
     } catch { $cleanupError = $_ }
-    if ($sessionStarted) {
+    if ($sessionCreateAttempted) {
         try {
             $stopResult = Invoke-A4SLogman -Arguments @('stop', $sessionName, '-ets')
-            $stoppedUtc = [DateTimeOffset]::UtcNow
-            $stopResult.output | Set-Content -LiteralPath (Join-Path $resolvedOutputDirectory 'session-stop.txt') -Encoding UTF8
-            if ($stopResult.exitCode -ne 0) { throw "logman stop failed with exit code $($stopResult.exitCode): $($stopResult.output -join ' ')" }
+            if ($stopResult.exitCode -eq 0) { $stoppedUtc = [DateTimeOffset]::UtcNow }
+            try {
+                $stopResult.output | Set-Content -LiteralPath (Join-Path $resolvedOutputDirectory 'session-stop.txt') -Encoding UTF8
+            } catch { [void]$artifactErrors.Add("Could not write session-stop.txt: $($_.Exception.Message)") }
+            if ($sessionStarted -and $stopResult.exitCode -ne 0) {
+                throw "logman stop failed with exit code $($stopResult.exitCode): $($stopResult.output -join ' ')"
+            }
+            if (-not $sessionStarted -and $stopResult.exitCode -ne 0) {
+                $queryResult = Invoke-A4SLogman -Arguments @('query', $sessionName, '-ets')
+                try {
+                    $queryResult.output | Set-Content -LiteralPath (Join-Path $resolvedOutputDirectory 'session-query-after-failed-start.txt') -Encoding UTF8
+                } catch { [void]$artifactErrors.Add("Could not write session-query-after-failed-start.txt: $($_.Exception.Message)") }
+                if ($queryResult.exitCode -eq 0) {
+                    throw "The failed create attempt left ETW session '$sessionName' running, and the unconditional stop request did not remove it."
+                }
+            }
         } catch { $stopError = $_ }
     }
 }
 
-if ($stopError) { throw "ETW session cleanup failed for '$sessionName'. Capture directory: '$resolvedOutputDirectory'. $($stopError.Exception.Message)" }
+try {
+    [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
+        -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
+        -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks)
+    $postHostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
+    $postDllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($preflightHostSha256, $postHostSha256) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($preflightDllSha256, $postDllSha256)) {
+        throw 'A staged product binary changed while the trace was running.'
+    }
+    if (Test-Path -LiteralPath $startAllBackRegistryPath) {
+        $postStartAllBackDisabledState = Get-ItemPropertyValue -LiteralPath $startAllBackRegistryPath -Name Disabled -ErrorAction SilentlyContinue
+        if ($null -eq $postStartAllBackDisabledState -or [int]$postStartAllBackDisabledState -ne 1) {
+            throw 'StartAllBack became enabled while the trace was running.'
+        }
+    } elseif ($null -ne $startAllBackDisabledState) {
+        throw 'StartAllBack registry state changed while the trace was running.'
+    }
+    $postHostLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
+        $residentHostProcessId, $residentHost.MainModule.BaseAddress)
+    $postDllLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
+        $explorerProcessId, $mappedDlls[0].BaseAddress)
+    if (-not [StringComparer]::Ordinal.Equals($hostFileIdentity, $postHostLoadedIdentity) -or
+        -not [StringComparer]::Ordinal.Equals($dllFileIdentity, $postDllLoadedIdentity)) {
+        throw 'A resident product image changed identity while the trace was running.'
+    }
+} catch { $integrityError = $_ }
+
+if ($stopError) {
+    $details = @(
+        "ETW session cleanup failed for '$sessionName': $($stopError.Exception.Message)"
+        if ($captureError) { "Capture error: $($captureError.Exception.Message)" }
+        if ($cleanupError) { "Menu cleanup error: $($cleanupError.Exception.Message)" }
+        if ($integrityError) { "Integrity error: $($integrityError.Exception.Message)" }
+        $artifactErrors
+    ) -join ' '
+    throw "$details Capture directory: '$resolvedOutputDirectory'."
+}
 if (-not (Test-Path -LiteralPath $etlPath -PathType Leaf) -or (Get-Item -LiteralPath $etlPath).Length -eq 0) {
-    $reason = if ($captureError) { $captureError.Exception.Message } else { 'The ETW logger produced no file data.' }
+    $reason = @(
+        if ($captureError) { $captureError.Exception.Message } else { 'The ETW logger produced no file data.' }
+        if ($cleanupError) { "Menu cleanup: $($cleanupError.Exception.Message)" }
+        if ($integrityError) { "Integrity: $($integrityError.Exception.Message)" }
+        $artifactErrors
+    ) -join ' '
     throw "No usable raw ETL was produced. Capture directory: '$resolvedOutputDirectory'. $reason"
 }
 
@@ -360,6 +659,7 @@ try {
         EtlPath = $etlPath
         ExpectedProcessId = $explorerProcessId
         ColdSampleCount = $coldSampleCount
+        ExpectedCycleCount = $CapturedCycles
         WarmOpenTargetMilliseconds = $WarmOpenTargetMilliseconds
         RefreshRateHz = $RefreshRateHz
         OutputPath = $reportPath
@@ -369,31 +669,48 @@ try {
 } catch { $conversionError = $_ }
 
 if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
-    $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
-    $capture = [pscustomobject][ordered]@{
-        sessionName = $sessionName
-        providerMode = 'real-time plus sequential ETL file'
-        startedUtc = if ($startedUtc) { $startedUtc.ToString('o') } else { $null }
-        stoppedUtc = if ($stoppedUtc) { $stoppedUtc.ToString('o') } else { $null }
-        requestedCycles = $CapturedCycles
-        completedCycles = $completedCycles
-        warmupCycles = $WarmupCycles
-        explorerProcessId = $explorerProcessId
-        residentHostProcessId = $residentHostProcessId
-        productDirectory = $resolvedProductDirectory
-        hostPath = $expectedHost
-        hostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
-        dllPath = $expectedDll
-        dllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
-        captureError = if ($captureError) { $captureError.Exception.Message } else { $null }
-        cleanupError = if ($cleanupError) { $cleanupError.Exception.Message } else { $null }
+    try {
+        $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+        $capture = [pscustomobject][ordered]@{
+            sessionName = $sessionName
+            providerMode = 'real-time plus sequential ETL file'
+            startedUtc = if ($startedUtc) { $startedUtc.ToString('o') } else { $null }
+            stoppedUtc = if ($stoppedUtc) { $stoppedUtc.ToString('o') } else { $null }
+            requestedCycles = $CapturedCycles
+            completedCycles = $completedCycles
+            warmupCycles = $WarmupCycles
+            explorerProcessId = $explorerProcessId
+            residentHostProcessId = $residentHostProcessId
+            startAllBackDisabled = if ($null -eq $startAllBackDisabledState) { 'notInstalledOrUnconfigured' } else { [int]$startAllBackDisabledState }
+            productDirectory = $resolvedProductDirectory
+            hostPath = $expectedHost
+            hostSha256 = $preflightHostSha256
+            hostFileIdentity = $hostFileIdentity
+            hostLoadedIdentity = $hostLoadedIdentity
+            dllPath = $expectedDll
+            dllSha256 = $preflightDllSha256
+            dllFileIdentity = $dllFileIdentity
+            dllLoadedIdentity = $dllLoadedIdentity
+            captureError = if ($captureError) { $captureError.Exception.Message } else { $null }
+            cleanupError = if ($cleanupError) { $cleanupError.Exception.Message } else { $null }
+            integrityError = if ($integrityError) { $integrityError.Exception.Message } else { $null }
+            artifactErrors = @($artifactErrors)
+        }
+        $report | Add-Member -NotePropertyName capture -NotePropertyValue $capture -Force
+        $report | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+    } catch {
+        [void]$artifactErrors.Add("Could not enrich the runtime report with capture metadata: $($_.Exception.Message)")
     }
-    $report | Add-Member -NotePropertyName capture -NotePropertyValue $capture -Force
-    $report | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath $reportPath -Encoding UTF8
 }
 
-if ($conversionError) { throw "ETL parsing failed; raw ETL is preserved at '$etlPath'. $($conversionError.Exception.Message)" }
-if ($captureError) { throw "Capture ended early after $completedCycles/$CapturedCycles cycles. Raw ETL and partial report are in '$resolvedOutputDirectory'. $($captureError.Exception.Message)" }
-if ($cleanupError) { throw "Capture completed but final menu cleanup failed. Artifacts are in '$resolvedOutputDirectory'. $($cleanupError.Exception.Message)" }
+$terminalErrors = [Collections.Generic.List[string]]::new()
+if ($conversionError) { [void]$terminalErrors.Add("ETL parsing/target evaluation failed: $($conversionError.Exception.Message)") }
+if ($captureError) { [void]$terminalErrors.Add("Capture ended early after $completedCycles/$CapturedCycles cycles: $($captureError.Exception.Message)") }
+if ($cleanupError) { [void]$terminalErrors.Add("Final menu cleanup failed: $($cleanupError.Exception.Message)") }
+if ($integrityError) { [void]$terminalErrors.Add("Resident/staged binary integrity validation failed: $($integrityError.Exception.Message)") }
+foreach ($artifactError in $artifactErrors) { [void]$terminalErrors.Add($artifactError) }
+if ($terminalErrors.Count) {
+    throw "A4S runtime trace did not complete authoritatively. Raw ETL and any derived artifacts are in '$resolvedOutputDirectory'. $($terminalErrors -join ' ')"
+}
 
 Write-Output $reportPath

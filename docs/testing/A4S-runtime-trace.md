@@ -16,14 +16,31 @@ Explorer. It refuses to run unless all of these preconditions are already true:
    reports `READY` through `A4SMenu.Host.Control.v1`;
 3. the resident host executable path is exactly the requested staged path;
 4. taskbar Explorer and the observer are in the same interactive session;
-5. Explorer has exactly one `A4SMenu.dll` mapping and its path is exactly the
-   staged DLL path; and
-6. no A4S menu window is visible before the run.
+5. StartAllBack is either unconfigured/not installed or its `Disabled` value
+   is exactly `1` (the value is checked again after capture);
+6. Explorer has exactly one `A4SMenu.dll` mapping and its path is exactly the
+   staged DLL path;
+7. the RSDS build GUID/age plus PE timestamp and image size read from each
+   resident process image exactly match the corresponding staged file (a path
+   match alone is deliberately insufficient because Windows can retain an old
+   mapped image after that path is replaced);
+8. the staged host and DLL hashes remain stable across preflight and capture;
+   and
+9. no A4S menu window is visible before the run.
 
 Each measured opening must create exactly one visible
 `A4SMenu.CMenuContainer` owned by that validated Explorer process. Toggle
 requests use the product's existing host control message. The tool never runs a
-second host executable as a command client.
+second host executable as a command client. Recovery cleanup revalidates the
+same host window, host process start time, taskbar Explorer process start time,
+and `READY` state, and examines only menu windows owned by that validated
+Explorer PID. It never toggles because a same-class window exists in some other
+process.
+
+The strong resident-image check requires the product's normal RSDS CodeView
+record. If a future product build intentionally strips that identity, the trace
+tool fails closed; add an equally strong immutable build identifier before
+relaxing this precondition.
 
 ## Static/self-test (safe with no injected product)
 
@@ -35,9 +52,10 @@ This is the first command to run after changing the scripts:
 
 It performs no live ETW capture and never starts the product. It checks the
 PowerShell syntax and safety gate, compiles the embedded Win32 interop helper,
-feeds synthetic events through the JSON and tracerpt-XML parsers, verifies
-cycle/phase correlation and percentile results, and proves that an incomplete
-operation is reported.
+validates the PE/RSDS identity of staged binaries when they are present, feeds
+synthetic events through the JSON and tracerpt-XML parsers, verifies strict
+cycle/phase correlation and percentile results, and proves that truncated,
+mixed-process, ambiguous, or incomplete input cannot pass.
 
 ## Live capture
 
@@ -65,9 +83,12 @@ sample, do not warm up and provide the explicit attestation:
 
 The tool creates a unique ETW session name and a new output directory. It uses
 the provider in real-time mode while simultaneously writing a sequential ETL
-file. The session is always stopped in a `finally` block, including failed or
-partial runs. If Windows denies ETW session creation, run the same command from
-an elevated 64-bit PowerShell; do not weaken the product preflight.
+file. Once session creation is attempted, an unconditional stop is issued from
+a `finally` block, including failed or partial starts. A successful start whose
+stop fails is a terminal error; after a failed start, the tool also queries a
+failed stop to detect a residual named session. If Windows denies ETW session
+creation, run the same command from an elevated 64-bit PowerShell; do not weaken
+the product preflight.
 
 Artifacts in the unique directory include:
 
@@ -81,7 +102,11 @@ The JSON records activation source, open begin/end, visible, first paint, close
 begin/end, hidden, and all phase scopes emitted by the DLL. It reports p50,
 p95, maximum, and mean durations. A trace is incomplete when a begin has no
 end, an end has no begin, a duplicate begin occurs, or an opening cycle lacks
-one of its required markers.
+one of its required markers. It also fails completeness for a missing whole
+cycle, duplicate cycle marker, mixed/zero process identity, zero phase
+operation, or phase that changes threads. The live capture always supplies the
+requested cycle count to the converter, so total ETW loss of one cycle cannot
+silently reduce the denominator.
 
 The custom-trace target evaluation covers:
 
@@ -89,6 +114,8 @@ The custom-trace target evaluation covers:
   default;
 - the closing `activationRequested` to `windowHidden` p95 within one nominal
   display frame (the report also retains the narrower `closePath` duration);
+- exactly the requested number of captured cycles;
+- at least 20 complete warm samples and 20 complete close samples by default;
 - zero incomplete-operation/cycle diagnostics.
 
 Use `-EnforceTargets` when a non-passing custom trace should make the command
@@ -102,11 +129,16 @@ An existing ETL can be decoded again without running or touching the product:
 & .\tools\Convert-A4SRuntimeTrace.ps1 `
     -EtlPath .\build\test-results\A4S-runtime-trace-...\A4SMenu.Runtime.etl `
     -ExpectedProcessId 1234 `
+    -ExpectedCycleCount 20 `
     -RefreshRateHz 239
 ```
 
 `-Force` permits replacing only derived XML/JSON files. The raw ETL is never
 modified. `-EventJsonPath` exists for deterministic synthetic/offline tests.
+Offline `-EnforceTargets` cannot pass without an explicit
+`-ExpectedCycleCount`; this prevents a truncated ETL from validating itself.
+The 20-sample minimums can be raised, but lowering them weakens the evidence and
+must be recorded with the result.
 
 ## Interpretation limits and follow-up evidence
 
