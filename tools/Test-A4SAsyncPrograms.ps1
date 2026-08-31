@@ -108,6 +108,8 @@ $readyIcons = Get-CppFunctionBody $itemSource 'bool CItemManager::AreA4SItemInfo
 $waitItem = Get-CppFunctionBody $itemSource 'bool CItemManager::WaitForA4SItemInfo( DWORD timeout )'
 $customIcon = Get-CppFunctionBody $itemSource 'const CItemManager::ItemInfo *CItemManager::GetA4SCustomIcon( const wchar_t *path,'
 $refreshItem = Get-CppFunctionBody $itemSource 'void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellItem *pItem0, bool bHasWriteLock )'
+$liveConfiguration = Get-CppFunctionBody $treeSource 'bool CProgramsTree::IsA4SConfigurationLive('
+$supersedeConfiguration = Get-CppFunctionBody $treeSource 'bool CProgramsTree::SupersedeA4SConfigurationIfStale('
 
 # Product-only dispatch: upstream still executes the original synchronous tree
 # construction, while A4S returns immediately after requesting a snapshot.
@@ -183,8 +185,30 @@ Assert-Contract ($worker -match 's_A4SAsyncFailedGeneration=generation' -and
 # leave a process-lifetime stale cache.
 Assert-Contract ($treeHeader -match 'ULONGLONG\s+folderContentGeneration\s*;') `
     'snapshot identity omits watched-folder content generation'
+Assert-Contract ($treeHeader -match 'ULONGLONG\s+iconCacheEpoch\s*;' -and
+    $treeHeader -match 'iconCacheEpoch==other\.iconCacheEpoch') `
+    'snapshot identity omits the ItemManager icon/cache epoch'
 Assert-Contract ($treeSource -match 'folderContentGeneration\s*=\s*g_ItemManager\.GetFolderContentGeneration\(\)') `
     'snapshot capture does not consume the watcher generation'
+Assert-Contract ($treeSource -match 'iconCacheEpoch\s*=\s*g_ItemManager\.GetIconCacheEpoch\(\)') `
+    'snapshot capture does not consume the icon/cache epoch'
+Assert-Contract ($liveConfiguration -match 'IsFolderWatchBaselineReady\(\)' -and
+    $liveConfiguration -match 'GetFolderContentGeneration\(\)' -and
+    $liveConfiguration -match 'GetIconCacheEpoch\(\)') `
+    'live snapshot validation omits baseline, folder generation, or icon epoch'
+Assert-Contract ($worker -match 'while\s*\(IsA4SGenerationCurrent\(generation\)\s*&&[\s\S]*!g_ItemManager\.IsFolderWatchBaselineReady\(\)\)[\s\S]*WaitForFolderWatchBaseline\(100\)') `
+    'Programs can enumerate or publish before the directory watcher baseline'
+$supersedeCallCount = [Regex]::Matches($worker, 'SupersedeA4SConfigurationIfStale\(configuration,generation\)').Count
+Assert-Contract ($supersedeCallCount -ge 3) `
+    'worker does not validate live epochs before build, before publication, and after a publication race'
+$supersedeIncrementCount = [Regex]::Matches($supersedeConfiguration, 'InterlockedIncrement\(&s_A4SAsyncGeneration\)').Count
+Assert-Contract ($supersedeIncrementCount -eq 1 -and
+    $supersedeConfiguration -match 'generation==s_A4SAsyncGeneration' -and
+    $supersedeConfiguration -match 'configuration==s_A4SAsyncConfiguration') `
+    'a stale external epoch can spawn duplicate successor generations or supersede unrelated work'
+Assert-Contract ($worker -match 'IsA4SConfigurationLive\(configuration\)[\s\S]*oldItems\.swap\(s_A4SAsyncItems\)[\s\S]*s_A4SAsyncItems\.swap\(items\)[\s\S]*IsA4SConfigurationLive\(configuration\)' -and
+    $worker -match 'items\.swap\(s_A4SAsyncItems\)[\s\S]*s_A4SAsyncItems\.swap\(oldItems\)') `
+    'publication does not restore the prior snapshot when an epoch changes during the swap'
 Assert-Contract ($buildSnapshot -match 'IsA4SGenerationCurrent\(generation\)') `
     'root enumeration cannot observe cancellation between shell folders'
 Assert-Contract ($worker -match 'if\s*\(bRetry\)[\s\S]*continue\s*;') `
@@ -224,6 +248,11 @@ Assert-Contract ($applySnapshot -match 's_A4SAsyncReadyGeneration==currentGenera
     $applySnapshot -match 's_A4SSnapshotConfiguration==s_A4SAsyncConfiguration' -and
     $applySnapshot -match 's_A4SSnapshotConfiguration\.bFoldersFirst') `
     'the UI can apply a stale or differently configured retained snapshot'
+$applyLiveChecks = [Regex]::Matches($applySnapshot, 'IsA4SConfigurationLive\(snapshotConfiguration\)').Count
+Assert-Contract ($applyLiveChecks -ge 2 -and
+    $applySnapshot -match 'RequestA4SItems\(this,m_hWnd,snapshotConfiguration\.bNoCommonFolders,false\)' -and
+    $applySnapshot -match 'delete\s+\*it[\s\S]*RequestA4SItems') `
+    'UI application lacks both live epoch barriers or cannot request one safe successor'
 
 # Every root icon is decoded (or reaches a terminal fallback) on ItemManager's
 # existing decoder before the immutable snapshot becomes publishable. The
@@ -330,5 +359,48 @@ $lateCompletionEntersPrograms = $navigationModel.Pending -and
 Assert-Contract (-not $lateCompletionEntersPrograms -and
     $navigationModel.Mode -eq 'Normal') `
     'a cancelled cold completion can still replace the normal menu'
+
+# Deterministic epoch-publication model. A mismatch conditionally advances the
+# exact captured generation once; repeated observations from the old worker do
+# not spin or start additional successors.
+$epochModel = [ordered]@{
+    Generation = 50
+    CapturedGeneration = 50
+    DesiredFolder = [UInt64]12
+    DesiredIcons = [UInt64]8
+    LiveFolder = [UInt64]13
+    LiveIcons = [UInt64]8
+    Successors = 0
+    Snapshot = @('known-good')
+}
+function Invoke-EpochSupersede([Collections.IDictionary] $model) {
+    $stale = $model.DesiredFolder -ne $model.LiveFolder -or
+        $model.DesiredIcons -ne $model.LiveIcons
+    if ($stale -and $model.CapturedGeneration -eq $model.Generation) {
+        $model.DesiredFolder = $model.LiveFolder
+        $model.DesiredIcons = $model.LiveIcons
+        $model.Generation++
+        $model.Successors++
+    }
+}
+Invoke-EpochSupersede $epochModel
+Invoke-EpochSupersede $epochModel # the old captured generation cannot advance twice
+Assert-Contract ($epochModel.Generation -eq 51 -and $epochModel.Successors -eq 1 -and
+    ($epochModel.Snapshot -join '|') -eq 'known-good') `
+    'one folder/icon mismatch does not produce exactly one retained-cache successor'
+
+$publicationModel = [ordered]@{
+    Snapshot = @('old-complete')
+    Candidate = @('new-complete')
+    FolderBefore = [UInt64]20
+    FolderAfter = [UInt64]21
+    IconBefore = [UInt64]4
+    IconAfter = [UInt64]4
+}
+$canCommit = $publicationModel.FolderBefore -eq $publicationModel.FolderAfter -and
+    $publicationModel.IconBefore -eq $publicationModel.IconAfter
+if ($canCommit) { $publicationModel.Snapshot = @($publicationModel.Candidate) }
+Assert-Contract (($publicationModel.Snapshot -join '|') -eq 'old-complete') `
+    'an epoch change during publication replaced the previous complete Programs snapshot'
 
 Write-Host 'A4S asynchronous Programs gates passed.'

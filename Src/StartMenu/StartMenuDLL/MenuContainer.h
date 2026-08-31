@@ -594,8 +594,10 @@ private:
 	static void PrepareA4SRootConfiguration( int dpi, unsigned int profileHash,
 		unsigned int modelHash, unsigned int rootSettings );
 	bool IsA4SRootCacheCandidate( void ) const;
-	bool RestoreA4SRootItems( ULONGLONG generation );
-	void PublishA4SRootItems( ULONGLONG generation );
+	bool RestoreA4SRootItems( ULONGLONG folderGeneration,
+		ULONGLONG iconCacheEpoch );
+	void PublishA4SRootItems( ULONGLONG folderGeneration,
+		ULONGLONG iconCacheEpoch, bool bComplete );
 #endif
 
 	struct SortMenuItem
@@ -815,8 +817,8 @@ private:
 		MRU_PROGRAMS_COUNT=40,
 	};
 
-	void AddFirstFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options );
-	void AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options );
+	HRESULT AddFirstFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options );
+	HRESULT AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options );
 
 	struct ActivateData
 	{

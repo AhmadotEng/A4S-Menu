@@ -196,6 +196,9 @@ public:
 	void RefreshInfos( void );
 #ifdef A4S_PRODUCT
 	ULONGLONG GetFolderContentGeneration( void ) const;
+	ULONGLONG GetIconCacheEpoch( void ) const;
+	bool IsFolderWatchBaselineReady( void ) const;
+	bool WaitForFolderWatchBaseline( DWORD timeout ) const;
 #endif
 #ifdef A4S_PRODUCT
 	// Creates or finds a custom icon entry but always leaves decoding to the
@@ -294,6 +297,7 @@ private:
 	HANDLE m_DoneEvent; // done preloading start menu items
 #ifdef A4S_PRODUCT
 	HANDLE m_A4SItemReadyEvent; // an icon reached ready or terminal fallback state
+	HANDLE m_A4SFolderWatchReadyEvent; // initial watched-directory baseline is armed
 #endif
 	HANDLE m_PreloadItemsThread;
 	HANDLE m_RefreshInfoThread;
@@ -406,7 +410,10 @@ private:
 #ifdef A4S_PRODUCT
 	volatile LONG m_PendingPidlRefresh;
 	volatile LONGLONG m_FolderContentGeneration;
+	volatile LONGLONG m_IconCacheEpoch;
+	volatile LONG m_A4SFolderWatchReady;
 	void AdvanceFolderContentGeneration( void );
+	void AdvanceIconCacheEpoch( void );
 #endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;

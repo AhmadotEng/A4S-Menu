@@ -384,8 +384,40 @@ CProgramsTree::A4SAsyncConfiguration CProgramsTree::CaptureA4SConfiguration( boo
 	configuration.bHideProgramsMetro=GetSettingBool(L"HideProgramsMetro");
 	configuration.bFoldersFirst=GetSettingBool(L"FoldersFirst");
 	configuration.folderContentGeneration=g_ItemManager.GetFolderContentGeneration();
+	configuration.iconCacheEpoch=g_ItemManager.GetIconCacheEpoch();
 	configuration.appsName=FindTranslation(L"Menu.Apps",L"Apps");
 	return configuration;
+}
+
+bool CProgramsTree::IsA4SConfigurationLive(
+	const A4SAsyncConfiguration &configuration )
+{
+	return g_ItemManager.IsFolderWatchBaselineReady() &&
+		configuration.folderContentGeneration==g_ItemManager.GetFolderContentGeneration() &&
+		configuration.iconCacheEpoch==g_ItemManager.GetIconCacheEpoch();
+}
+
+bool CProgramsTree::SupersedeA4SConfigurationIfStale(
+	const A4SAsyncConfiguration &configuration, LONG generation )
+{
+	if (IsA4SConfigurationLive(configuration))
+		return false;
+
+	// Only the externally changing epochs are stale here. Preserve the exact
+	// requested settings identity and refresh those epochs outside the lock.
+	A4SAsyncConfiguration latest=configuration;
+	latest.folderContentGeneration=g_ItemManager.GetFolderContentGeneration();
+	latest.iconCacheEpoch=g_ItemManager.GetIconCacheEpoch();
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	if (!s_bA4SAsyncStopping && generation==s_A4SAsyncGeneration &&
+		configuration==s_A4SAsyncConfiguration)
+	{
+		s_A4SAsyncConfiguration=latest;
+		InterlockedIncrement(&s_A4SAsyncGeneration);
+		s_A4SAsyncFailedGeneration=0;
+	}
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+	return true;
 }
 
 bool CProgramsTree::IsA4SGenerationCurrent( LONG generation )
@@ -870,6 +902,19 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		if (bStopping)
 			break;
 
+		// The watcher thread intentionally starts after a short idle delay. Do not
+		// let a snapshot captured in that blind window become publishable. The
+		// baseline signal advances the folder generation before it wakes us.
+		while (IsA4SGenerationCurrent(generation) &&
+			!g_ItemManager.IsFolderWatchBaselineReady())
+		{
+			g_ItemManager.WaitForFolderWatchBaseline(100);
+		}
+		if (!IsA4SGenerationCurrent(generation))
+			continue;
+		if (SupersedeA4SConfigurationIfStale(configuration,generation))
+			continue;
+
 		std::vector<CTreeItem> items;
 		bool bAutoSort=false;
 		A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
@@ -878,11 +923,15 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		programsScope.SetResult(static_cast<UINT32>(items.size()),FALSE);
 		if (result==A4S_ASYNC_CANCELLED && !IsA4SGenerationCurrent(generation))
 			continue;
+		if (result==A4S_ASYNC_SUCCESS &&
+			SupersedeA4SConfigurationIfStale(configuration,generation))
+			continue;
 
 		HWND notifyWindow=NULL;
 		LONG notifyCookie=0;
 		std::vector<CTreeItem> oldItems;
 		bool bRetry=false;
+		bool bSupersede=false;
 		AcquireSRWLockExclusive(&s_A4SAsyncLock);
 		if (s_bA4SAsyncStopping)
 		{
@@ -891,15 +940,32 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		else if (result==A4S_ASYNC_SUCCESS && generation==s_A4SAsyncGeneration &&
 			configuration==s_A4SAsyncConfiguration)
 		{
-			oldItems.swap(s_A4SAsyncItems);
-			s_A4SAsyncItems.swap(items);
-			s_A4SSnapshotConfiguration=configuration;
-			s_A4SAsyncReadyGeneration=generation;
-			s_A4SAsyncFailedGeneration=0;
-			s_bA4SAsyncHasSnapshot=true;
-			s_bA4SAsyncAutoSort=bAutoSort;
-			notifyWindow=s_A4SAsyncNotifyWindow;
-			notifyCookie=s_A4SAsyncNotifyCookie;
+			// Check the external folder/icon epochs immediately before and after
+			// swapping the candidate. If either changes during publication, restore
+			// the previous known-good snapshot and supersede this generation once.
+			if (IsA4SConfigurationLive(configuration))
+			{
+				oldItems.swap(s_A4SAsyncItems);
+				s_A4SAsyncItems.swap(items);
+				if (IsA4SConfigurationLive(configuration))
+				{
+					s_A4SSnapshotConfiguration=configuration;
+					s_A4SAsyncReadyGeneration=generation;
+					s_A4SAsyncFailedGeneration=0;
+					s_bA4SAsyncHasSnapshot=true;
+					s_bA4SAsyncAutoSort=bAutoSort;
+					notifyWindow=s_A4SAsyncNotifyWindow;
+					notifyCookie=s_A4SAsyncNotifyCookie;
+				}
+				else
+				{
+					items.swap(s_A4SAsyncItems);
+					s_A4SAsyncItems.swap(oldItems);
+					bSupersede=true;
+				}
+			}
+			else
+				bSupersede=true;
 		}
 		else if (generation==s_A4SAsyncGeneration &&
 			configuration==s_A4SAsyncConfiguration)
@@ -913,6 +979,11 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 			!(configuration==s_A4SAsyncConfiguration)))
 			bRetry=true;
 		ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+		if (bSupersede)
+		{
+			SupersedeA4SConfigurationIfStale(configuration,generation);
+			continue;
+		}
 		if (bRetry)
 			continue;
 
@@ -2004,6 +2075,7 @@ bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )
 	LONG currentGeneration=0;
 	bool bAutoSort=false;
 	bool bFoldersFirst=false;
+	A4SAsyncConfiguration snapshotConfiguration={};
 	AcquireSRWLockShared(&s_A4SAsyncLock);
 	currentGeneration=InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0);
 	if (s_bA4SAsyncHasSnapshot &&
@@ -2015,10 +2087,16 @@ bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )
 		readyGeneration=s_A4SAsyncReadyGeneration;
 		bAutoSort=s_bA4SAsyncAutoSort;
 		bFoldersFirst=s_A4SSnapshotConfiguration.bFoldersFirst;
+		snapshotConfiguration=s_A4SSnapshotConfiguration;
 	}
 	ReleaseSRWLockShared(&s_A4SAsyncLock);
 	if (!readyGeneration)
 		return false;
+	if (!IsA4SConfigurationLive(snapshotConfiguration))
+	{
+		RequestA4SItems(this,m_hWnd,snapshotConfiguration.bNoCommonFolders,false);
+		return false;
+	}
 
 	A4SPerformanceScope cachedScope(A4S_PERF_PROGRAMS_ENUMERATION);
 	std::vector<CTreeItem*> items;
@@ -2040,6 +2118,28 @@ bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )
 				pItem->bNew=true;
 		}
 		items.push_back(pItem);
+	}
+
+	// Enumeration and ItemInfo probing above may overlap a directory or icon
+	// invalidation. Revalidate the exact immutable snapshot immediately before
+	// touching the live TreeView. On mismatch, keep the current view intact and
+	// request the single successor generation selected by RequestA4SItems.
+	AcquireSRWLockShared(&s_A4SAsyncLock);
+	currentGeneration=InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0);
+	const bool bApplyCurrent=s_bA4SAsyncHasSnapshot &&
+		s_A4SAsyncReadyGeneration==readyGeneration &&
+		readyGeneration==currentGeneration &&
+		s_A4SSnapshotConfiguration==snapshotConfiguration &&
+		s_A4SAsyncConfiguration==snapshotConfiguration &&
+		(!expectedGeneration || readyGeneration==expectedGeneration) &&
+		IsA4SConfigurationLive(snapshotConfiguration);
+	ReleaseSRWLockShared(&s_A4SAsyncLock);
+	if (!bApplyCurrent)
+	{
+		for (std::vector<CTreeItem*>::iterator it=items.begin();it!=items.end();++it)
+			delete *it;
+		RequestA4SItems(this,m_hWnd,snapshotConfiguration.bNoCommonFolders,false);
+		return false;
 	}
 
 	// TreeView insertion sends paint/scroll notifications per row. Suppress them

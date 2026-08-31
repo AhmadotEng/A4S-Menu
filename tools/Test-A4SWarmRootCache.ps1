@@ -96,7 +96,7 @@ Assert-Contract ($container -match '#ifdef\s+A4S_PRODUCT\s+struct\s+CMenuContain
     'the root snapshot implementation is not product-only'
 
 $keyBlock = [Regex]::Match($container, '(?s)struct Key\s*\{.*?bool operator==.*?\n\s*\}').Value
-foreach ($field in @('folderGeneration', 'policyGeneration', 'refreshGeneration', 'dpi', 'profileHash', 'modelHash', 'rootSettings')) {
+foreach ($field in @('folderGeneration', 'iconCacheEpoch', 'policyGeneration', 'refreshGeneration', 'dpi', 'profileHash', 'modelHash', 'rootSettings')) {
     Assert-Contract ($keyBlock -match [Regex]::Escape($field)) "cache key omits $field"
 }
 
@@ -113,16 +113,36 @@ foreach ($pattern in @(
 )) {
     Assert-Contract ($candidate -match $pattern) "normal-root scope is missing $pattern"
 }
+Assert-Contract ($candidate -match 'g_ItemManager\.IsFolderWatchBaselineReady\(\)') `
+    'root snapshots can be used before the watched-directory baseline is armed'
 
-$restore = Get-CppFunctionBody $container 'bool CMenuContainer::RestoreA4SRootItems( ULONGLONG generation )'
-$publish = Get-CppFunctionBody $container 'void CMenuContainer::PublishA4SRootItems( ULONGLONG generation )'
+$restore = Get-CppFunctionBody $container 'bool CMenuContainer::RestoreA4SRootItems( ULONGLONG folderGeneration,'
+$publish = Get-CppFunctionBody $container 'void CMenuContainer::PublishA4SRootItems( ULONGLONG folderGeneration,'
+$invalidate = Get-CppFunctionBody $container 'void CMenuContainer::InvalidateA4SRootCache( bool bEnvironment )'
+$clearEnvironment = Get-CppFunctionBody $container 'void ClearEnvironment( void )'
 foreach ($body in @($restore, $publish)) {
     Assert-Contract ($body -match 'item\.Clone\(\*it\)') 'a snapshot direction does not deep-clone MenuItem PIDLs'
+    Assert-Contract ($body -match 'GetFolderContentGeneration\(\)!=folderGeneration' -and
+        $body -match 'GetIconCacheEpoch\(\)!=iconCacheEpoch') `
+        'a root snapshot direction omits its immediate folder/icon epoch recheck'
 }
 Assert-Contract ($container -match 'if \(it->pItem1\) ILFree\(it->pItem1\);[\s\S]*if \(it->pItem2\) ILFree\(it->pItem2\);') `
     'cached PIDLs are not explicitly released'
-Assert-Contract ($publish -match 'GetFolderContentGeneration\(\)!=generation') `
-    'a snapshot can publish after watched folder content changed during construction'
+Assert-Contract ($restore -notmatch 'ClearSnapshot\(' -and $invalidate -notmatch 'ClearSnapshot\(') `
+    'a cache miss or invalidation destroys the previous known-good snapshot'
+Assert-Contract ($restore -match 'std::vector<MenuItem>\s+restoredItems' -and
+    $restore -match 'm_Items\.swap\(restoredItems\)') `
+    'restore mutates the live menu before the complete PIDL clone is validated'
+$newItemsIndex = $publish.IndexOf('std::vector<MenuItem> newItems', [StringComparison]::Ordinal)
+$oldItemsIndex = $publish.IndexOf('std::vector<MenuItem> oldItems', [StringComparison]::Ordinal)
+$swapSnapshotIndex = $publish.IndexOf('cache.items.swap(newItems)', [StringComparison]::Ordinal)
+Assert-Contract ($publish -match '!bComplete' -and $newItemsIndex -ge 0 -and
+    $oldItemsIndex -gt $newItemsIndex -and $swapSnapshotIndex -gt $oldItemsIndex -and
+    $publish -notmatch 'cache\.ClearSnapshot\(' -and
+    $publish -match 'newItems\.swap\(cache\.items\)[\s\S]*cache\.items\.swap\(oldItems\)') `
+    'publication can clear the prior snapshot before a complete replacement is ready'
+Assert-Contract ($clearEnvironment -notmatch 'startMenu\.Clear|commonStartMenu\.Clear|pinFolder\.Empty') `
+    'environment invalidation erases the previous complete rollback values'
 
 $dependentFields = @(
     'm_ScrollCount', 'm_OriginalScrollCount', 'm_OriginalCount', 'm_SearchIndex',
@@ -144,24 +164,62 @@ Assert-Contract ($initItems -match 'pinnedScope\.SetResult\([^;]+,TRUE\);\s*retu
     'cache hits are not recorded and returned immediately'
 Assert-Contract ($initItems -match 'm_pDropFolder\[0\]=m_pDropFolder\[1\]=NULL') `
     'warm roots can retain apartment-bound drag/drop shell objects'
+Assert-Contract ($initItems -match 'bool\s+bA4SRootBuildComplete=false' -and
+    $initItems -match 'bA4SRootBuildComplete=true' -and
+    $initItems -match 'FAILED\(AddFirstFolder\([^;]+\)\)[\s\S]*bA4SRootBuildComplete=false' -and
+    $initItems -match 'FAILED\(AddSecondFolder\([^;]+\)\)[\s\S]*bA4SRootBuildComplete=false' -and
+    $initItems -match 'PublishA4SRootItems\(a4sRootGeneration,a4sRootIconEpoch,[\s\S]*bA4SRootBuildComplete\)') `
+    'root construction does not fail closed across both required enumerations'
+Assert-Contract ($initItems -match 'SHCreateItemFromIDList\(m_Path1\[0\][\s\S]*else[\s\S]*bA4SRootBuildComplete=false') `
+    'a required root SHCreateItemFromIDList failure remains cache-eligible'
+
+$firstFolder = Get-CppFunctionBody $container 'HRESULT CMenuContainer::AddFirstFolder( IShellItem *pFolder,'
+$secondFolder = Get-CppFunctionBody $container 'HRESULT CMenuContainer::AddSecondFolder( IShellItem *pFolder,'
+foreach ($folderBody in @($firstFolder, $secondFolder)) {
+    Assert-Contract ($folderBody -match 'HRESULT\s+result=S_FALSE' -and
+        $folderBody -match 'enumerator\.GetResult\(\)' -and
+        $folderBody -match 'FAILED\(terminal\)' -and
+        $folderBody -match 'return\s+result') `
+        'folder enumeration does not distinguish clean S_FALSE exhaustion from failure'
+    Assert-Contract ($folderBody -match 'FAILED\(hr\)\s*\|\|\s*!ignore' -and
+        $folderBody -match 'FAILED\(hrFlags\)' -and
+        $folderBody -match 'SUCCEEDED\(result\)\)\s*result=') `
+        'folder enumeration does not propagate a required shell failure'
+}
 
 $toggle = Get-CppFunctionBody $container 'HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPrograms )'
+$resolveEnvironment = Get-CppFunctionBody $container 'static bool ResolveA4SRootEnvironment( bool bAllPrograms,'
 Assert-Contract ($toggle -match 'const bool bDiscoverA4SEnvironment=!a4sRootCache\.bEnvironmentValid') `
     'one-time policy/path discovery gate is missing'
 foreach ($discovery in @(
     'SHRestricted\(REST_NOCOMMONGROUPS\)',
     'FlyoutMenuSettings',
     'GetPwrCapabilities',
-    'CoCreateInstance\(CLSID_Shell',
-    'ShGetKnownFolderIDList\(FOLDERID_StartMenu',
-    'ShGetKnownFolderPath\(FOLDERID_StartMenu'
+    'CoCreateInstance\(CLSID_Shell'
 )) {
     Assert-Contract ($toggle -match $discovery) "expected cold discovery is missing: $discovery"
 }
+foreach ($discovery in @(
+    'ShGetKnownFolderIDList\(FOLDERID_StartMenu',
+    'ShGetKnownFolderPath\(FOLDERID_StartMenu',
+    'ShGetKnownFolderIDList\(FOLDERID_CommonStartMenu',
+    'SHCreateDirectory\(NULL,path\)',
+    'SHParseDisplayName\(path,NULL,&resolvedStart'
+)) {
+    Assert-Contract ($resolveEnvironment -match $discovery) "transactional path discovery is missing: $discovery"
+}
+Assert-Contract ($resolveEnvironment -match 'FAILED\(hr\)\s*\|\|' -and
+    $resolveEnvironment -match 'createResult!=ERROR_SUCCESS' -and
+    $resolveEnvironment -match 'FAILED\(hr\)\s*\|\|\s*!resolvedStart') `
+    'known-folder, directory creation, or parse failure can be reported as a complete environment'
 Assert-Contract ($toggle -match 'else\s*\{\s*path1\.Clone\(a4sRootCache\.startMenu\);\s*path2\.Clone\(a4sRootCache\.commonStartMenu\);\s*s_PinFolder=a4sRootCache\.pinFolder;\s*\}') `
     'the warm path does not restore cached Start/CommonStart PIDLs and pin folder'
 Assert-Contract ($toggle -match 'else\s*\{\s*s_bHasUpdates=a4sRootCache\.bHasUpdates;\s*for \(int i=0;i<_countof\(g_StdOptions\);i\+\+\)\s*g_StdOptions\[i\]\.options=a4sRootCache\.stdOptions\[i\];\s*\}') `
     'the warm path does not restore cached power/policy standard options'
+$environmentCommitCount = [Regex]::Matches($toggle, 'a4sRootCache\.bEnvironmentValid=true').Count
+Assert-Contract ($environmentCommitCount -eq 1 -and
+    $toggle -match 'cachedStart\s*&&\s*\(!path2\s*\|\|\s*cachedCommon\)[\s\S]*a4sRootCache\.stdOptions\[i\]=g_StdOptions\[i\]\.options[\s\S]*a4sRootCache\.bEnvironmentValid=true') `
+    'environment state is published partially or through more than one commit point'
 
 $prepareIndex = $toggle.LastIndexOf('PrepareA4SRootConfiguration', [StringComparison]::Ordinal)
 $initIndex = $toggle.LastIndexOf('pStartMenu->InitItems()', [StringComparison]::Ordinal)
@@ -210,6 +268,7 @@ Assert-Contract ($itemManager -match 'ULONGLONG CItemManager::GetFolderContentGe
 # while an identical warm key must hit.
 $base = [ordered]@{
     folderGeneration = [UInt64]9
+    iconCacheEpoch = [UInt64]5
     policyGeneration = 3
     refreshGeneration = 4
     dpi = 144
@@ -231,6 +290,63 @@ foreach ($name in $base.Keys) {
 	foreach ($copyName in $base.Keys) { $changed[$copyName] = $base[$copyName] }
     $changed[$name] = [UInt64]$changed[$name] + 1
     Assert-Contract (-not (Compare-Key $base $changed)) "a changed $name did not invalidate"
+}
+
+# Executable publication model: failed discovery/enumeration/clone attempts
+# preserve the last complete snapshot. Only a complete candidate with matching
+# folder and icon epochs replaces it.
+function Invoke-RootPublicationModel {
+    param(
+        [Parameter(Mandatory)][string[]] $Previous,
+        [Parameter(Mandatory)][string[]] $Candidate,
+        [bool] $EnvironmentComplete = $true,
+        [bool] $FirstFolderComplete = $true,
+        [bool] $SecondFolderComplete = $true,
+        [bool] $CloneComplete = $true,
+        [UInt64] $CapturedFolder = 7,
+        [UInt64] $LiveFolder = 7,
+        [UInt64] $CapturedIcons = 4,
+        [UInt64] $LiveIcons = 4
+    )
+    $complete = $EnvironmentComplete -and $FirstFolderComplete -and
+        $SecondFolderComplete -and $CloneComplete -and
+        $CapturedFolder -eq $LiveFolder -and $CapturedIcons -eq $LiveIcons
+    if ($complete) { return @($Candidate) }
+    return @($Previous)
+}
+
+$knownGood = @('pinned-a', 'pinned-b')
+$replacement = @('new-a', 'new-b', 'new-c')
+$failureCases = @(
+    @{ EnvironmentComplete = $false },       # known-folder / parse discovery
+    @{ FirstFolderComplete = $false },       # first enumerator or SHCreate
+    @{ SecondFolderComplete = $false },      # merge enumerator or SHCreate
+    @{ CloneComplete = $false },             # PIDL clone allocation
+    @{ CapturedFolder = [UInt64]7; LiveFolder = [UInt64]8 },
+    @{ CapturedIcons = [UInt64]4; LiveIcons = [UInt64]5 }
+)
+foreach ($case in $failureCases) {
+    $observed = Invoke-RootPublicationModel -Previous $knownGood -Candidate $replacement @case
+    Assert-Contract (($observed -join '|') -eq ($knownGood -join '|')) `
+        "failed rebuild replaced the last good snapshot: $($case | ConvertTo-Json -Compress)"
+}
+$published = Invoke-RootPublicationModel -Previous $knownGood -Candidate $replacement
+Assert-Contract (($published -join '|') -eq ($replacement -join '|')) `
+    'a complete matching rebuild did not atomically replace the old snapshot'
+
+$environmentStages = [ordered]@{
+    Policy = $true
+    Power = $true
+    StartFolder = $true
+    CommonFolder = $true
+    PinPath = $true
+}
+foreach ($failedStage in $environmentStages.Keys) {
+    $candidate = [ordered]@{}
+    foreach ($stage in $environmentStages.Keys) { $candidate[$stage] = $environmentStages[$stage] }
+    $candidate[$failedStage] = $false
+    $eligible = -not ($candidate.Values -contains $false)
+    Assert-Contract (-not $eligible) "partial environment became eligible after $failedStage failure"
 }
 
 Write-Host 'A4S warm-root cache gates passed.'

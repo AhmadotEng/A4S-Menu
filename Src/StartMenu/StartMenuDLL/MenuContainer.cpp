@@ -449,6 +449,7 @@ struct CMenuContainer::A4SRootCache
 	struct Key
 	{
 		ULONGLONG folderGeneration;
+		ULONGLONG iconCacheEpoch;
 		LONG policyGeneration;
 		LONG refreshGeneration;
 		int dpi;
@@ -459,6 +460,7 @@ struct CMenuContainer::A4SRootCache
 		bool operator==( const Key &other ) const
 		{
 			return folderGeneration==other.folderGeneration &&
+				iconCacheEpoch==other.iconCacheEpoch &&
 				policyGeneration==other.policyGeneration &&
 				refreshGeneration==other.refreshGeneration &&
 				dpi==other.dpi && profileHash==other.profileHash &&
@@ -501,9 +503,8 @@ struct CMenuContainer::A4SRootCache
 
 	void ClearEnvironment( void )
 	{
-		startMenu.Clear();
-		commonStartMenu.Clear();
-		pinFolder.Empty();
+		// Retain the previous complete value set for diagnostics/rollback. The
+		// validity bit alone controls eligibility while rediscovery is pending.
 		bEnvironmentValid=false;
 	}
 
@@ -551,7 +552,8 @@ void CMenuContainer::InvalidateA4SRootCache( bool bEnvironment )
 	if (!s_pA4SRootCache)
 		return;
 	A4SRootCache &cache=*s_pA4SRootCache;
-	cache.ClearSnapshot();
+	// A refresh changes the key immediately but deliberately retains the last
+	// complete snapshot until a replacement has been cloned and validated.
 	cache.refreshGeneration=cache.refreshGeneration==LONG_MAX?1:cache.refreshGeneration+1;
 	if (cache.bConfigurationValid)
 		cache.configuration.refreshGeneration=cache.refreshGeneration;
@@ -575,6 +577,7 @@ void CMenuContainer::PrepareA4SRootConfiguration( int dpi,
 {
 	A4SRootCache &cache=GetA4SRootCache();
 	cache.configuration.folderGeneration=0;
+	cache.configuration.iconCacheEpoch=g_ItemManager.GetIconCacheEpoch();
 	cache.configuration.policyGeneration=cache.policyGeneration;
 	cache.configuration.refreshGeneration=cache.refreshGeneration;
 	cache.configuration.dpi=dpi;
@@ -582,6 +585,56 @@ void CMenuContainer::PrepareA4SRootConfiguration( int dpi,
 	cache.configuration.modelHash=modelHash;
 	cache.configuration.rootSettings=rootSettings;
 	cache.bConfigurationValid=cache.bEnvironmentValid;
+}
+
+static bool ResolveA4SRootEnvironment( bool bAllPrograms,
+	bool bNoCommonFolders, CAbsolutePidl &startMenu,
+	CAbsolutePidl &commonStartMenu, CString &pinFolder )
+{
+	CAbsolutePidl resolvedStart;
+	CAbsolutePidl resolvedCommon;
+	CString resolvedPin;
+	const bool bUseStartFolders=bAllPrograms ||
+		GetSettingInt(L"PinnedPrograms")==PINNED_PROGRAMS_FAST;
+	if (bUseStartFolders)
+	{
+		HRESULT hr=ShGetKnownFolderIDList(FOLDERID_StartMenu,&resolvedStart);
+		if (FAILED(hr) || !resolvedStart)
+			return false;
+		CComString path;
+		hr=ShGetKnownFolderPath(FOLDERID_StartMenu,&path);
+		if (FAILED(hr) || !path || !path[0])
+			return false;
+		resolvedPin=path;
+		if (!bNoCommonFolders)
+		{
+			hr=ShGetKnownFolderIDList(FOLDERID_CommonStartMenu,&resolvedCommon);
+			if (FAILED(hr) || !resolvedCommon)
+				return false;
+		}
+	}
+	else
+	{
+		wchar_t path[_MAX_PATH];
+		Strcpy(path,_countof(path),GetSettingString(L"PinnedItemsPath"));
+		DoEnvironmentSubst(path,_countof(path));
+		if (!path[0])
+			return false;
+		const int createResult=SHCreateDirectory(NULL,path);
+		if (createResult!=ERROR_SUCCESS && createResult!=ERROR_FILE_EXISTS &&
+			createResult!=ERROR_ALREADY_EXISTS)
+			return false;
+		HRESULT hr=SHParseDisplayName(path,NULL,&resolvedStart,0,NULL);
+		if (FAILED(hr) || !resolvedStart)
+			return false;
+		resolvedPin=path;
+	}
+
+	startMenu.Swap(resolvedStart);
+	commonStartMenu.Swap(resolvedCommon);
+	pinFolder=resolvedPin;
+	return startMenu && !pinFolder.IsEmpty() &&
+		(!bUseStartFolders || bNoCommonFolders || commonStartMenu);
 }
 #endif
 
@@ -1058,17 +1111,22 @@ CMenuContainer::~CMenuContainer( void )
 	if (m_pProgramsTree) m_pProgramsTree->Release();
 }
 
-void CMenuContainer::AddFirstFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options )
+HRESULT CMenuContainer::AddFirstFolder( IShellItem *pFolder,
+	std::vector<MenuItem> &items, int options )
 {
+	HRESULT result=S_FALSE;
 	CAbsolutePidl ignore;
 	if (!m_pParent || (m_Options&CONTAINER_ALLPROGRAMS))
 	{
 		// remove the Programs subfolder from the main menu. it will be added separately
-		ShGetKnownFolderIDList(FOLDERID_Programs,&ignore);
+		HRESULT hr=ShGetKnownFolderIDList(FOLDERID_Programs,&ignore);
+		if (FAILED(hr) || !ignore)
+			result=FAILED(hr)?hr:E_FAIL;
 	}
 
 	CShellItemEnumerator enumerator(pFolder);
-	if (!enumerator.IsValid()) return;
+	if (!enumerator.IsValid())
+		return FAILED(enumerator.GetResult())?enumerator.GetResult():result;
 	
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
@@ -1089,17 +1147,26 @@ void CMenuContainer::AddFirstFolder( IShellItem *pFolder, std::vector<MenuItem> 
 		SFGAOF flags=0;
 		HRESULT hrFlags=pChild->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM|SFGAO_LINK|SFGAO_HIDDEN,&flags);
 		if (FAILED(hrFlags)) // check if the item is a folder, archive or a link
+		{
 			flags=0;
+			if (SUCCEEDED(result)) result=hrFlags;
+		}
 		if (flags&SFGAO_HIDDEN)
 			continue;
 		CComString pName;
-		if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName)))
+		HRESULT hrName=pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName);
+		if (SUCCEEDED(hrName))
 		{
 			LOG_MENU(LOG_OPEN,L"%s, 0x%08X, 0x%08X",(const wchar_t*)pName,flags,hrFlags);
 			MenuItem item(MENU_NO);
 			if (ignore && ILIsEqual(childPidl,ignore))
 				continue;
 			item.pItemInfo=g_ItemManager.GetItemInfo(pChild,childPidl,refreshFlags);
+			if (!item.pItemInfo)
+			{
+				if (SUCCEEDED(result)) result=E_FAIL;
+				continue;
+			}
 			bool bLibrary=_wcsicmp(PathFindExtension(pName),L".library-ms")==0;
 			bool bStartScreen=(
 #ifndef STARTSCREEN_WIN7
@@ -1167,20 +1234,31 @@ void CMenuContainer::AddFirstFolder( IShellItem *pFolder, std::vector<MenuItem> 
 			}
 #endif
 		}
+		else if (SUCCEEDED(result))
+			result=hrName;
 	}
+	HRESULT terminal=enumerator.GetResult();
+	if (FAILED(terminal) && SUCCEEDED(result))
+		result=terminal;
+	return result;
 }
 
-void CMenuContainer::AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem> &items, int options )
+HRESULT CMenuContainer::AddSecondFolder( IShellItem *pFolder,
+	std::vector<MenuItem> &items, int options )
 {
+	HRESULT result=S_FALSE;
 	CAbsolutePidl ignore;
 	if (!m_pParent || (m_Options&CONTAINER_ALLPROGRAMS))
 	{
 		// remove the Programs subfolder from the main menu. it will be added separately
-		ShGetKnownFolderIDList(FOLDERID_CommonPrograms,&ignore);
+		HRESULT hr=ShGetKnownFolderIDList(FOLDERID_CommonPrograms,&ignore);
+		if (FAILED(hr) || !ignore)
+			result=FAILED(hr)?hr:E_FAIL;
 	}
 
 	CShellItemEnumerator enumerator(pFolder);
-	if (!enumerator.IsValid()) return;
+	if (!enumerator.IsValid())
+		return FAILED(enumerator.GetResult())?enumerator.GetResult():result;
 	
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
@@ -1199,11 +1277,15 @@ void CMenuContainer::AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem>
 		SFGAOF flags=0;
 		HRESULT hrFlags=pChild->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM|SFGAO_LINK|SFGAO_HIDDEN,&flags);
 		if (FAILED(hrFlags)) // check if the item is a folder, archive or a link
+		{
 			flags=0;
+			if (SUCCEEDED(result)) result=hrFlags;
+		}
 		if (flags&SFGAO_HIDDEN)
 			continue;
 		CComString pName;
-		if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName)))
+		HRESULT hrName=pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName);
+		if (SUCCEEDED(hrName))
 		{
 			LOG_MENU(LOG_OPEN,L"%s, 0x%08X, 0x%08X",(const wchar_t*)pName,flags,hrFlags);
 			bool bLibrary=_wcsicmp(PathFindExtension(pName),L".library-ms")==0;
@@ -1262,6 +1344,11 @@ void CMenuContainer::AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem>
 				if (!bStartScreen)
 				{
 					item.pItemInfo=g_ItemManager.GetItemInfo(pChild,childPidl,refreshFlags);
+					if (!item.pItemInfo)
+					{
+						if (SUCCEEDED(result)) result=E_FAIL;
+						continue;
+					}
 
 					if (bLibrary) flags&=~SFGAO_STREAM;
 					item.bLink=(flags&SFGAO_LINK)!=0;
@@ -1292,7 +1379,13 @@ void CMenuContainer::AddSecondFolder( IShellItem *pFolder, std::vector<MenuItem>
 #endif
 			}
 		}
+		else if (SUCCEEDED(result))
+			result=hrName;
 	}
+	HRESULT terminal=enumerator.GetResult();
+	if (FAILED(terminal) && SUCCEEDED(result))
+		result=terminal;
+	return result;
 }
 
 static int GetStdOptions( TMenuID id )
@@ -2598,29 +2691,83 @@ bool CMenuContainer::IsA4SRootCacheCandidate( void ) const
 		(m_Options&(CONTAINER_ALLPROGRAMS|CONTAINER_DOCUMENTS|CONTAINER_SEARCH|
 			CONTAINER_JUMPLIST|CONTAINER_APPS|CONTAINER_A4S_CONTEXT))==0 &&
 		s_pA4SRootCache && s_pA4SRootCache->bEnvironmentValid &&
-		s_pA4SRootCache->bConfigurationValid;
+		s_pA4SRootCache->bConfigurationValid &&
+		g_ItemManager.IsFolderWatchBaselineReady();
 }
 
-bool CMenuContainer::RestoreA4SRootItems( ULONGLONG generation )
+bool CMenuContainer::RestoreA4SRootItems( ULONGLONG folderGeneration,
+	ULONGLONG iconCacheEpoch )
 {
 	if (!IsA4SRootCacheCandidate())
 		return false;
 	A4SRootCache &cache=*s_pA4SRootCache;
 	A4SRootCache::Key key=cache.configuration;
-	key.folderGeneration=generation;
+	key.folderGeneration=folderGeneration;
+	key.iconCacheEpoch=iconCacheEpoch;
 	if (!cache.bSnapshotValid || !(cache.snapshotKey==key))
-	{
-		cache.ClearSnapshot();
 		return false;
-	}
 
-	m_Items.reserve(cache.items.size());
+	std::vector<MenuItem> restoredItems;
+	restoredItems.reserve(cache.items.size());
 	for (std::vector<MenuItem>::const_iterator it=cache.items.begin();
 		it!=cache.items.end();++it)
 	{
 		MenuItem item;
 		item.Clone(*it);
-		m_Items.push_back(item);
+		restoredItems.push_back(item);
+		if ((it->pItem1 && !item.pItem1) || (it->pItem2 && !item.pItem2))
+		{
+			for (std::vector<MenuItem>::iterator cleanup=restoredItems.begin();
+				cleanup!=restoredItems.end();++cleanup)
+			{
+				if (cleanup->pItem1) ILFree(cleanup->pItem1);
+				if (cleanup->pItem2) ILFree(cleanup->pItem2);
+				cleanup->pItem1=cleanup->pItem2=NULL;
+			}
+			return false;
+		}
+	}
+
+	// Cloning may take long enough for either watched folder content or decoded
+	// icon state to change. Never apply a value set whose key stopped being live.
+	A4SRootCache::Key liveKey=cache.configuration;
+	liveKey.folderGeneration=folderGeneration;
+	liveKey.iconCacheEpoch=iconCacheEpoch;
+	if (!IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=folderGeneration ||
+		g_ItemManager.GetIconCacheEpoch()!=iconCacheEpoch ||
+		!cache.bSnapshotValid || !(cache.snapshotKey==key) ||
+		!(liveKey==key))
+	{
+		for (std::vector<MenuItem>::iterator cleanup=restoredItems.begin();
+			cleanup!=restoredItems.end();++cleanup)
+		{
+			if (cleanup->pItem1) ILFree(cleanup->pItem1);
+			if (cleanup->pItem2) ILFree(cleanup->pItem2);
+			cleanup->pItem1=cleanup->pItem2=NULL;
+		}
+		return false;
+	}
+
+	m_Items.swap(restoredItems);
+	A4SRootCache::Key postRestoreKey=cache.configuration;
+	postRestoreKey.folderGeneration=folderGeneration;
+	postRestoreKey.iconCacheEpoch=iconCacheEpoch;
+	if (!IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=folderGeneration ||
+		g_ItemManager.GetIconCacheEpoch()!=iconCacheEpoch ||
+		!cache.bSnapshotValid || !(cache.snapshotKey==key) ||
+		!(postRestoreKey==key))
+	{
+		m_Items.swap(restoredItems);
+		for (std::vector<MenuItem>::iterator cleanup=restoredItems.begin();
+			cleanup!=restoredItems.end();++cleanup)
+		{
+			if (cleanup->pItem1) ILFree(cleanup->pItem1);
+			if (cleanup->pItem2) ILFree(cleanup->pItem2);
+			cleanup->pItem1=cleanup->pItem2=NULL;
+		}
+		return false;
 	}
 	m_ScrollCount=cache.scrollCount;
 	m_OriginalScrollCount=cache.originalScrollCount;
@@ -2636,22 +2783,84 @@ bool CMenuContainer::RestoreA4SRootItems( ULONGLONG generation )
 	return true;
 }
 
-void CMenuContainer::PublishA4SRootItems( ULONGLONG generation )
+void CMenuContainer::PublishA4SRootItems( ULONGLONG folderGeneration,
+	ULONGLONG iconCacheEpoch, bool bComplete )
 {
-	if (!IsA4SRootCacheCandidate() ||
-		g_ItemManager.GetFolderContentGeneration()!=generation)
+	if (!bComplete || !IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=folderGeneration ||
+		g_ItemManager.GetIconCacheEpoch()!=iconCacheEpoch)
 		return;
 	A4SRootCache &cache=*s_pA4SRootCache;
 	A4SRootCache::Key key=cache.configuration;
-	key.folderGeneration=generation;
-	cache.ClearSnapshot();
-	cache.items.reserve(m_Items.size());
+	key.folderGeneration=folderGeneration;
+	key.iconCacheEpoch=iconCacheEpoch;
+	std::vector<MenuItem> newItems;
+	newItems.reserve(m_Items.size());
 	for (std::vector<MenuItem>::const_iterator it=m_Items.begin();
 		it!=m_Items.end();++it)
 	{
 		MenuItem item;
 		item.Clone(*it);
-		cache.items.push_back(item);
+		newItems.push_back(item);
+		if ((it->pItem1 && !item.pItem1) || (it->pItem2 && !item.pItem2))
+		{
+			for (std::vector<MenuItem>::iterator cleanup=newItems.begin();
+				cleanup!=newItems.end();++cleanup)
+			{
+				if (cleanup->pItem1) ILFree(cleanup->pItem1);
+				if (cleanup->pItem2) ILFree(cleanup->pItem2);
+				cleanup->pItem1=cleanup->pItem2=NULL;
+			}
+			return;
+		}
+	}
+	A4SRootCache::Key liveKey=cache.configuration;
+	liveKey.folderGeneration=folderGeneration;
+	liveKey.iconCacheEpoch=iconCacheEpoch;
+	if (!IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=folderGeneration ||
+		g_ItemManager.GetIconCacheEpoch()!=iconCacheEpoch ||
+		!(liveKey==key))
+	{
+		for (std::vector<MenuItem>::iterator cleanup=newItems.begin();
+			cleanup!=newItems.end();++cleanup)
+		{
+			if (cleanup->pItem1) ILFree(cleanup->pItem1);
+			if (cleanup->pItem2) ILFree(cleanup->pItem2);
+			cleanup->pItem1=cleanup->pItem2=NULL;
+		}
+		return;
+	}
+	// Keep the prior cache allocation intact until a post-swap epoch check has
+	// proven that this candidate was current for the entire publication step.
+	std::vector<MenuItem> oldItems;
+	oldItems.swap(cache.items);
+	cache.items.swap(newItems);
+	A4SRootCache::Key postPublishKey=cache.configuration;
+	postPublishKey.folderGeneration=folderGeneration;
+	postPublishKey.iconCacheEpoch=iconCacheEpoch;
+	if (!IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=folderGeneration ||
+		g_ItemManager.GetIconCacheEpoch()!=iconCacheEpoch ||
+		!(postPublishKey==key))
+	{
+		newItems.swap(cache.items);
+		cache.items.swap(oldItems);
+		for (std::vector<MenuItem>::iterator cleanup=newItems.begin();
+			cleanup!=newItems.end();++cleanup)
+		{
+			if (cleanup->pItem1) ILFree(cleanup->pItem1);
+			if (cleanup->pItem2) ILFree(cleanup->pItem2);
+			cleanup->pItem1=cleanup->pItem2=NULL;
+		}
+		return;
+	}
+	for (std::vector<MenuItem>::iterator cleanup=oldItems.begin();
+		cleanup!=oldItems.end();++cleanup)
+	{
+		if (cleanup->pItem1) ILFree(cleanup->pItem1);
+		if (cleanup->pItem2) ILFree(cleanup->pItem2);
+		cleanup->pItem1=cleanup->pItem2=NULL;
 	}
 	cache.scrollCount=m_ScrollCount;
 	cache.originalScrollCount=m_OriginalScrollCount;
@@ -2672,10 +2881,14 @@ void CMenuContainer::PublishA4SRootItems( ULONGLONG generation )
 // Initialize the m_Items list
 void CMenuContainer::InitItems( void )
 {
+	// Kept outside the product guard because the shared enumeration code records
+	// failures in both builds; only A4S consumes the result for publication.
+	bool bA4SRootBuildComplete=false;
 #ifdef A4S_PRODUCT
 	const bool measurePinned=!m_bSubMenu && (m_Options&CONTAINER_PROGRAMS)!=0;
 	A4SPerformanceScope pinnedScope(A4S_PERF_PINNED_ENUMERATION,measurePinned);
 	ULONGLONG a4sRootGeneration=0;
+	ULONGLONG a4sRootIconEpoch=0;
 #endif
 	ClearItems(m_Items.begin(),m_Items.end());
 	m_pShellView=NULL;
@@ -2696,11 +2909,13 @@ void CMenuContainer::InitItems( void )
 	if (IsA4SRootCacheCandidate())
 	{
 		a4sRootGeneration=g_ItemManager.GetFolderContentGeneration();
-		if (RestoreA4SRootItems(a4sRootGeneration))
+		a4sRootIconEpoch=g_ItemManager.GetIconCacheEpoch();
+		if (RestoreA4SRootItems(a4sRootGeneration,a4sRootIconEpoch))
 		{
 			pinnedScope.SetResult(static_cast<UINT32>(m_OriginalCount),TRUE);
 			return;
 		}
+		bA4SRootBuildComplete=true;
 	}
 #endif
 
@@ -2830,34 +3045,52 @@ void CMenuContainer::InitItems( void )
 		if (m_Path1[0])
 		{
 			CComPtr<IShellItem> pItem;
-			if (SUCCEEDED(SHCreateItemFromIDList(m_Path1[0],IID_IShellItem,(void**)&pItem)))
+			HRESULT hrCreate=SHCreateItemFromIDList(m_Path1[0],IID_IShellItem,
+				(void**)&pItem);
+			if (SUCCEEDED(hrCreate) && pItem)
 			{
 				pItem->BindToHandler(NULL,BHID_SFViewObject,IID_IShellView,(void**)&m_pShellView);
 				m_pDropFolder[0]=pItem;
 				CComString pName;
-				if (SUCCEEDED(pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName)))
+				HRESULT hrName=pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName);
+				if (SUCCEEDED(hrName))
 				{
 					pName.MakeUpper();
 					m_FolderHash[0]=CalcFNVHash(pName);
 				}
-				AddFirstFolder(pItem,m_Items,m_Options);
+				else
+					bA4SRootBuildComplete=false;
+				if (FAILED(AddFirstFolder(pItem,m_Items,m_Options)))
+					bA4SRootBuildComplete=false;
 			}
+			else
+				bA4SRootBuildComplete=false;
 		}
+		else
+			bA4SRootBuildComplete=false;
 
 		// add second folder
 		if (m_Path2[0])
 		{
 			CComPtr<IShellItem> pItem;
-			if (SUCCEEDED(SHCreateItemFromIDList(m_Path2[0],IID_IShellItem,(void**)&pItem)))
+			HRESULT hrCreate=SHCreateItemFromIDList(m_Path2[0],IID_IShellItem,
+				(void**)&pItem);
+			if (SUCCEEDED(hrCreate) && pItem)
 			{
 				CComString pName;
-				if (SUCCEEDED(pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName)))
+				HRESULT hrName=pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName);
+				if (SUCCEEDED(hrName))
 				{
 					pName.MakeUpper();
 					m_FolderHash[0]=CalcFNVHash(pName,m_FolderHash[0]);
 				}
-				AddSecondFolder(pItem,m_Items,m_Options);
+				else
+					bA4SRootBuildComplete=false;
+				if (FAILED(AddSecondFolder(pItem,m_Items,m_Options)))
+					bA4SRootBuildComplete=false;
 			}
+			else
+				bA4SRootBuildComplete=false;
 		}
 	}
 
@@ -3051,7 +3284,8 @@ void CMenuContainer::InitItems( void )
 	UpdateAccelerators(0,m_OriginalCount);
 #ifdef A4S_PRODUCT
 	if (a4sRootGeneration)
-		PublishA4SRootItems(a4sRootGeneration);
+		PublishA4SRootItems(a4sRootGeneration,a4sRootIconEpoch,
+			bA4SRootBuildComplete);
 	pinnedScope.SetResult(measurePinned?static_cast<UINT32>(m_OriginalCount):0U);
 #endif
 }
@@ -8605,20 +8839,25 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #ifdef A4S_PRODUCT
 	A4SRootCache &a4sRootCache=GetA4SRootCache();
 	const bool bDiscoverA4SEnvironment=!a4sRootCache.bEnvironmentValid;
+	bool a4sNoCommonFolders=a4sRootCache.bNoCommonFolders;
+	bool a4sNoRun=a4sRootCache.bNoRun;
+	bool a4sNoClose=a4sRootCache.bNoClose;
+	bool a4sHasTouch=a4sRootCache.bHasTouch;
+	bool a4sRemote=a4sRootCache.bRemote;
 	if (bDiscoverA4SEnvironment)
 	{
-		a4sRootCache.bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
-		a4sRootCache.bNoRun=(SHRestricted(REST_NORUN)!=0);
-		a4sRootCache.bNoClose=(SHRestricted(REST_NOCLOSE)!=0);
-		a4sRootCache.bHasTouch=GetWinVersion()>=WIN_VER_WIN8 &&
+		a4sNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
+		a4sNoRun=(SHRestricted(REST_NORUN)!=0);
+		a4sNoClose=(SHRestricted(REST_NOCLOSE)!=0);
+		a4sHasTouch=GetWinVersion()>=WIN_VER_WIN8 &&
 			GetSettingBool(L"EnableTouch") &&
 			(GetSystemMetrics(SM_DIGITIZER)&NID_INTEGRATED_TOUCH)!=0;
-		a4sRootCache.bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
+		a4sRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
 	}
-	s_bNoCommonFolders=a4sRootCache.bNoCommonFolders;
-	s_bNoRun=a4sRootCache.bNoRun;
-	s_bNoClose=a4sRootCache.bNoClose;
-	s_bHasTouch=a4sRootCache.bHasTouch;
+	s_bNoCommonFolders=a4sNoCommonFolders;
+	s_bNoRun=a4sNoRun;
+	s_bNoClose=a4sNoClose;
+	s_bHasTouch=a4sHasTouch;
 #else
 	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
 	s_bNoRun=(SHRestricted(REST_NORUN)!=0);
@@ -8634,7 +8873,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #endif
 
 #ifdef A4S_PRODUCT
-	bool bRemote=a4sRootCache.bRemote;
+	bool bRemote=a4sRemote;
 	// The product profile never exposes the legacy People or Active Directory
 	// search commands. Avoid probing Windows Mail or a domain controller on the
 	// latency-sensitive menu-opening path.
@@ -8990,9 +9229,6 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		LOG_MENU(LOG_OPEN,L"ItemOptions[%d]=%d",i,g_StdOptions[i].options);
 	}	
 #ifdef A4S_PRODUCT
-		a4sRootCache.bHasUpdates=s_bHasUpdates;
-		for (int i=0;i<_countof(g_StdOptions);i++)
-			a4sRootCache.stdOptions[i]=g_StdOptions[i].options;
 	}
 	else
 	{
@@ -9020,7 +9256,44 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #ifdef A4S_PRODUCT
 	if (bDiscoverA4SEnvironment)
 	{
-#endif
+		s_PinFolder.Empty();
+		if (ResolveA4SRootEnvironment(bAllPrograms,s_bNoCommonFolders,
+			path1,path2,s_PinFolder))
+		{
+			// Clone all fallible value state before touching the previous cache.
+			// Only a complete set is swapped into the shared environment record.
+			CAbsolutePidl cachedStart(path1);
+			CAbsolutePidl cachedCommon(path2);
+			if (cachedStart && (!path2 || cachedCommon))
+			{
+				a4sRootCache.startMenu.Swap(cachedStart);
+				a4sRootCache.commonStartMenu.Swap(cachedCommon);
+				a4sRootCache.pinFolder=s_PinFolder;
+				a4sRootCache.bNoCommonFolders=s_bNoCommonFolders;
+				a4sRootCache.bNoRun=s_bNoRun;
+				a4sRootCache.bNoClose=s_bNoClose;
+				a4sRootCache.bHasTouch=s_bHasTouch;
+				a4sRootCache.bRemote=bRemote;
+				a4sRootCache.bHasUpdates=s_bHasUpdates;
+				for (int i=0;i<_countof(g_StdOptions);i++)
+					a4sRootCache.stdOptions[i]=g_StdOptions[i].options;
+				// This is the sole environment commit point.
+				a4sRootCache.bEnvironmentValid=true;
+			}
+		}
+		if (!a4sRootCache.bEnvironmentValid)
+			a4sRootCache.bConfigurationValid=false;
+	}
+	else
+	{
+		path1.Clone(a4sRootCache.startMenu);
+		path2.Clone(a4sRootCache.commonStartMenu);
+		s_PinFolder=a4sRootCache.pinFolder;
+	}
+	// Programs enumeration is independent of first-frame construction. The
+	// request is a cache/configuration check on a warm normal-root toggle.
+	CProgramsTree::PreloadA4SItems(s_bNoCommonFolders);
+#else
 	s_PinFolder.Empty();
 	if (bAllPrograms || GetSettingInt(L"PinnedPrograms")==PINNED_PROGRAMS_FAST)
 	{
@@ -9041,25 +9314,6 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		s_PinFolder=path;
 		SHParseDisplayName(path,NULL,&path1,0,NULL);
 	}
-#ifdef A4S_PRODUCT
-		a4sRootCache.startMenu.Clone(path1);
-		a4sRootCache.commonStartMenu.Clone(path2);
-		a4sRootCache.pinFolder=s_PinFolder;
-		// Publish only after policy, power, standard options and every path have
-		// been captured. A warm opener can therefore never observe a partial set.
-		a4sRootCache.bEnvironmentValid=true;
-	}
-	else
-	{
-		path1.Clone(a4sRootCache.startMenu);
-		path2.Clone(a4sRootCache.commonStartMenu);
-		s_PinFolder=a4sRootCache.pinFolder;
-	}
-	// Programs enumeration is independent of first-frame construction. The
-	// request is a cache/configuration check on a warm normal-root toggle.
-	CProgramsTree::PreloadA4SItems(s_bNoCommonFolders);
-#endif
-#ifndef A4S_PRODUCT
 #ifndef STARTSCREEN_WIN7
 	if (GetWinVersion()>=WIN_VER_WIN8)
 #endif

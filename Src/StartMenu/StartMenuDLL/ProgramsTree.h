@@ -258,6 +258,7 @@ private:
 		bool bHideProgramsMetro;
 		bool bFoldersFirst;
 		ULONGLONG folderContentGeneration;
+		ULONGLONG iconCacheEpoch;
 		CString appsName;
 
 		bool operator==( const A4SAsyncConfiguration &other ) const
@@ -268,6 +269,7 @@ private:
 				bHideProgramsMetro==other.bHideProgramsMetro &&
 				bFoldersFirst==other.bFoldersFirst &&
 				folderContentGeneration==other.folderContentGeneration &&
+				iconCacheEpoch==other.iconCacheEpoch &&
 				appsName==other.appsName;
 		}
 	};
@@ -289,6 +291,9 @@ private:
 	static LONG s_A4SAsyncNotifyCookie;
 
 	static A4SAsyncConfiguration CaptureA4SConfiguration( bool bNoCommonFolders );
+	static bool IsA4SConfigurationLive( const A4SAsyncConfiguration &configuration );
+	static bool SupersedeA4SConfigurationIfStale(
+		const A4SAsyncConfiguration &configuration, LONG generation );
 	static bool StartA4SAsyncWorkerLocked( void );
 	static DWORD CALLBACK A4SAsyncWorkerProc( void *param );
 	static A4SAsyncResult BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,

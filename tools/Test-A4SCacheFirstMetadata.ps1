@@ -58,6 +58,7 @@ $pathSignature = 'const CItemManager::ItemInfo *CItemManager::GetItemInfo( CStri
 $helper = Get-CppFunctionBody -Text $source -Signature $helperSignature
 $shellOverload = Get-CppFunctionBody -Text $source -Signature $shellSignature
 $pathOverload = Get-CppFunctionBody -Text $source -Signature $pathSignature
+$resetTempIcons = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::ResetTempIcons( void )'
 
 Assert-Contract ($header -match '#ifdef\s+A4S_PRODUCT\s+bool\s+TryGetCachedFileMetadata\([^;]+;\s+#endif') `
     'the helper declaration is not product-only'
@@ -106,7 +107,7 @@ Assert-Contract ($classicPinnedIndex -ge 0 -and $classicPinnedIndex -lt [int]$wa
 Assert-Contract ($source -match 'FindFirstChangeNotification\([^;]+FILE_NOTIFY_CHANGE_LAST_WRITE\)') `
     'the watcher no longer observes pin/unpin and shortcut metadata changes'
 
-Assert-Contract ($header -match '#ifdef\s+A4S_PRODUCT\s+ULONGLONG\s+GetFolderContentGeneration\(\s*void\s*\)\s+const;\s+#endif') `
+Assert-Contract ($header -match '#ifdef\s+A4S_PRODUCT[\s\S]*ULONGLONG\s+GetFolderContentGeneration\(\s*void\s*\)\s+const;[\s\S]*GetIconCacheEpoch') `
     'the product-only folder-content generation API is missing'
 $constructor = Get-CppFunctionBody -Text $source -Signature 'CItemManager::CItemManager( void )'
 $generationGetter = Get-CppFunctionBody -Text $source -Signature 'ULONGLONG CItemManager::GetFolderContentGeneration( void ) const'
@@ -124,6 +125,47 @@ Assert-Contract ($source -match 'A4S_MENU_CONTENT_DIR_MASK\s*=\s*\(1U<<0\)\|\(1U
     'the content generation mask no longer covers both Start roots, classic pins, and packaged app links'
 Assert-Contract ($preload -match 'dirMask\s*&\s*A4S_MENU_CONTENT_DIR_MASK[\s\S]*AdvanceFolderContentGeneration\(\)') `
     'watched menu-content notifications do not advance the generation'
+
+# Icon/metadata invalidation has an independent epoch. ResetTempIcons executes
+# on every menu toggle, so a true no-op must preserve warm snapshot identity.
+Assert-Contract ($header -match 'ULONGLONG\s+GetIconCacheEpoch\(\s*void\s*\)\s+const' -and
+    $header -match 'volatile\s+LONGLONG\s+m_IconCacheEpoch') `
+    'the product has no icon/cache epoch in ItemManager'
+$iconGetter = Get-CppFunctionBody -Text $source -Signature 'ULONGLONG CItemManager::GetIconCacheEpoch( void ) const'
+$iconAdvance = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::AdvanceIconCacheEpoch( void )'
+Assert-Contract ($constructor -match 'm_IconCacheEpoch\s*=\s*1\s*;') `
+    'icon/cache epoch is not initialized to a nonzero value'
+Assert-Contract ($iconGetter -match 'InterlockedCompareExchange64\(' -and
+    $iconAdvance -match 'InterlockedCompareExchange64\(' -and
+    $iconAdvance -match 'value\s*==\s*~0ULL\s*\?\s*1\s*:\s*value\s*\+\s*1') `
+    'icon/cache epoch is not atomically monotonic with zero-skipping wrap'
+$resetEpochCalls = [Regex]::Matches($resetTempIcons, 'AdvanceIconCacheEpoch\(\)').Count
+Assert-Contract ($resetTempIcons -match 'bool\s+bCacheInvalidated=false' -and
+    $resetTempIcons -match 'if\s*\(bCacheInvalidated\)\s*AdvanceIconCacheEpoch\(\)' -and
+    $resetEpochCalls -eq 1) `
+    'ResetTempIcons advances the epoch on a no-op toggle'
+Assert-Contract ($resetTempIcons -match 'a4sResolvedIconFlags&=~INFO_SMALL_ICON' -and
+    $resetTempIcons -match 'a4sResolvedIconFlags&=~INFO_LARGE_ICON' -and
+    $resetTempIcons -match 'a4sResolvedIconFlags&=~INFO_EXTRA_LARGE_ICON' -and
+    $resetTempIcons -match 'a4sResolvedIconFlags&=~INFO_ICON') `
+    'invalidated icons can remain falsely marked as terminally resolved'
+
+# The pre-watch delay cannot validate a snapshot. Readiness is manual-reset and
+# the content generation advances before readiness is published.
+Assert-Contract ($header -match 'IsFolderWatchBaselineReady' -and
+    $header -match 'WaitForFolderWatchBaseline' -and
+    $header -match 'm_A4SFolderWatchReadyEvent') `
+    'the initial watched-directory baseline has no explicit readiness contract'
+Assert-Contract ($source -match 'm_A4SFolderWatchReadyEvent=CreateEvent\(NULL,TRUE,FALSE,NULL\)') `
+    'folder watcher readiness is not a manual-reset one-time baseline'
+$waitBaseline = Get-CppFunctionBody -Text $source -Signature 'bool CItemManager::WaitForFolderWatchBaseline( DWORD timeout ) const'
+Assert-Contract ($waitBaseline -match 'm_A4SFolderWatchReadyEvent' -and
+    $waitBaseline -match 'm_ExitEvent' -and
+    $waitBaseline -match 'WaitForMultipleObjects') `
+    'waiting for the initial watcher baseline cannot be cancelled at shutdown'
+$baselineSequence = 'AdvanceFolderContentGeneration\(\);\s*InterlockedExchange\(&m_A4SFolderWatchReady,1\);\s*SetEvent\(m_A4SFolderWatchReadyEvent\);'
+Assert-Contract ($preload -match $baselineSequence) `
+    'watcher readiness is signaled before pre-watch snapshots are invalidated'
 
 # Deterministic fail-closed decision model for the exact conditions encoded by
 # TryGetCachedFileMetadata. This exercises every rejection edge without loading
@@ -172,5 +214,35 @@ Assert-Contract ($generation -eq 33) 'folder-content generation model did not ad
 $generation = [UInt64]::MaxValue
 $generation = if ($generation -eq [UInt64]::MaxValue) { [UInt64]1 } else { $generation + 1 }
 Assert-Contract ($generation -eq 1) 'folder-content generation model did not skip zero on wrap'
+
+# Executable no-op/invalidation model for ResetTempIcons.
+function Invoke-IconResetModel {
+    param([UInt64] $Epoch, [bool] $RemovedOrInvalidated)
+    if ($RemovedOrInvalidated) {
+        return $(if ($Epoch -eq [UInt64]::MaxValue) { [UInt64]1 } else { $Epoch + 1 })
+    }
+    return $Epoch
+}
+$iconEpoch = [UInt64]14
+$iconEpoch = Invoke-IconResetModel -Epoch $iconEpoch -RemovedOrInvalidated:$false
+Assert-Contract ($iconEpoch -eq 14) 'a no-op toggle changed icon/cache identity'
+$iconEpoch = Invoke-IconResetModel -Epoch $iconEpoch -RemovedOrInvalidated:$true
+Assert-Contract ($iconEpoch -eq 15) 'a real icon invalidation did not change cache identity'
+
+# A snapshot captured during the initial delay is never eligible after watcher
+# setup: baseline publication first advances generation, then exposes readiness.
+$blindWindow = [ordered]@{
+    SnapshotGeneration = [UInt64]3
+    LiveGeneration = [UInt64]3
+    BaselineReady = $false
+}
+$eligibleBeforeBaseline = $blindWindow.BaselineReady -and
+    $blindWindow.SnapshotGeneration -eq $blindWindow.LiveGeneration
+$blindWindow.LiveGeneration++
+$blindWindow.BaselineReady = $true
+$eligibleAfterBaseline = $blindWindow.BaselineReady -and
+    $blindWindow.SnapshotGeneration -eq $blindWindow.LiveGeneration
+Assert-Contract (-not $eligibleBeforeBaseline -and -not $eligibleAfterBaseline) `
+    'a pre-watch snapshot can survive baseline establishment'
 
 Write-Host 'A4S cache-first metadata gates passed.'

@@ -529,7 +529,10 @@ CItemManager::CItemManager( void )
 #ifdef A4S_PRODUCT
 	m_PendingPidlRefresh=0;
 	m_FolderContentGeneration=1;
+	m_IconCacheEpoch=1;
+	m_A4SFolderWatchReady=0;
 	m_A4SItemReadyEvent=NULL;
+	m_A4SFolderWatchReadyEvent=NULL;
 #endif
 	m_LastCacheSave=0;
 	m_TransientHash=1;
@@ -646,12 +649,14 @@ bool CItemManager::Init( void )
 	m_ExitEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 	m_DoneEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 #ifdef A4S_PRODUCT
+	InterlockedExchange(&m_A4SFolderWatchReady,0);
 	m_A4SItemReadyEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
+	m_A4SFolderWatchReadyEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 #endif
 
 #ifdef A4S_PRODUCT
 	if (!m_StartEvent || !m_WorkEvent || !m_ExitEvent || !m_DoneEvent ||
-		!m_A4SItemReadyEvent)
+		!m_A4SItemReadyEvent || !m_A4SFolderWatchReadyEvent)
 	{
 		Close();
 		return false;
@@ -741,7 +746,9 @@ bool CItemManager::Close( void )
 	m_StartEvent=m_WorkEvent=m_ExitEvent=m_DoneEvent=NULL;
 #ifdef A4S_PRODUCT
 	if (m_A4SItemReadyEvent) CloseHandle(m_A4SItemReadyEvent);
+	if (m_A4SFolderWatchReadyEvent) CloseHandle(m_A4SFolderWatchReadyEvent);
 	m_A4SItemReadyEvent=NULL;
+	m_A4SFolderWatchReadyEvent=NULL;
 #endif
 	m_LoadIconData[0].Close();
 	m_bInitialized=false;
@@ -799,6 +806,7 @@ void CItemManager::ResetTempIcons( void )
 	Lock cleanupLock(this,LOCK_CLEANUP);
 	RWLock itemLock(this,true,RWLOCK_ITEMS);
 	RWLock iconLock(this,true,RWLOCK_ICONS);
+	bool bCacheInvalidated=false;
 
 	COLORREF sysColor=GetSystemAccentColor();
 	bool bResetMetro=m_OldSysAccentColor!=sysColor;
@@ -816,8 +824,13 @@ void CItemManager::ResetTempIcons( void )
 			std::map<unsigned int,const ItemInfo*>::iterator next=it; ++next;
 			if (it->second && !it->second->packagePath.IsEmpty())
 			{
-				const_cast<ItemInfo*>(it->second)->validFlags&=~(INFO_ICON|INFO_METRO);
+				ItemInfo *pInfo=const_cast<ItemInfo*>(it->second);
+				pInfo->validFlags&=~(INFO_ICON|INFO_METRO);
+#ifdef A4S_PRODUCT
+				pInfo->a4sResolvedIconFlags&=~INFO_ICON;
+#endif
 				m_MetroItemInfos10.erase(it);
+				bCacheInvalidated=true;
 			}
 			it=next;
 		}
@@ -832,6 +845,7 @@ void CItemManager::ResetTempIcons( void )
 			{
 				Assert(!(*it)->largeIcon && !(*it)->extraLargeIcon && ((*it)->smallIcon==m_DefaultSmallIcon || (*it)->smallIcon->bTemp));
 				m_ItemQueue.erase(it);
+				bCacheInvalidated=true;
 			}
 			it=next;
 		}
@@ -848,6 +862,7 @@ void CItemManager::ResetTempIcons( void )
 			{
 				Assert(it->second.largeIcon==m_DefaultLargeIcon && it->second.extraLargeIcon==m_DefaultExtraLargeIcon && (it->second.smallIcon==m_DefaultSmallIcon || it->second.smallIcon->bTemp));
 				m_ItemInfos.erase(it);
+				bCacheInvalidated=true;
 			}
 			else
 			{
@@ -855,17 +870,39 @@ void CItemManager::ResetTempIcons( void )
 				{
 					it->second.smallIcon=m_DefaultSmallIcon;
 					it->second.validFlags&=~(INFO_SMALL_ICON|metroFlags);
+#ifdef A4S_PRODUCT
+					it->second.a4sResolvedIconFlags&=~INFO_SMALL_ICON;
+#endif
+					bCacheInvalidated=true;
 				}
 				if (it->second.largeIcon && (it->second.largeIcon->bTemp || (it->second.largeIcon->bMetro && bResetMetro)))
 				{
 					it->second.largeIcon=m_DefaultLargeIcon;
 					it->second.validFlags&=~(INFO_LARGE_ICON|metroFlags);
+#ifdef A4S_PRODUCT
+					it->second.a4sResolvedIconFlags&=~INFO_LARGE_ICON;
+#endif
+					bCacheInvalidated=true;
 				}
 				if (it->second.extraLargeIcon && (it->second.extraLargeIcon->bTemp || (it->second.extraLargeIcon->bMetro && bResetMetro)))
 				{
 					it->second.extraLargeIcon=m_DefaultExtraLargeIcon;
 					it->second.validFlags&=~(INFO_EXTRA_LARGE_ICON|metroFlags);
+#ifdef A4S_PRODUCT
+					it->second.a4sResolvedIconFlags&=~INFO_EXTRA_LARGE_ICON;
+#endif
+					bCacheInvalidated=true;
 				}
+#ifdef A4S_PRODUCT
+				// A terminal fallback has no Metro IconInfo to match. Accent or
+				// inversion changes must still make that Metro result resolvable again.
+				if (bResetMetro && (it->second.bMetroLink || it->second.bMetroApp ||
+					!it->second.packagePath.IsEmpty()) && it->second.a4sResolvedIconFlags)
+				{
+					it->second.a4sResolvedIconFlags&=~INFO_ICON;
+					bCacheInvalidated=true;
+				}
+#endif
 			}
 			it=next;
 		}
@@ -882,6 +919,7 @@ void CItemManager::ResetTempIcons( void )
 				if (it->second.bitmap)
 					DeleteObject(it->second.bitmap);
 				m_IconInfos.erase(it);
+				bCacheInvalidated=true;
 			}
 			it=next;
 		}
@@ -893,7 +931,15 @@ void CItemManager::ResetTempIcons( void )
 			DeleteObject(*it);
 		m_OldBitmaps.clear();
 	}
+	if (m_TransientHash!=1)
+		bCacheInvalidated=true;
 	m_TransientHash=1;
+#ifdef A4S_PRODUCT
+	// ResetTempIcons runs on every toggle. Preserve warm cache identity unless
+	// this pass actually removed or invalidated icon/Metro/temp state.
+	if (bCacheInvalidated)
+		AdvanceIconCacheEpoch();
+#endif
 }
 
 static bool ComparePidls( PIDLIST_ABSOLUTE pidl1, PIDLIST_ABSOLUTE pidl2 )
@@ -2403,6 +2449,28 @@ ULONGLONG CItemManager::GetFolderContentGeneration( void ) const
 		const_cast<volatile LONGLONG*>(&m_FolderContentGeneration),0,0));
 }
 
+ULONGLONG CItemManager::GetIconCacheEpoch( void ) const
+{
+	return static_cast<ULONGLONG>(InterlockedCompareExchange64(
+		const_cast<volatile LONGLONG*>(&m_IconCacheEpoch),0,0));
+}
+
+bool CItemManager::IsFolderWatchBaselineReady( void ) const
+{
+	return InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_A4SFolderWatchReady),0,0)!=0;
+}
+
+bool CItemManager::WaitForFolderWatchBaseline( DWORD timeout ) const
+{
+	if (IsFolderWatchBaselineReady())
+		return true;
+	if (!m_A4SFolderWatchReadyEvent || !m_ExitEvent)
+		return false;
+	HANDLE handles[2]={m_A4SFolderWatchReadyEvent,m_ExitEvent};
+	return WaitForMultipleObjects(_countof(handles),handles,FALSE,timeout)==WAIT_OBJECT_0;
+}
+
 void CItemManager::AdvanceFolderContentGeneration( void )
 {
 	LONGLONG current=InterlockedCompareExchange64(&m_FolderContentGeneration,0,0);
@@ -2413,6 +2481,20 @@ void CItemManager::AdvanceFolderContentGeneration( void )
 		const ULONGLONG value=static_cast<ULONGLONG>(current);
 		const LONGLONG next=static_cast<LONGLONG>(value==~0ULL?1:value+1);
 		const LONGLONG observed=InterlockedCompareExchange64(&m_FolderContentGeneration,next,current);
+		if (observed==current)
+			return;
+		current=observed;
+	}
+}
+
+void CItemManager::AdvanceIconCacheEpoch( void )
+{
+	LONGLONG current=InterlockedCompareExchange64(&m_IconCacheEpoch,0,0);
+	while (1)
+	{
+		const ULONGLONG value=static_cast<ULONGLONG>(current);
+		const LONGLONG next=static_cast<LONGLONG>(value==~0ULL?1:value+1);
+		const LONGLONG observed=InterlockedCompareExchange64(&m_IconCacheEpoch,next,current);
 		if (observed==current)
 			return;
 		current=observed;
@@ -3180,7 +3262,18 @@ void CItemManager::PreloadItemsThread( void )
 		{
 			if (m_LoadingStage!=LOAD_LOADING) break;
 			if (i==NUM_WATCHED_DIRS && dirMask==0xFFFFFFFF)
+			{
+#ifdef A4S_PRODUCT
+				// The first menu may open during the intentional two-second preload
+				// delay. Once every watched path has been armed (or attempted), advance
+				// the content generation before publishing readiness. Any snapshot
+				// captured in that blind window is therefore permanently stale.
+				AdvanceFolderContentGeneration();
+				InterlockedExchange(&m_A4SFolderWatchReady,1);
+				SetEvent(m_A4SFolderWatchReadyEvent);
+#endif
 				SetEvent(m_DoneEvent);
+			}
 			if (!(dirMask&(1<<i))) continue;
 			if (g_CacheFolders[i].folder==FOLDERID_Favorites && !m_bPreloadFavorites) continue;
 			CAbsolutePidl pidl;
