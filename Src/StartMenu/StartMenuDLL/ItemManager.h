@@ -105,6 +105,9 @@ public:
 		{
 			smallIcon=largeIcon=extraLargeIcon=NULL;
 			validFlags=refreshFlags=0;
+#ifdef A4S_PRODUCT
+			a4sResolvedIconFlags=0;
+#endif
 			bIconOnly=bTemp=bLink=bExplicitAppId=bNoPin=bNoNew=bMetroLink=bMetroApp=bProtectedLink=false;
 			writestamp.dwHighDateTime=writestamp.dwLowDateTime=0;
 			createstamp.dwHighDateTime=createstamp.dwLowDateTime=0;
@@ -156,6 +159,12 @@ public:
 
 		int validFlags;
 		int refreshFlags; // 0 if not in the queue, the item can't be deleted if this is !=0
+#ifdef A4S_PRODUCT
+		// Includes successful icons and terminal fallback/error outcomes. This is
+		// separate from validFlags because legacy StartScreen icon paths
+		// intentionally opt out of persistent icon validation.
+		int a4sResolvedIconFlags;
+#endif
 
 		CAbsolutePidl targetPidl;
 		CString targetPATH;
@@ -187,6 +196,19 @@ public:
 	void RefreshInfos( void );
 #ifdef A4S_PRODUCT
 	ULONGLONG GetFolderContentGeneration( void ) const;
+#endif
+#ifdef A4S_PRODUCT
+	// Creates or finds a custom icon entry but always leaves decoding to the
+	// dedicated refresh thread. This keeps snapshot workers and the UI thread out
+	// of the WIC/shell icon path.
+	const ItemInfo *GetA4SCustomIcon( const wchar_t *path,
+		TIconSizeType iconSizeType );
+	// Queues icons on ItemManager's dedicated decoder regardless of the legacy
+	// DelayIcons setting. Snapshot workers may wait here; the UI thread never does.
+	bool QueueA4SItemInfo( const ItemInfo *pInfo, int refreshFlags );
+	bool AreA4SItemInfosReady( const std::vector<const ItemInfo*> &items,
+		int refreshFlags );
+	bool WaitForA4SItemInfo( DWORD timeout );
 #endif
 
 	void RemoveNewItem( PIDLIST_ABSOLUTE pItem1, PIDLIST_ABSOLUTE pItem2, bool bFolder );
@@ -270,6 +292,9 @@ private:
 	HANDLE m_WorkEvent; // kicks off the refresh thread
 	HANDLE m_ExitEvent; // exit all threads
 	HANDLE m_DoneEvent; // done preloading start menu items
+#ifdef A4S_PRODUCT
+	HANDLE m_A4SItemReadyEvent; // an icon reached ready or terminal fallback state
+#endif
 	HANDLE m_PreloadItemsThread;
 	HANDLE m_RefreshInfoThread;
 	HANDLE m_SaveCacheThread;
@@ -322,6 +347,8 @@ private:
 
 	// requires LOCK_ITEMS to be held
 	void QueueItemInfo( ItemInfo *pInfo, int refreshFlags );
+	const ItemInfo *GetCustomIconInternal( const wchar_t *location, int index,
+		TIconSizeType iconSizeType, bool bTemp, bool bForceAsync );
 	// doesn't require a lock
 	void RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellItem *pItem, bool bHasWriteLock );
 

@@ -529,6 +529,7 @@ CItemManager::CItemManager( void )
 #ifdef A4S_PRODUCT
 	m_PendingPidlRefresh=0;
 	m_FolderContentGeneration=1;
+	m_A4SItemReadyEvent=NULL;
 #endif
 	m_LastCacheSave=0;
 	m_TransientHash=1;
@@ -644,9 +645,13 @@ bool CItemManager::Init( void )
 	m_WorkEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
 	m_ExitEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 	m_DoneEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
+#ifdef A4S_PRODUCT
+	m_A4SItemReadyEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
+#endif
 
 #ifdef A4S_PRODUCT
-	if (!m_StartEvent || !m_WorkEvent || !m_ExitEvent || !m_DoneEvent)
+	if (!m_StartEvent || !m_WorkEvent || !m_ExitEvent || !m_DoneEvent ||
+		!m_A4SItemReadyEvent)
 	{
 		Close();
 		return false;
@@ -676,6 +681,10 @@ bool CItemManager::Close( void )
 	m_LoadingStage=LOAD_STOPPING;
 	if (m_ExitEvent)
 		SetEvent(m_ExitEvent);
+#ifdef A4S_PRODUCT
+	if (m_A4SItemReadyEvent)
+		SetEvent(m_A4SItemReadyEvent);
+#endif
 #ifdef A4S_PRODUCT
 	const DWORD closeBudget=1500;
 	const DWORD closeStart=GetTickCount();
@@ -730,6 +739,10 @@ bool CItemManager::Close( void )
 	if (m_ExitEvent) CloseHandle(m_ExitEvent);
 	if (m_DoneEvent) CloseHandle(m_DoneEvent);
 	m_StartEvent=m_WorkEvent=m_ExitEvent=m_DoneEvent=NULL;
+#ifdef A4S_PRODUCT
+	if (m_A4SItemReadyEvent) CloseHandle(m_A4SItemReadyEvent);
+	m_A4SItemReadyEvent=NULL;
+#endif
 	m_LoadIconData[0].Close();
 	m_bInitialized=false;
 	return true;
@@ -1189,10 +1202,16 @@ void CItemManager::UpdateItemInfo( const ItemInfo *pInfo, int refreshFlags, bool
 
 const CItemManager::ItemInfo *CItemManager::GetCustomIcon( const wchar_t *location, int index, TIconSizeType iconSizeType, bool bTemp )
 {
+	return GetCustomIconInternal(location,index,iconSizeType,bTemp,false);
+}
+
+const CItemManager::ItemInfo *CItemManager::GetCustomIconInternal( const wchar_t *location,
+	int index, TIconSizeType iconSizeType, bool bTemp, bool bForceAsync )
+{
 	Assert(!RWLock::ThreadHasReadLock(RWLOCK_ITEMS));
 	unsigned int hash=CalcFNVHash(location,CalcFNVHash(&index,4));
 	ItemInfo *pInfo=NULL;
-	bool bDelay=GetSettingBool(L"DelayIcons");
+	bool bDelay=bForceAsync || GetSettingBool(L"DelayIcons");
 	int refreshFlags=0;
 	{
 		RWLock lock(this,true,RWLOCK_ITEMS);
@@ -1263,6 +1282,32 @@ const CItemManager::ItemInfo *CItemManager::GetCustomIcon( const wchar_t *path, 
 	}
 	return GetCustomIcon(text,index,iconSizeType,false);
 }
+
+#ifdef A4S_PRODUCT
+const CItemManager::ItemInfo *CItemManager::GetA4SCustomIcon( const wchar_t *path,
+	TIconSizeType iconSizeType )
+{
+	Assert(!RWLock::ThreadHasReadLock(RWLOCK_ITEMS));
+	wchar_t text[1024];
+	Strcpy(text,_countof(text),path);
+	DoEnvironmentSubst(text,_countof(text));
+	wchar_t *c=wcsrchr(text,',');
+	int index=0;
+	if (c)
+	{
+		*c=0;
+		index=-_wtol(c+1);
+	}
+	if (!text[0] && index==-IDI_APPSICON)
+	{
+		if (IsWin11())
+			index=-IDI_APPSICON11;
+		else if (GetWinVersion()==WIN_VER_WIN10)
+			index=-IDI_APPSICON10;
+	}
+	return GetCustomIconInternal(text,index,iconSizeType,false,true);
+}
+#endif
 
 const CItemManager::ItemInfo* CItemManager::GetLinkIcon(IShellLink* link, TIconSizeType iconSizeType)
 {
@@ -1381,6 +1426,67 @@ void CItemManager::QueueItemInfo( ItemInfo *pInfo, int refreshFlags )
 			SetEvent(m_StartEvent);
 	}
 }
+
+#ifdef A4S_PRODUCT
+bool CItemManager::QueueA4SItemInfo( const ItemInfo *pInfo0, int refreshFlags )
+{
+	refreshFlags&=INFO_ICON;
+	if (!pInfo0 || !refreshFlags || !m_bInitialized ||
+		m_LoadingStage!=LOAD_LOADING || !m_WorkEvent || !m_StartEvent)
+		return !refreshFlags;
+
+	ItemInfo *pInfo=const_cast<ItemInfo*>(pInfo0);
+	RWLock lock(this,true,RWLOCK_ITEMS);
+	const int missingFlags=refreshFlags&~pInfo->validFlags;
+	if (!missingFlags)
+		return true;
+
+	// A previous terminal fallback applies only to the request that produced it.
+	// Explicitly queueing an invalidated icon starts a fresh resolution attempt.
+	pInfo->a4sResolvedIconFlags&=~missingFlags;
+
+	// Promote an idle preload request to the high-priority decoder queue. The
+	// decoder may already have popped the item; a harmless second queue entry is
+	// preferable to waiting behind unrelated preload work.
+	for (std::list<ItemInfo*>::iterator it=m_ItemQueueLow.begin();
+		it!=m_ItemQueueLow.end();)
+	{
+		if (*it==pInfo)
+			it=m_ItemQueueLow.erase(it);
+		else
+			++it;
+	}
+	QueueItemInfo(pInfo,missingFlags);
+	return true;
+}
+
+bool CItemManager::AreA4SItemInfosReady(
+	const std::vector<const ItemInfo*> &items, int refreshFlags )
+{
+	refreshFlags&=INFO_ICON;
+	if (!refreshFlags)
+		return true;
+	RWLock lock(this,false,RWLOCK_ITEMS);
+	for (std::vector<const ItemInfo*>::const_iterator it=items.begin();
+		it!=items.end();++it)
+	{
+		const ItemInfo *pInfo=*it;
+		if (pInfo && ((pInfo->validFlags|pInfo->a4sResolvedIconFlags)&refreshFlags)
+			!=refreshFlags)
+			return false;
+	}
+	return true;
+}
+
+bool CItemManager::WaitForA4SItemInfo( DWORD timeout )
+{
+	if (!m_A4SItemReadyEvent || !m_ExitEvent)
+		return false;
+	HANDLE handles[2]={m_A4SItemReadyEvent,m_ExitEvent};
+	const DWORD result=WaitForMultipleObjects(_countof(handles),handles,FALSE,timeout);
+	return result==WAIT_OBJECT_0 || result==WAIT_TIMEOUT;
+}
+#endif
 
 void CItemManager::WaitForShortcuts( const POINT &balloonPos )
 {
@@ -1949,6 +2055,7 @@ void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellIte
 {
 #ifdef A4S_PRODUCT
 	const UINT32 requestedIconFlags=static_cast<UINT32>(refreshFlags&INFO_ICON);
+	ItemInfo *const pA4SInfo=pInfo;
 	A4SPerformanceScope iconScope(A4S_PERF_ICON_LOAD,requestedIconFlags!=0,
 		requestedIconFlags);
 #endif
@@ -1982,7 +2089,20 @@ void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellIte
 				if (pidl)
 				{
 					if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pItem)))
+					{
+#ifdef A4S_PRODUCT
+						{
+							RWLock lock(this,true,bHasWriteLock?RWLOCK_COUNT:RWLOCK_ITEMS);
+							if (requestedIconFlags)
+								pA4SInfo->a4sResolvedIconFlags|=requestedIconFlags;
+							pA4SInfo->refreshFlags&=~refreshFlags;
+						}
+						if (requestedIconFlags && m_A4SItemReadyEvent)
+							SetEvent(m_A4SItemReadyEvent);
+						iconScope.SetResult(requestedIconFlags,FALSE);
+#endif
 						return;
+					}
 				}
 			}
 		}
@@ -2240,9 +2360,14 @@ void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellIte
 			pInfo->validFlags|=refreshFlags&(INFO_DATA|INFO_ICON);
 		else
 			pInfo->validFlags|=refreshFlags&INFO_DATA;
+#ifdef A4S_PRODUCT
+		pInfo->a4sResolvedIconFlags|=requestedIconFlags;
+#endif
 		pInfo->refreshFlags&=~refreshFlags;
 	}
 #ifdef A4S_PRODUCT
+	if (requestedIconFlags && m_A4SItemReadyEvent)
+		SetEvent(m_A4SItemReadyEvent);
 	iconScope.SetResult(requestedIconFlags,FALSE);
 #endif
 }

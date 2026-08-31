@@ -8352,6 +8352,12 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_DropDescriptionFormat=RegisterClipboardFormat(CFSTR_DROPDESCRIPTION);
 #endif
 	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
+#ifdef A4S_PRODUCT
+	// Root Programs enumeration is independent of first-frame construction.
+	// Warm it while the normal menu continues through its existing layout path;
+	// a later Programs view consumes only a complete cached snapshot.
+	CProgramsTree::PreloadA4SItems(s_bNoCommonFolders);
+#endif
 	s_bNoRun=(SHRestricted(REST_NORUN)!=0);
 	s_bNoClose=(SHRestricted(REST_NOCLOSE)!=0);
 	s_bHasTouch=GetWinVersion()>=WIN_VER_WIN8 && GetSettingBool(L"EnableTouch") && (GetSystemMetrics(SM_DIGITIZER)&NID_INTEGRATED_TOUCH)!=0;

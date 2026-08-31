@@ -7,6 +7,9 @@
 #include "StartMenuDLL.h"
 #include "StartButton.h"
 #include "MenuContainer.h"
+#ifdef A4S_PRODUCT
+#include "ProgramsTree.h"
+#endif
 #include "SettingsParser.h"
 #include "Translations.h"
 #include "Settings.h"
@@ -5461,6 +5464,13 @@ STARTMENUAPI bool InitManagers( bool bNohook )
 
 STARTMENUAPI bool CloseManagers( bool bNohook )
 {
+#ifdef A4S_PRODUCT
+	// The Programs snapshot worker consumes ItemManager metadata. Prove it has
+	// cancelled before dismantling that dependency; a timeout keeps the complete
+	// manager chain resident and inert, matching the other bounded-stop guards.
+	if (!CProgramsTree::ShutdownA4SItems(1500))
+		return false;
+#endif
 	const bool searchClosed=g_SearchManager.Close();
 	// Search workers dereference the item manager. If a bounded product stop
 	// cannot join them, retain the entire dependency chain intact and inert.

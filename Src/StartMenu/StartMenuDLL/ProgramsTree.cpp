@@ -22,6 +22,21 @@
 
 bool CProgramsTree::s_bFoldersFirst;
 
+#ifdef A4S_PRODUCT
+SRWLOCK CProgramsTree::s_A4SAsyncLock=SRWLOCK_INIT;
+CProgramsTree::A4SAsyncConfiguration CProgramsTree::s_A4SAsyncConfiguration={};
+std::vector<CProgramsTree::CTreeItem> CProgramsTree::s_A4SAsyncItems;
+volatile LONG CProgramsTree::s_A4SAsyncGeneration=1;
+LONG CProgramsTree::s_A4SAsyncReadyGeneration=0;
+bool CProgramsTree::s_bA4SAsyncHasSnapshot=false;
+bool CProgramsTree::s_bA4SAsyncAutoSort=false;
+bool CProgramsTree::s_bA4SAsyncWorkerRunning=false;
+bool CProgramsTree::s_bA4SAsyncStopping=false;
+HANDLE CProgramsTree::s_A4SAsyncWorker=NULL;
+HWND CProgramsTree::s_A4SAsyncNotifyWindow=NULL;
+CProgramsTree *CProgramsTree::s_pA4SAsyncNotifyOwner=NULL;
+#endif
+
 const wchar_t *ORDER_PREFIX=L"#";
 
 // Keep a wheel/key pulse on-screen long enough to be perceptible and captured.
@@ -65,6 +80,9 @@ CProgramsTree::CProgramsTree( void )
 	m_bHoverTimer=m_bTrackMouse=m_bRefreshPosted=m_bAutoSort=m_bDragApps=m_bInsertAfter=false;
 	m_bA4SScrollbarHover=m_bA4SScrollbarPulse=false;
 	m_A4SScrollbarInputCount=0;
+#ifdef A4S_PRODUCT
+	m_pA4SPendingSelectItem=NULL;
+#endif
 	m_LastMousePos.x=m_LastMousePos.y=0;
 	m_MinX=m_MaxX=m_RootX=0;
 	m_DropLocation=DROP_NOWHERE;
@@ -264,6 +282,10 @@ void CProgramsTree::SyncA4SScrollbarProperties( void )
 
 LRESULT CProgramsTree::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
+#ifdef A4S_PRODUCT
+	UnsubscribeA4SItems(this);
+	m_pA4SPendingSelectItem=NULL;
+#endif
 	if (A4SMenuProfile::IsEnabled())
 	{
 		KillTimer(TIMER_A4S_SCROLLBAR_IDLE);
@@ -345,6 +367,525 @@ LRESULT CProgramsTree::OnBeginDrag( int idCtrl, LPNMHDR pnmh, BOOL& bHandled )
 	return 0;
 #endif
 }
+
+#ifdef A4S_PRODUCT
+CProgramsTree::A4SAsyncConfiguration CProgramsTree::CaptureA4SConfiguration( bool bNoCommonFolders )
+{
+	A4SAsyncConfiguration configuration={};
+	configuration.pinnedPrograms=GetSettingInt(L"PinnedPrograms");
+	configuration.bNoCommonFolders=bNoCommonFolders;
+	configuration.bAllProgramsMetro=GetSettingBool(L"AllProgramsMetro");
+	configuration.bHideProgramsMetro=GetSettingBool(L"HideProgramsMetro");
+	configuration.bFoldersFirst=GetSettingBool(L"FoldersFirst");
+	configuration.folderContentGeneration=g_ItemManager.GetFolderContentGeneration();
+	configuration.appsName=FindTranslation(L"Menu.Apps",L"Apps");
+	return configuration;
+}
+
+bool CProgramsTree::IsA4SGenerationCurrent( LONG generation )
+{
+	return InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0)==generation;
+}
+
+bool CProgramsTree::StartA4SAsyncWorkerLocked( void )
+{
+	if (s_bA4SAsyncStopping)
+		return false;
+	if (s_bA4SAsyncWorkerRunning)
+		return true;
+	if (s_A4SAsyncWorker)
+	{
+		// Once running is false the previous thread has released every ItemManager
+		// reference. Its remaining PostMessage/COM/module teardown is self-pinned.
+		CloseHandle(s_A4SAsyncWorker);
+		s_A4SAsyncWorker=NULL;
+	}
+
+	// The worker may outlive an individual menu window. Retain the module until
+	// its COM apartment and all shell objects have been torn down.
+	HMODULE module=NULL;
+	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
+		(LPCTSTR)(ULONG_PTR)&A4SAsyncWorkerProc,&module))
+		return false;
+
+	s_bA4SAsyncWorkerRunning=true;
+	HANDLE thread=CreateThread(NULL,0,A4SAsyncWorkerProc,module,0,NULL);
+	if (!thread)
+	{
+		s_bA4SAsyncWorkerRunning=false;
+		FreeLibrary(module);
+		return false;
+	}
+	s_A4SAsyncWorker=thread;
+	return true;
+}
+
+void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
+	bool bNoCommonFolders, bool bRefresh )
+{
+	const A4SAsyncConfiguration configuration=CaptureA4SConfiguration(bNoCommonFolders);
+
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	if (s_bA4SAsyncStopping)
+	{
+		ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+		return;
+	}
+	if (!(configuration==s_A4SAsyncConfiguration))
+	{
+		s_A4SAsyncConfiguration=configuration;
+		InterlockedIncrement(&s_A4SAsyncGeneration);
+		s_A4SAsyncReadyGeneration=0;
+		s_bA4SAsyncHasSnapshot=false;
+		s_A4SAsyncItems.clear();
+	}
+
+	if (pOwner)
+	{
+		s_pA4SAsyncNotifyOwner=pOwner;
+		s_A4SAsyncNotifyWindow=notifyWindow;
+	}
+
+	// Entering Programs presents the last complete snapshot immediately and
+	// refreshes it in the background. Normal menu openings merely warm a missing
+	// snapshot, which keeps repeated warm toggles free of enumeration I/O.
+	if (bRefresh)
+		InterlockedIncrement(&s_A4SAsyncGeneration);
+	if (!s_bA4SAsyncHasSnapshot || bRefresh)
+		StartA4SAsyncWorkerLocked();
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+}
+
+void CProgramsTree::PreloadA4SItems( bool bNoCommonFolders )
+{
+	RequestA4SItems(NULL,NULL,bNoCommonFolders,false);
+}
+
+bool CProgramsTree::ShutdownA4SItems( DWORD timeout )
+{
+	HANDLE worker=NULL;
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	s_bA4SAsyncStopping=true;
+	InterlockedIncrement(&s_A4SAsyncGeneration);
+	s_pA4SAsyncNotifyOwner=NULL;
+	s_A4SAsyncNotifyWindow=NULL;
+	worker=s_A4SAsyncWorker;
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+
+	if (worker && WaitForSingleObject(worker,timeout)!=WAIT_OBJECT_0)
+		return false;
+
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	if (s_A4SAsyncWorker)
+	{
+		CloseHandle(s_A4SAsyncWorker);
+		s_A4SAsyncWorker=NULL;
+	}
+	s_bA4SAsyncWorkerRunning=false;
+	s_bA4SAsyncHasSnapshot=false;
+	s_A4SAsyncReadyGeneration=0;
+	s_A4SAsyncItems.clear();
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+	return true;
+}
+
+void CProgramsTree::UnsubscribeA4SItems( CProgramsTree *pOwner )
+{
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	if (s_pA4SAsyncNotifyOwner==pOwner)
+	{
+		s_pA4SAsyncNotifyOwner=NULL;
+		s_A4SAsyncNotifyWindow=NULL;
+	}
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+}
+
+void CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
+	IShellItem *pParent, bool bPrograms, bool bHideProgramsMetro, LONG generation )
+{
+	const unsigned int hash0Prog=CalcFNVHash(L"\\",FNV_HASH0);
+	const unsigned int hash0=FNV_HASH0;
+	CShellItemEnumerator enumerator(pParent);
+	if (!enumerator.IsValid())
+		return;
+
+	CComPtr<IShellItem> pChild;
+	CAbsolutePidl childPidl;
+	while (IsA4SGenerationCurrent(generation) && enumerator.GetNext(pChild,childPidl))
+	{
+		SFGAOF itemFlags=0;
+		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)) ||
+			(itemFlags&SFGAO_HIDDEN))
+			continue;
+
+		CTreeItem item;
+		item.bFolder=(itemFlags&SFGAO_FOLDER)!=0;
+		item.pItemInfo1=g_ItemManager.GetItemInfo(pChild,childPidl,
+			CItemManager::INFO_LINK|CItemManager::INFO_METRO);
+		if (!item.pItemInfo1)
+			continue;
+
+		{
+			CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
+			if (item.pItemInfo1->IsMetroLink())
+			{
+				if (bHideProgramsMetro ||
+					_wcsicmp(item.pItemInfo1->GetAppid(),DESKTOP_APP_ID)==0)
+					continue;
+				CString name=item.pItemInfo1->GetMetroName();
+				item.SetName(name,false);
+				name.MakeUpper();
+				item.nameHash=CalcFNVHash(name,hash0);
+				item.nameHashProg=CalcFNVHash(name,hash0Prog);
+			}
+		}
+
+		if (item.name.IsEmpty())
+		{
+			CComString pName;
+			if (FAILED(pChild->GetDisplayName(SIGDN_NORMALDISPLAY,&pName)))
+				continue;
+			item.SetName(pName,false);
+			CComString pName2;
+			if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
+			{
+				pName2.MakeUpper();
+				item.nameHash=CalcFNVHash(pName2,hash0);
+				item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
+			}
+			else
+			{
+				pName.MakeUpper();
+				item.nameHash=CalcFNVHash(pName,hash0);
+				item.nameHashProg=CalcFNVHash(pName,hash0Prog);
+			}
+		}
+
+		if (bPrograms && IsA4SHiddenProgramsRootItem(item.name))
+			continue;
+		if (item.bFolder)
+			item.folderHash=CalcFNVHash(item.pItemInfo1->PATH,CalcFNVHash(ORDER_PREFIX));
+		item.order=-1;
+		item.bPrograms=bPrograms;
+		item.bNew=false; // IsNewProgram is intentionally evaluated on the UI thread.
+		items.push_back(item);
+	}
+}
+
+void CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
+	IShellItem *pParent, bool bPrograms, bool bHideProgramsMetro, LONG generation )
+{
+	const unsigned int hash0Prog=CalcFNVHash(L"\\",FNV_HASH0);
+	const unsigned int hash0=FNV_HASH0;
+	CShellItemEnumerator enumerator(pParent);
+	if (!enumerator.IsValid())
+		return;
+
+	CComPtr<IShellItem> pChild;
+	CAbsolutePidl childPidl;
+	while (IsA4SGenerationCurrent(generation) && enumerator.GetNext(pChild,childPidl))
+	{
+		SFGAOF itemFlags=0;
+		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)) ||
+			(itemFlags&SFGAO_HIDDEN))
+			continue;
+
+		CTreeItem item;
+		item.bFolder=(itemFlags&SFGAO_FOLDER)!=0;
+		item.pItemInfo1=g_ItemManager.GetItemInfo(pChild,childPidl,
+			CItemManager::INFO_LINK|CItemManager::INFO_METRO);
+		if (!item.pItemInfo1)
+			continue;
+
+		{
+			CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
+			if (item.pItemInfo1->IsMetroLink())
+			{
+				if (bHideProgramsMetro ||
+					_wcsicmp(item.pItemInfo1->GetAppid(),DESKTOP_APP_ID)==0)
+					continue;
+				CString name=item.pItemInfo1->GetMetroName();
+				item.SetName(name,false);
+				name.MakeUpper();
+				item.nameHash=CalcFNVHash(name,hash0);
+				item.nameHashProg=CalcFNVHash(name,hash0Prog);
+			}
+		}
+
+		if (item.name.IsEmpty())
+		{
+			CComString pName;
+			if (FAILED(pChild->GetDisplayName(SIGDN_NORMALDISPLAY,&pName)))
+				continue;
+			item.SetName(pName,false);
+			CComString pName2;
+			if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
+			{
+				pName2.MakeUpper();
+				item.nameHash=CalcFNVHash(pName2,hash0);
+				item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
+			}
+			else
+			{
+				pName.MakeUpper();
+				item.nameHash=CalcFNVHash(pName,hash0);
+				item.nameHashProg=CalcFNVHash(pName,hash0Prog);
+			}
+		}
+
+		if (bPrograms && IsA4SHiddenProgramsRootItem(item.name))
+			continue;
+		if (item.bFolder)
+			item.folderHash=CalcFNVHash(item.pItemInfo1->PATH,CalcFNVHash(ORDER_PREFIX));
+		item.order=-1;
+		item.bPrograms=bPrograms;
+		item.bNew=false;
+
+		const unsigned int nameHash=item.GetNameHash();
+		bool bMerged=false;
+		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
+		{
+			if (it->GetNameHash()==nameHash)
+			{
+				it->pItemInfo2=item.pItemInfo1;
+				bMerged=true;
+				break;
+			}
+		}
+		if (!bMerged)
+			items.push_back(item);
+	}
+}
+
+bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
+	LONG generation, std::vector<CTreeItem> &items, bool &bAutoSort )
+{
+	CComPtr<IShellItem> pRoot;
+	CAbsolutePidl pidl;
+	if (configuration.pinnedPrograms==PINNED_PROGRAMS_PINNED)
+	{
+		if (SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_StartMenu,&pidl)) &&
+			SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+		{
+			AddA4SFirstFolder(items,pRoot,false,configuration.bHideProgramsMetro,generation);
+			pRoot=NULL;
+		}
+		pidl.Clear();
+		if (!configuration.bNoCommonFolders && IsA4SGenerationCurrent(generation) &&
+			SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_CommonStartMenu,&pidl)) &&
+			SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+		{
+			AddA4SSecondFolder(items,pRoot,false,configuration.bHideProgramsMetro,generation);
+			pRoot=NULL;
+		}
+		pidl.Clear();
+	}
+
+	if (!IsA4SGenerationCurrent(generation))
+		return false;
+	if (SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_Programs,&pidl)) &&
+		SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+	{
+		AddA4SFirstFolder(items,pRoot,true,configuration.bHideProgramsMetro,generation);
+		pRoot=NULL;
+		CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
+		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
+		{
+			if (it->pItemInfo1 && ILIsEqual(it->pItemInfo1->GetPidl(),pidl))
+			{
+				items.erase(it);
+				break;
+			}
+		}
+	}
+	pidl.Clear();
+
+	if (!configuration.bNoCommonFolders && IsA4SGenerationCurrent(generation) &&
+		SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_CommonPrograms,&pidl)) &&
+		SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+	{
+		AddA4SSecondFolder(items,pRoot,true,configuration.bHideProgramsMetro,generation);
+		pRoot=NULL;
+		CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
+		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
+		{
+			if (it->pItemInfo1 && ILIsEqual(it->pItemInfo1->GetPidl(),pidl))
+			{
+				items.erase(it);
+				break;
+			}
+		}
+	}
+	pidl.Clear();
+
+	if (!IsA4SGenerationCurrent(generation))
+		return false;
+	if (configuration.bAllProgramsMetro)
+	{
+		CTreeItem item;
+		item.bFolder=true;
+		item.bApps=true;
+		item.SetName(configuration.appsName,false);
+		item.pItemInfo1=g_ItemManager.GetA4SCustomIcon(L",2",
+			CItemManager::ICON_SIZE_TYPE_SMALL);
+		item.folderHash=CalcFNVHash(L"?Apps",CalcFNVHash(ORDER_PREFIX));
+		item.order=-1;
+		items.push_back(item);
+	}
+
+	std::vector<unsigned int> hashes;
+	CRegKey regOrder;
+	if (regOrder.Open(HKEY_CURRENT_USER,A4S_MENU_REG_ORDER,KEY_READ)==ERROR_SUCCESS)
+	{
+		wchar_t name[100];
+		ULONG size=0;
+		Sprintf(name,_countof(name),L"%08X",CalcFNVHash(ORDER_PREFIX));
+		regOrder.QueryBinaryValue(name,NULL,&size);
+		if (size>0 && !(size&3))
+		{
+			hashes.resize(size/4);
+			regOrder.QueryBinaryValue(name,&hashes[0],&size);
+		}
+	}
+	bAutoSort=hashes.size()==1 && hashes[0]=='AUTO';
+	if (!bAutoSort)
+	{
+		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
+		{
+			it->order=32768;
+			for (int i=0;i<(int)hashes.size();i++)
+			{
+				if (hashes[i]==it->GetNameHash())
+				{
+					it->order=i;
+					break;
+				}
+			}
+		}
+	}
+
+	std::sort(items.begin(),items.end(),[&configuration](const CTreeItem &item1,
+		const CTreeItem &item2)
+	{
+		if (item1.order!=item2.order) return item1.order<item2.order;
+		if (!item1.bFolder && item2.bFolder) return !configuration.bFoldersFirst;
+		if (item1.bFolder && !item2.bFolder) return configuration.bFoldersFirst;
+		return CMenuContainer::CompareMenuString(item1.name,item2.name)<0;
+	});
+	return WaitForA4SIcons(items,generation);
+}
+
+bool CProgramsTree::WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generation )
+{
+	std::vector<const CItemManager::ItemInfo*> itemInfos;
+	itemInfos.reserve(items.size()*2);
+	for (std::vector<CTreeItem>::const_iterator it=items.begin();it!=items.end();++it)
+	{
+		const CItemManager::ItemInfo *infos[2]={it->pItemInfo1,it->pItemInfo2};
+		for (int i=0;i<_countof(infos);i++)
+		{
+			if (!infos[i] || std::find(itemInfos.begin(),itemInfos.end(),infos[i])!=itemInfos.end())
+				continue;
+			itemInfos.push_back(infos[i]);
+			if (!g_ItemManager.QueueA4SItemInfo(infos[i],CItemManager::INFO_SMALL_ICON))
+				return false;
+		}
+	}
+
+	while (IsA4SGenerationCurrent(generation))
+	{
+		if (g_ItemManager.AreA4SItemInfosReady(itemInfos,
+			CItemManager::INFO_SMALL_ICON))
+			return true;
+		// The completion event is only a wake-up hint. Recheck the complete set
+		// after every item or timeout so coalesced signals cannot publish early.
+		if (!g_ItemManager.WaitForA4SItemInfo(100))
+			return false;
+	}
+	return false;
+}
+
+DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
+{
+	HMODULE module=(HMODULE)param;
+	SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_BELOW_NORMAL);
+	const HRESULT comResult=CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
+	const bool bComInitialized=SUCCEEDED(comResult);
+
+	while (bComInitialized)
+	{
+		A4SAsyncConfiguration configuration;
+		LONG generation;
+		AcquireSRWLockShared(&s_A4SAsyncLock);
+		const bool bStopping=s_bA4SAsyncStopping;
+		configuration=s_A4SAsyncConfiguration;
+		generation=InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0);
+		ReleaseSRWLockShared(&s_A4SAsyncLock);
+		if (bStopping)
+			break;
+
+		std::vector<CTreeItem> items;
+		bool bAutoSort=false;
+		A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
+		const bool bBuilt=BuildA4SRootSnapshot(configuration,generation,items,bAutoSort);
+		programsScope.SetResult(static_cast<UINT32>(items.size()),FALSE);
+		if (!bBuilt && !IsA4SGenerationCurrent(generation))
+			continue;
+
+		HWND notifyWindow=NULL;
+		CProgramsTree *pNotifyOwner=NULL;
+		std::vector<CTreeItem> oldItems;
+		bool bRetry=false;
+		AcquireSRWLockExclusive(&s_A4SAsyncLock);
+		if (s_bA4SAsyncStopping)
+		{
+			// Cancellation is complete once this iteration drops its local snapshot.
+		}
+		else if (bBuilt && generation==s_A4SAsyncGeneration &&
+			configuration==s_A4SAsyncConfiguration)
+		{
+			oldItems.swap(s_A4SAsyncItems);
+			s_A4SAsyncItems.swap(items);
+			s_A4SAsyncReadyGeneration=generation;
+			s_bA4SAsyncHasSnapshot=true;
+			s_bA4SAsyncAutoSort=bAutoSort;
+			notifyWindow=s_A4SAsyncNotifyWindow;
+			pNotifyOwner=s_pA4SAsyncNotifyOwner;
+		}
+		else if (!s_bA4SAsyncStopping && (generation!=s_A4SAsyncGeneration ||
+			!(configuration==s_A4SAsyncConfiguration)))
+			bRetry=true;
+		ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+		if (bRetry)
+			continue;
+
+		if (bBuilt && notifyWindow && pNotifyOwner)
+			::PostMessage(notifyWindow,TVM_A4S_SNAPSHOT_READY,
+				(WPARAM)generation,(LPARAM)pNotifyOwner);
+		break;
+	}
+
+	if (bComInitialized)
+		CoUninitialize();
+	AcquireSRWLockExclusive(&s_A4SAsyncLock);
+	s_bA4SAsyncWorkerRunning=false;
+	// A refresh can arrive after this worker publishes but before its COM
+	// apartment finishes tearing down. The request and this transition share the
+	// same lock, so either this worker starts the successor or the requester sees
+	// running=false and does so; no refresh generation can be lost in between.
+	if (bComInitialized && !s_bA4SAsyncStopping &&
+		s_A4SAsyncReadyGeneration!=s_A4SAsyncGeneration)
+		StartA4SAsyncWorkerLocked();
+	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
+	if (!bComInitialized)
+	{
+		// COM initialization failures publish no snapshot and leave the cache in
+		// its previous complete state. A later request may start another worker.
+	}
+	FreeLibraryAndExitThread(module,0);
+	return 0;
+}
+#endif
 
 LRESULT CProgramsTree::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
@@ -708,9 +1249,27 @@ LRESULT CProgramsTree::OnSetInsertMark( UINT uMsg, WPARAM wParam, LPARAM lParam,
 LRESULT CProgramsTree::OnRefresh( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
 	m_bRefreshPosted=false;
+#ifdef A4S_PRODUCT
+	InvalidateA4SItems((CItemManager::ItemInfo*)lParam);
+#else
 	RefreshTree(NULL,(CItemManager::ItemInfo*)lParam);
+#endif
 	return 0;
 }
+
+#ifdef A4S_PRODUCT
+LRESULT CProgramsTree::OnA4SSnapshotReady( UINT uMsg, WPARAM wParam, LPARAM lParam,
+	BOOL& bHandled )
+{
+	UNREFERENCED_PARAMETER(uMsg);
+	UNREFERENCED_PARAMETER(bHandled);
+	if ((CProgramsTree*)lParam!=this || !::IsWindow(m_hWnd) ||
+		!m_pOwner || m_pOwner->m_bDestroyed)
+		return 0;
+	ApplyA4SSnapshot((LONG)wParam);
+	return 0;
+}
+#endif
 
 // Subclass the renaming editbox to handle Esc and Enter
 static LRESULT CALLBACK SubclassEditboxProc( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData )
@@ -1280,17 +1839,155 @@ void CProgramsTree::CreateFolderItems( HTREEITEM hParent )
 void CProgramsTree::CreateItems( void )
 {
 #ifdef A4S_PRODUCT
-	A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
-#endif
+	TreeView_DeleteAllItems(m_hWnd);
+	m_RootX=0;
+	RequestA4SItems(this,m_hWnd,CMenuContainer::s_bNoCommonFolders,true);
+	ApplyA4SSnapshot();
+	return;
+#else
 	TreeView_DeleteAllItems(m_hWnd);
 	CreateFolderItems(NULL);
 	RECT rc;
 	TreeView_GetItemRect(m_hWnd,TreeView_GetRoot(m_hWnd),&rc,TRUE);
 	m_RootX=rc.left;
-#ifdef A4S_PRODUCT
-	programsScope.SetResult(static_cast<UINT32>(TreeView_GetCount(m_hWnd)));
 #endif
 }
+
+#ifdef A4S_PRODUCT
+void CProgramsTree::ApplyA4SRootItems( std::vector<CTreeItem*> &newItems,
+	const CItemManager::ItemInfo *pSelectItem )
+{
+	int index=0;
+	HTREEITEM hAfter=NULL;
+	for (HTREEITEM hItem=TreeView_GetRoot(m_hWnd);hItem;)
+	{
+		TVITEM item={TVIF_PARAM|TVIF_STATE,hItem,0,TVIS_SELECTED};
+		TreeView_GetItem(m_hWnd,&item);
+		CTreeItem *pOldItem=(CTreeItem*)item.lParam;
+		int nextIndex=-1;
+		for (int i=index;i<(int)newItems.size();i++)
+		{
+			if (*pOldItem==*newItems[i])
+			{
+				pOldItem->bNew=newItems[i]->bNew;
+				nextIndex=i;
+				break;
+			}
+		}
+		HTREEITEM hNext=TreeView_GetNextSibling(m_hWnd,hItem);
+		if (nextIndex>=0)
+		{
+			for (int i=index;i<nextIndex;i++)
+			{
+				TVINSERTSTRUCT insert={NULL,hAfter?hAfter:TVI_FIRST,
+					{TVIF_CHILDREN|TVIF_PARAM|TVIF_TEXT}};
+				insert.itemex.pszText=(LPWSTR)(LPCWSTR)newItems[i]->name;
+				insert.itemex.cChildren=newItems[i]->bFolder?1:0;
+				insert.itemex.lParam=(LPARAM)newItems[i];
+				hAfter=TreeView_InsertItem(m_hWnd,&insert);
+			}
+			delete newItems[nextIndex];
+			newItems[nextIndex]=NULL;
+			index=nextIndex+1;
+			hAfter=hItem;
+		}
+		else
+		{
+			if (item.state&TVIS_SELECTED)
+				TreeView_SelectItem(m_hWnd,NULL);
+			TreeView_DeleteItem(m_hWnd,hItem);
+		}
+		hItem=hNext;
+	}
+	for (int i=index;i<(int)newItems.size();i++)
+	{
+		TVINSERTSTRUCT insert={NULL,hAfter?hAfter:TVI_FIRST,
+			{TVIF_CHILDREN|TVIF_PARAM|TVIF_TEXT}};
+		insert.itemex.pszText=(LPWSTR)(LPCWSTR)newItems[i]->name;
+		insert.itemex.cChildren=newItems[i]->bFolder?1:0;
+		insert.itemex.lParam=(LPARAM)newItems[i];
+		hAfter=TreeView_InsertItem(m_hWnd,&insert);
+	}
+
+	// Existing root handles survive the merge, so expanded folders, their child
+	// handles, context targets, and the native scroll anchor retain the original
+	// Open-Shell behavior. Only expanded children are refreshed on demand.
+	for (HTREEITEM hItem=TreeView_GetRoot(m_hWnd);hItem;
+		hItem=TreeView_GetNextSibling(m_hWnd,hItem))
+	{
+		TVITEM item={TVIF_STATE|TVIF_PARAM,hItem,0,TVIS_EXPANDEDONCE};
+		TreeView_GetItem(m_hWnd,&item);
+		if (item.state&TVIS_EXPANDEDONCE)
+			RefreshTree(hItem,pSelectItem);
+		if (pSelectItem && ((CTreeItem*)item.lParam)->pItemInfo1==pSelectItem)
+			TreeView_SelectItem(m_hWnd,hItem);
+	}
+}
+
+bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )
+{
+	std::vector<CTreeItem> snapshot;
+	LONG readyGeneration=0;
+	bool bAutoSort=false;
+	bool bFoldersFirst=false;
+	AcquireSRWLockShared(&s_A4SAsyncLock);
+	if (s_bA4SAsyncHasSnapshot &&
+		(!expectedGeneration || s_A4SAsyncReadyGeneration==expectedGeneration))
+	{
+		snapshot=s_A4SAsyncItems;
+		readyGeneration=s_A4SAsyncReadyGeneration;
+		bAutoSort=s_bA4SAsyncAutoSort;
+		bFoldersFirst=s_A4SAsyncConfiguration.bFoldersFirst;
+	}
+	ReleaseSRWLockShared(&s_A4SAsyncLock);
+	if (!readyGeneration)
+		return false;
+
+	A4SPerformanceScope cachedScope(A4S_PERF_PROGRAMS_ENUMERATION);
+	std::vector<CTreeItem*> items;
+	items.reserve(snapshot.size());
+	for (std::vector<CTreeItem>::iterator it=snapshot.begin();it!=snapshot.end();++it)
+	{
+		CTreeItem *pItem=new CTreeItem(*it);
+		if (pItem->bApps)
+			pItem->bNew=g_ItemManager.HasNewApps(false);
+		else if (pItem->pItemInfo1)
+		{
+			pItem->bNew=g_ItemManager.IsNewProgram(pItem->pItemInfo1->GetPidl(),
+				pItem->bFolder,false);
+		}
+		if (pItem->pItemInfo2)
+		{
+			if (g_ItemManager.IsNewProgram(pItem->pItemInfo2->GetPidl(),
+				pItem->bFolder,false))
+				pItem->bNew=true;
+		}
+		items.push_back(pItem);
+	}
+
+	// TreeView insertion sends paint/scroll notifications per row. Suppress them
+	// until the full immutable snapshot has been merged, then publish one frame.
+	SendMessage(WM_SETREDRAW,FALSE,0);
+	m_bAutoSort=bAutoSort;
+	s_bFoldersFirst=bFoldersFirst;
+	ApplyA4SRootItems(items,m_pA4SPendingSelectItem);
+	HTREEITEM root=TreeView_GetRoot(m_hWnd);
+	RECT rc={};
+	if (root && TreeView_GetItemRect(m_hWnd,root,&rc,TRUE))
+		m_RootX=rc.left;
+	SendMessage(WM_SETREDRAW,TRUE,0);
+	RedrawWindow(NULL,NULL,RDW_INVALIDATE|RDW_FRAME|RDW_UPDATENOW);
+	m_pA4SPendingSelectItem=NULL;
+	cachedScope.SetResult(static_cast<UINT32>(snapshot.size()),TRUE);
+	return true;
+}
+
+void CProgramsTree::InvalidateA4SItems( const CItemManager::ItemInfo *pSelectItem )
+{
+	m_pA4SPendingSelectItem=pSelectItem;
+	RequestA4SItems(this,m_hWnd,CMenuContainer::s_bNoCommonFolders,true);
+}
+#endif
 
 void CProgramsTree::RefreshTree( HTREEITEM hParent, const CItemManager::ItemInfo *pSelectItem )
 {

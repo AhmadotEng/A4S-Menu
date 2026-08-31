@@ -14,6 +14,9 @@ class CProgramsTree: public IDropTarget, public CWindowImpl<CProgramsTree>
 public:
 	enum {
 		TVM_REFRESH=WM_APP+1,
+#ifdef A4S_PRODUCT
+		TVM_A4S_SNAPSHOT_READY=WM_APP+2,
+#endif
 		TIMER_HOVER=1,
 		TIMER_A4S_SCROLLBAR_IDLE=2,
 	};
@@ -75,6 +78,9 @@ public:
 		MESSAGE_HANDLER( WM_MOUSEWHEEL, OnScroll )
 		MESSAGE_HANDLER( TVM_SETINSERTMARK, OnSetInsertMark )
 		MESSAGE_HANDLER( TVM_REFRESH, OnRefresh )
+#ifdef A4S_PRODUCT
+		MESSAGE_HANDLER( TVM_A4S_SNAPSHOT_READY, OnA4SSnapshotReady )
+#endif
 		REFLECTED_NOTIFY_CODE_HANDLER( TVN_DELETEITEM, OnDeleteItem )
 		REFLECTED_NOTIFY_CODE_HANDLER( TVN_ITEMEXPANDING, OnItemExpanding )
 		REFLECTED_NOTIFY_CODE_HANDLER( TVN_SINGLEEXPAND, OnSingleExpand )
@@ -94,6 +100,14 @@ public:
 		Assert(m_RefCount==0);
 	}
 	void Create( CMenuContainer *pOwner );
+#ifdef A4S_PRODUCT
+	// Starts the process-wide Programs root snapshot while the normal menu is
+	// becoming visible. The worker never publishes apartment-bound objects.
+	static void PreloadA4SItems( bool bNoCommonFolders );
+	// Cancels enumeration and proves no worker can still reference ItemManager
+	// before the Explorer-side manager shutdown transaction continues.
+	static bool ShutdownA4SItems( DWORD timeout );
+#endif
 
 	virtual WNDPROC GetWindowProc( void ) { return CustomWindowProc; }
 	static LRESULT CALLBACK CustomWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
@@ -183,6 +197,9 @@ private:
 	bool m_bA4SScrollbarHover;
 	bool m_bA4SScrollbarPulse;
 	DWORD m_A4SScrollbarInputCount;
+#ifdef A4S_PRODUCT
+	const CItemManager::ItemInfo *m_pA4SPendingSelectItem;
+#endif
 	POINT m_LastMousePos;
 	int m_RootX;
 	int m_MinX;
@@ -221,6 +238,63 @@ private:
 	void ClearAllNewRec( HTREEITEM hParent );
 	bool IsA4SScrollbarActive( void ) const { return m_bA4SScrollbarHover || m_bA4SScrollbarPulse; }
 	void SyncA4SScrollbarProperties( void );
+
+#ifdef A4S_PRODUCT
+	struct A4SAsyncConfiguration
+	{
+		int pinnedPrograms;
+		bool bNoCommonFolders;
+		bool bAllProgramsMetro;
+		bool bHideProgramsMetro;
+		bool bFoldersFirst;
+		ULONGLONG folderContentGeneration;
+		CString appsName;
+
+		bool operator==( const A4SAsyncConfiguration &other ) const
+		{
+			return pinnedPrograms==other.pinnedPrograms &&
+				bNoCommonFolders==other.bNoCommonFolders &&
+				bAllProgramsMetro==other.bAllProgramsMetro &&
+				bHideProgramsMetro==other.bHideProgramsMetro &&
+				bFoldersFirst==other.bFoldersFirst &&
+				folderContentGeneration==other.folderContentGeneration &&
+				appsName==other.appsName;
+		}
+	};
+
+	static SRWLOCK s_A4SAsyncLock;
+	static A4SAsyncConfiguration s_A4SAsyncConfiguration;
+	static std::vector<CTreeItem> s_A4SAsyncItems;
+	static volatile LONG s_A4SAsyncGeneration;
+	static LONG s_A4SAsyncReadyGeneration;
+	static bool s_bA4SAsyncHasSnapshot;
+	static bool s_bA4SAsyncAutoSort;
+	static bool s_bA4SAsyncWorkerRunning;
+	static bool s_bA4SAsyncStopping;
+	static HANDLE s_A4SAsyncWorker;
+	static HWND s_A4SAsyncNotifyWindow;
+	static CProgramsTree *s_pA4SAsyncNotifyOwner;
+
+	static A4SAsyncConfiguration CaptureA4SConfiguration( bool bNoCommonFolders );
+	static bool StartA4SAsyncWorkerLocked( void );
+	static DWORD CALLBACK A4SAsyncWorkerProc( void *param );
+	static bool BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
+		LONG generation, std::vector<CTreeItem> &items, bool &bAutoSort );
+	static bool WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generation );
+	static bool IsA4SGenerationCurrent( LONG generation );
+	static void AddA4SFirstFolder( std::vector<CTreeItem> &items, IShellItem *pParent,
+		bool bPrograms, bool bHideProgramsMetro, LONG generation );
+	static void AddA4SSecondFolder( std::vector<CTreeItem> &items, IShellItem *pParent,
+		bool bPrograms, bool bHideProgramsMetro, LONG generation );
+	static void RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
+		bool bNoCommonFolders, bool bRefresh );
+	static void UnsubscribeA4SItems( CProgramsTree *pOwner );
+	bool ApplyA4SSnapshot( LONG expectedGeneration=0 );
+	void ApplyA4SRootItems( std::vector<CTreeItem*> &items,
+		const CItemManager::ItemInfo *pSelectItem );
+	void InvalidateA4SItems( const CItemManager::ItemInfo *pSelectItem );
+	LRESULT OnA4SSnapshotReady( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled );
+#endif
 
 	static bool s_bFoldersFirst;
 	static bool CmpTreeItems( const CTreeItem *item1, const CTreeItem *item2 );
