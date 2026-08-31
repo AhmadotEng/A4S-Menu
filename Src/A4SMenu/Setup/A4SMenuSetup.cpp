@@ -3,6 +3,7 @@
 #include <bcrypt.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <sddl.h>
 #include <tlhelp32.h>
 
 #include <algorithm>
@@ -26,6 +27,12 @@ namespace
 {
     constexpr wchar_t kStateKey[] = L"Software\\A4SMenu";
     constexpr wchar_t kServicingKey[] = L"Software\\A4SMenu\\Servicing";
+    // This tombstone is deliberately outside kStateKey: deferred uninstall
+    // removes the product tree, but lifecycle qualification must still be able
+    // to prove which servicing invocation was the last writer.
+    constexpr wchar_t kLifecycleKey[] = L"Software\\A4SMenuLifecycle";
+    constexpr wchar_t kServicingSequenceValue[] = L"ServicingSequence";
+    constexpr wchar_t kLastOperationValue[] = L"LastOperation";
     constexpr wchar_t kUninstallKey[] =
         L"Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\A4SMenu";
     constexpr wchar_t kRunKey[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -40,6 +47,7 @@ namespace
     // Global namespace serializes the same SID across simultaneous desktop/RDP
     // sessions; the SID-derived suffix still keeps different users independent.
     constexpr wchar_t kSetupMutexPrefix[] = L"Global\\A4SMenu.Setup.v1.";
+    constexpr wchar_t kLifecycleMutexPrefix[] = L"Global\\A4SMenu.Lifecycle.v1.";
     constexpr DWORD kStopTimeoutMs = 20000;
     constexpr DWORD kRestartTimeoutMs = 20000;
     constexpr size_t kMaximumPayloadBytes = 64U * 1024U * 1024U;
@@ -208,6 +216,7 @@ namespace
         std::wstring extractPath;
         DWORD waitProcessId = 0;
         DWORD waitExplorerId = 0;
+        std::wstring qualificationToken;
     };
 
     struct InstalledState
@@ -273,6 +282,7 @@ namespace
         { kStateKey, L"PreviousSlot" },
         { kStateKey, L"InstallVersion" },
         { kStateKey, L"ActiveSlot" },
+        { kLifecycleKey, kLastOperationValue },
     };
 
     struct RegistryValueSnapshot
@@ -293,7 +303,15 @@ namespace
         std::wstring targetPrevious;
         std::wstring targetCleanupCommand;
         std::wstring targetRecoveryCommand;
+        std::uint64_t operationSequence = 0;
+        std::wstring operationToken;
         bool resetSafety = false;
+    };
+
+    struct OperationIdentity
+    {
+        std::uint64_t sequence = 0;
+        std::wstring token;
     };
 
     std::wstring Quote(const std::wstring &value)
@@ -528,6 +546,16 @@ namespace
         return text;
     }
 
+    std::wstring NewQualificationToken()
+    {
+        std::array<std::uint8_t, 32> bytes = {};
+        const NTSTATUS status = BCryptGenRandom(nullptr, bytes.data(),
+            static_cast<ULONG>(bytes.size()), BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (status < 0)
+            Fail(ERROR_GEN_FAILURE, L"Could not generate an A4S Menu servicing identity.");
+        return Hex(bytes);
+    }
+
     std::wstring PayloadSlotBase(std::wstring_view version,
         std::span<const std::uint8_t> host, std::span<const std::uint8_t> menu,
         std::span<const std::uint8_t> setup)
@@ -589,7 +617,7 @@ namespace
         L"1.0.0.0-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF.repair-0123456789ABCDEF0123456789ABCDEF",
         L"1.0.0.0-0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF0123456789ABCDEF"));
 
-    OwnedMutex AcquireSetupMutex()
+    std::vector<std::uint8_t> CurrentUserSidBytes()
     {
         UniqueHandle token;
         HANDLE rawToken = nullptr;
@@ -608,10 +636,23 @@ namespace
         if (!IsValidSid(tokenUser->User.Sid))
             Fail(ERROR_INVALID_SID, L"The current-user identity is invalid.");
         const DWORD sidBytes = GetLengthSid(tokenUser->User.Sid);
-        const auto identity = HashBytes(std::span(
-            static_cast<const std::uint8_t *>(tokenUser->User.Sid), sidBytes));
-        const std::wstring name = std::wstring(kSetupMutexPrefix) + Hex(identity).substr(0, 32);
+        const auto *begin = static_cast<const std::uint8_t *>(tokenUser->User.Sid);
+        return std::vector<std::uint8_t>(begin, begin + sidBytes);
+    }
 
+    std::wstring CurrentUserSidString()
+    {
+        const std::vector<std::uint8_t> sid = CurrentUserSidBytes();
+        LPWSTR text = nullptr;
+        if (!ConvertSidToStringSidW(const_cast<std::uint8_t *>(sid.data()), &text) || !text)
+            FailLastError(L"Could not format the current-user identity.");
+        std::wstring result(text);
+        LocalFree(text);
+        return result;
+    }
+
+    OwnedMutex AcquireNamedMutex(const std::wstring &name)
+    {
         HANDLE mutex = CreateMutexW(nullptr, FALSE, name.c_str());
         if (!mutex)
             FailLastError(L"Could not create the A4S Menu servicing lock.");
@@ -629,6 +670,30 @@ namespace
             FailLastError(L"Could not acquire the A4S Menu servicing lock.");
         }
         return OwnedMutex(mutex);
+    }
+
+    OwnedMutex AcquireLifecycleMutex()
+    {
+        return AcquireNamedMutex(std::wstring(kLifecycleMutexPrefix) + CurrentUserSidString());
+    }
+
+    OwnedMutex AcquireSetupMutex()
+    {
+        const auto identity = HashBytes(CurrentUserSidBytes());
+        return AcquireNamedMutex(std::wstring(kSetupMutexPrefix) + Hex(identity).substr(0, 32));
+    }
+
+    struct ProductLocks
+    {
+        OwnedMutex lifecycle;
+        OwnedMutex setup;
+    };
+
+    ProductLocks AcquireProductLocks()
+    {
+        // Every native mutator and the qualification harness acquire these in
+        // the same order. Never acquire the Setup mutex and then Lifecycle.
+        return ProductLocks{ AcquireLifecycleMutex(), AcquireSetupMutex() };
     }
 
     PayloadSet LoadAndValidatePayloads(HINSTANCE instance)
@@ -876,7 +941,16 @@ namespace
             Fail(static_cast<DWORD>(status), L"Could not write the A4S Menu user configuration.");
     }
 
+    void SetQword(HKEY key, const wchar_t *name, std::uint64_t value)
+    {
+        const LSTATUS status = RegSetValueExW(key, name, 0, REG_QWORD,
+            reinterpret_cast<const BYTE *>(&value), sizeof(value));
+        if (status != ERROR_SUCCESS)
+            Fail(static_cast<DWORD>(status), L"Could not write the A4S Menu lifecycle sequence.");
+    }
+
     void DeleteValueChecked(const wchar_t *keyPath, const wchar_t *name);
+    void CommitOperationIdentity(const OperationIdentity &identity);
 
     RegistryValueSnapshot ReadRawValue(const RegistryValueSpec &spec)
     {
@@ -951,6 +1025,7 @@ namespace
         FlushKeyChecked(kRunOnceKey, true);
         FlushKeyChecked(kUninstallKey, true);
         FlushKeyChecked(kStateKey, true);
+        FlushKeyChecked(kLifecycleKey, true);
     }
 
     InstalledState ReadInstalledState()
@@ -979,7 +1054,8 @@ namespace
             std::numeric_limits<DWORD>::max()));
     }
 
-    void PrepareSlotRegistration(const std::wstring &active, const std::wstring &previous)
+    void PrepareSlotRegistration(const std::wstring &active, const std::wstring &previous,
+        const OperationIdentity &identity)
     {
         if (!ValidateSlotBasic(active))
             Fail(ERROR_FILE_CORRUPT, L"The selected A4S Menu version is incomplete.");
@@ -1007,6 +1083,7 @@ namespace
         SetString(state.get(), L"PreviousSlot", previous);
         SetString(state.get(), L"InstallVersion", VersionText(version));
         SetString(state.get(), L"ActiveSlot", active);
+        CommitOperationIdentity(identity);
 
         // A committed install supersedes any deferred cleanup from an older,
         // interrupted uninstall. The journal restores that value if this
@@ -1056,16 +1133,19 @@ namespace
             Fail(static_cast<DWORD>(status), L"Could not remove A4S Menu registration.");
     }
 
-    void PrepareUnregisterProduct()
+    void PrepareUnregisterProduct(const OperationIdentity &identity)
     {
         for (const auto &spec : kRegistrationValues)
         {
             if (_wcsicmp(spec.keyPath, kRunKey) == 0 ||
                 (_wcsicmp(spec.keyPath, kRunOnceKey) == 0 &&
-                    _wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0))
+                    _wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0) ||
+                (_wcsicmp(spec.keyPath, kLifecycleKey) == 0 &&
+                    _wcsicmp(spec.valueName, kLastOperationValue) == 0))
                 continue;
             DeleteValueChecked(spec.keyPath, spec.valueName);
         }
+        CommitOperationIdentity(identity);
         FlushKeyChecked(kUninstallKey, true);
         FlushKeyChecked(kStateKey, true);
         FlushKeyChecked(kRunOnceKey, true);
@@ -1099,6 +1179,93 @@ namespace
         return RawValueEquals(spec, REG_DWORD, &expected, sizeof(expected));
     }
 
+    std::wstring FormatOperationIdentity(const OperationIdentity &identity)
+    {
+        if (!identity.sequence || identity.token.size() != 64U || !IsUpperHex(identity.token))
+            Fail(ERROR_INVALID_DATA, L"The A4S Menu servicing identity is invalid.");
+        wchar_t sequence[32] = {};
+        swprintf_s(sequence, L"%020llu", static_cast<unsigned long long>(identity.sequence));
+        return std::wstring(sequence) + L":" + identity.token;
+    }
+
+    bool TryParseOperationIdentity(const std::wstring &encoded, OperationIdentity &identity)
+    {
+        if (encoded.size() != 85U || encoded[20] != L':' ||
+            !std::all_of(encoded.begin(), encoded.begin() + 20,
+                [](wchar_t ch) { return ch >= L'0' && ch <= L'9'; }) ||
+            !IsUpperHex(std::wstring_view(encoded).substr(21)))
+            return false;
+        const std::wstring digits = encoded.substr(0, 20);
+        wchar_t *end = nullptr;
+        const unsigned long long sequence = wcstoull(digits.c_str(), &end, 10);
+        if (!end || *end || sequence == 0)
+            return false;
+        identity.sequence = static_cast<std::uint64_t>(sequence);
+        identity.token = encoded.substr(21);
+        return true;
+    }
+
+    std::uint64_t ReadLifecycleHighWater()
+    {
+        const RegistryValueSpec sequenceSpec = { kLifecycleKey, kServicingSequenceValue };
+        const RegistryValueSpec lastSpec = { kLifecycleKey, kLastOperationValue };
+        const RegistryValueSnapshot sequenceValue = ReadRawValue(sequenceSpec);
+        const RegistryValueSnapshot lastValue = ReadRawValue(lastSpec);
+        std::uint64_t sequence = 0;
+        if (sequenceValue.present)
+        {
+            if (sequenceValue.type != REG_QWORD || sequenceValue.data.size() != sizeof(sequence))
+                Fail(ERROR_FILE_CORRUPT, L"The A4S Menu lifecycle sequence is invalid.");
+            std::memcpy(&sequence, sequenceValue.data.data(), sizeof(sequence));
+        }
+        if (lastValue.present)
+        {
+            constexpr size_t encodedCharacters = 20U + 1U + 64U + 1U;
+            if (lastValue.type != REG_SZ ||
+                lastValue.data.size() != encodedCharacters * sizeof(wchar_t))
+                Fail(ERROR_FILE_CORRUPT, L"The A4S Menu last-operation identity is invalid.");
+            const auto *text = reinterpret_cast<const wchar_t *>(lastValue.data.data());
+            const size_t characters = lastValue.data.size() / sizeof(wchar_t);
+            if (text[characters - 1U] != L'\0')
+                Fail(ERROR_FILE_CORRUPT, L"The A4S Menu last-operation identity is not terminated.");
+            OperationIdentity last;
+            if (!TryParseOperationIdentity(std::wstring(text), last) || last.sequence > sequence)
+                Fail(ERROR_FILE_CORRUPT, L"The A4S Menu lifecycle metadata is inconsistent.");
+        }
+        return sequence;
+    }
+
+    OperationIdentity AllocateOperationIdentity(const std::wstring &requestedToken)
+    {
+        OperationIdentity identity;
+        identity.token = requestedToken.empty() ? NewQualificationToken() : requestedToken;
+        if (identity.token.size() != 64U || !IsUpperHex(identity.token))
+            Fail(ERROR_BAD_ARGUMENTS, L"The qualification operation token is invalid.");
+        const std::uint64_t highWater = ReadLifecycleHighWater();
+        if (highWater == std::numeric_limits<std::uint64_t>::max())
+            Fail(ERROR_ARITHMETIC_OVERFLOW, L"The A4S Menu servicing sequence is exhausted.");
+        identity.sequence = highWater + 1U;
+        auto key = OpenOrCreateKey(kLifecycleKey);
+        SetQword(key.get(), kServicingSequenceValue, identity.sequence);
+        if (RegFlushKey(key.get()) != ERROR_SUCCESS)
+            Fail(ERROR_WRITE_FAULT, L"Could not durably advance the A4S Menu servicing sequence.");
+        return identity;
+    }
+
+    void CommitOperationIdentity(const OperationIdentity &identity)
+    {
+        auto key = OpenOrCreateKey(kLifecycleKey);
+        SetString(key.get(), kLastOperationValue, FormatOperationIdentity(identity));
+        if (RegFlushKey(key.get()) != ERROR_SUCCESS)
+            Fail(ERROR_WRITE_FAULT, L"Could not durably commit the A4S Menu servicing identity.");
+    }
+
+    bool LastOperationMatches(const OperationIdentity &identity)
+    {
+        return StringValueEquals(kLifecycleKey, kLastOperationValue,
+            FormatOperationIdentity(identity));
+    }
+
     bool RegistrationMatchesInstalledCore(const std::wstring &active,
         const std::wstring &previous)
     {
@@ -1126,11 +1293,12 @@ namespace
     }
 
     bool RegistrationMatchesSlot(const std::wstring &active, const std::wstring &previous,
-        const std::wstring &recoveryCommand)
+        const std::wstring &recoveryCommand, const OperationIdentity &identity)
     {
         const RegistryValueSpec cleanup = { kRunOnceKey, kCleanupRunOnceValue };
         return !ReadRawValue(cleanup).present &&
             StringValueEquals(kRunOnceKey, kRecoveryRunOnceValue, recoveryCommand) &&
+            LastOperationMatches(identity) &&
             RegistrationMatchesInstalledCore(active, previous);
     }
 
@@ -1139,21 +1307,31 @@ namespace
     {
         const RegistryValueSpec cleanup = { kRunOnceKey, kCleanupRunOnceValue };
         const RegistryValueSpec recovery = { kRunOnceKey, kRecoveryRunOnceValue };
+        OperationIdentity last;
+        const std::wstring encoded = ReadString(HKEY_CURRENT_USER, kLifecycleKey,
+            kLastOperationValue);
         return !ReadRawValue(cleanup).present && !ReadRawValue(recovery).present &&
+            TryParseOperationIdentity(encoded, last) &&
+            last.sequence <= ReadLifecycleHighWater() &&
             RegistrationMatchesInstalledCore(active, previous);
     }
 
-    bool RegistrationMatchesUninstalled(const std::wstring &cleanupCommand)
+    bool RegistrationMatchesUninstalled(const std::wstring &cleanupCommand,
+        const OperationIdentity &identity)
     {
         for (const auto &spec : kRegistrationValues)
         {
             if (_wcsicmp(spec.keyPath, kRunOnceKey) == 0 &&
                 _wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0)
                 continue;
+            if (_wcsicmp(spec.keyPath, kLifecycleKey) == 0 &&
+                _wcsicmp(spec.valueName, kLastOperationValue) == 0)
+                continue;
             if (ReadRawValue(spec).present)
                 return false;
         }
-        return StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, cleanupCommand);
+        return StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, cleanupCommand) &&
+            LastOperationMatches(identity);
     }
 
     void SetBinary(HKEY key, const wchar_t *name, std::span<const std::uint8_t> value)
@@ -1213,6 +1391,16 @@ namespace
         return true;
     }
 
+    bool ReadJournalQword(const wchar_t *name, std::uint64_t &value)
+    {
+        const RegistryValueSpec spec = { kServicingKey, name };
+        const RegistryValueSnapshot raw = ReadRawValue(spec);
+        if (!raw.present || raw.type != REG_QWORD || raw.data.size() != sizeof(value))
+            return false;
+        std::memcpy(&value, raw.data.data(), sizeof(value));
+        return true;
+    }
+
     bool JournalExists()
     {
         UniqueRegKey key;
@@ -1241,6 +1429,12 @@ namespace
         journal.targetPrevious = ReadString(HKEY_CURRENT_USER, kServicingKey, L"TargetPrevious");
         journal.targetCleanupCommand = ReadString(HKEY_CURRENT_USER, kServicingKey, L"TargetCleanup");
         journal.targetRecoveryCommand = ReadString(HKEY_CURRENT_USER, kServicingKey, L"TargetRecovery");
+        journal.operationToken = ReadString(HKEY_CURRENT_USER, kServicingKey, L"OperationToken");
+        if (!ReadJournalQword(L"OperationSequence", journal.operationSequence) ||
+            journal.operationSequence == 0 || journal.operationToken.size() != 64U ||
+            !IsUpperHex(journal.operationToken) ||
+            journal.operationSequence > ReadLifecycleHighWater())
+            Fail(ERROR_FILE_CORRUPT, L"The A4S Menu servicing journal identity is invalid.");
         for (size_t index = 0; index < journal.previous.size(); ++index)
         {
             const std::wstring name = SnapshotValueName(index);
@@ -1255,7 +1449,8 @@ namespace
 
     ServicingJournal BeginJournal(JournalTarget target, const std::wstring &active,
         const std::wstring &previous, const std::wstring &cleanupCommand,
-        const std::wstring &recoveryCommand, bool resetSafety)
+        const std::wstring &recoveryCommand, bool resetSafety,
+        const OperationIdentity &identity)
     {
         DeleteTreeChecked(kServicingKey);
         ServicingJournal journal;
@@ -1265,6 +1460,8 @@ namespace
         journal.targetPrevious = previous;
         journal.targetCleanupCommand = cleanupCommand;
         journal.targetRecoveryCommand = recoveryCommand;
+        journal.operationSequence = identity.sequence;
+        journal.operationToken = identity.token;
         journal.resetSafety = resetSafety;
 
         auto key = OpenOrCreateKey(kServicingKey);
@@ -1276,6 +1473,8 @@ namespace
         SetString(key.get(), L"TargetPrevious", previous);
         SetString(key.get(), L"TargetCleanup", cleanupCommand);
         SetString(key.get(), L"TargetRecovery", recoveryCommand);
+        SetQword(key.get(), L"OperationSequence", identity.sequence);
+        SetString(key.get(), L"OperationToken", identity.token);
         for (size_t index = 0; index < journal.previous.size(); ++index)
         {
             const std::wstring name = SnapshotValueName(index);
@@ -1344,10 +1543,11 @@ namespace
         }
 
         const ServicingJournal journal = LoadJournal();
+        const OperationIdentity identity = { journal.operationSequence, journal.operationToken };
         const bool targetMatches = journal.target == JournalTarget::Installed ?
             RegistrationMatchesSlot(journal.targetActive, journal.targetPrevious,
-                journal.targetRecoveryCommand) :
-            RegistrationMatchesUninstalled(journal.targetCleanupCommand);
+                journal.targetRecoveryCommand, identity) :
+            RegistrationMatchesUninstalled(journal.targetCleanupCommand, identity);
         switch (ChooseRecoveryDisposition(true, ready, targetMatches))
         {
         case RecoveryDisposition::KeepCommitted:
@@ -1665,6 +1865,8 @@ namespace
         {
             if (_wcsicmp(spec.keyPath, kRunOnceKey) == 0 &&
                 _wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0)
+                continue;
+            if (_wcsicmp(spec.keyPath, kLifecycleKey) == 0)
                 continue;
             if (ReadRawValue(spec).present)
                 return true;
@@ -2001,7 +2203,8 @@ namespace
         std::rethrow_exception(failure);
     }
 
-    int InstallOrRepair(HINSTANCE instance, const Options &options)
+    int InstallOrRepair(HINSTANCE instance, const Options &options,
+        const OperationIdentity &identity)
     {
         const PayloadSet payloads = LoadAndValidatePayloads(instance);
         const InstalledState oldState = ReadInstalledState();
@@ -2033,7 +2236,7 @@ namespace
         const bool resetSafety = options.resetSafety;
         const std::wstring recoveryCommand = RecoveryCommand(Join(newSlot, kSetupFilename));
         const ServicingJournal journal = BeginJournal(JournalTarget::Installed,
-            newSlot, previous, L"", recoveryCommand, resetSafety);
+            newSlot, previous, L"", recoveryCommand, resetSafety, identity);
         const bool hostWasPresent = FindWindowW(A4S_HOST_WINDOW_CLASS_W,
             A4S_HOST_WINDOW_TITLE_W) != nullptr;
         bool wasRunning = false;
@@ -2045,7 +2248,7 @@ namespace
             wasRunning = StopHost();
             oldExplorer = ExplorerProcessId();
             mappingRetained = ExplorerHasA4SModule(oldExplorer);
-            PrepareSlotRegistration(newSlot, previous);
+            PrepareSlotRegistration(newSlot, previous, identity);
             MarkJournalReady();
             CommitSlotStartup(newSlot);
         }
@@ -2078,7 +2281,7 @@ namespace
         return ERROR_SUCCESS;
     }
 
-    int Rollback(const Options &options)
+    int Rollback(const Options &options, const OperationIdentity &identity)
     {
         const InstalledState state = ReadInstalledState();
         if (!ValidateSlotBasic(state.previousSlot))
@@ -2088,7 +2291,7 @@ namespace
         const std::wstring recoveryCommand = RecoveryCommand(
             Join(state.previousSlot, kSetupFilename));
         const ServicingJournal journal = BeginJournal(JournalTarget::Installed,
-            state.previousSlot, nextPrevious, L"", recoveryCommand, false);
+            state.previousSlot, nextPrevious, L"", recoveryCommand, false, identity);
         const bool hostWasPresent = FindWindowW(A4S_HOST_WINDOW_CLASS_W,
             A4S_HOST_WINDOW_TITLE_W) != nullptr;
         bool wasRunning = false;
@@ -2100,7 +2303,7 @@ namespace
             wasRunning = StopHost();
             oldExplorer = ExplorerProcessId();
             mappingRetained = ExplorerHasA4SModule(oldExplorer);
-            PrepareSlotRegistration(state.previousSlot, nextPrevious);
+            PrepareSlotRegistration(state.previousSlot, nextPrevious, identity);
             MarkJournalReady();
             CommitSlotStartup(state.previousSlot);
         }
@@ -2120,14 +2323,15 @@ namespace
         return ERROR_SUCCESS;
     }
 
-    int Uninstall(HINSTANCE instance, const Options &options)
+    int Uninstall(HINSTANCE instance, const Options &options,
+        const OperationIdentity &identity)
     {
         const PayloadSet payloads = LoadAndValidatePayloads(instance);
         const InstalledState oldState = ReadInstalledState();
         const std::wstring cleanupHelper = CleanupHelperPath();
         const std::wstring cleanupRetry = CleanupCommand(cleanupHelper, 0, 0);
         const ServicingJournal journal = BeginJournal(JournalTarget::Uninstalled,
-            L"", L"", cleanupRetry, L"", false);
+            L"", L"", cleanupRetry, L"", false, identity);
         const bool hostWasPresent = FindWindowW(A4S_HOST_WINDOW_CLASS_W,
             A4S_HOST_WINDOW_TITLE_W) != nullptr;
         PreparedCleanup cleanup;
@@ -2143,7 +2347,7 @@ namespace
             wasRunning = StopHost();
             explorer = ExplorerProcessId();
             mappingRetained = ExplorerHasA4SModule(explorer);
-            PrepareUnregisterProduct();
+            PrepareUnregisterProduct(identity);
             MarkJournalReady();
             CommitUnregisteredStartup();
         }
@@ -2173,7 +2377,7 @@ namespace
             Fail(ERROR_INVALID_NAME, L"Deferred cleanup may run only from the canonical per-user helper path.");
         WaitForProcessId(options.waitProcessId);
         const CleanupWaitResult blocker = WaitForProcessOrInstalledState(options.waitExplorerId);
-        const OwnedMutex setupMutex = AcquireSetupMutex();
+        const ProductLocks productLocks = AcquireProductLocks();
         // The wake-up registration may have been only a partially committed
         // transaction when the setup process crashed. Reconcile it under the
         // same servicing mutex before deciding whether reinstall really won.
@@ -2279,6 +2483,14 @@ namespace
             else if (IsSwitch(argument, L"--wait-explorer") && index + 1 < argc &&
                 ParseDword(argv[index + 1], options.waitExplorerId))
                 ++index;
+            else if (IsSwitch(argument, L"--qualification-operation-token") &&
+                index + 1 < argc && options.qualificationToken.empty())
+            {
+                options.qualificationToken = argv[++index];
+                if (options.qualificationToken.size() != 64U ||
+                    !IsUpperHex(options.qualificationToken))
+                    options.operation = Operation::Invalid;
+            }
             else
                 options.operation = Operation::Invalid;
         }
@@ -2287,6 +2499,12 @@ namespace
         if (options.restartExplorer && options.operation != Operation::Install &&
             options.operation != Operation::Repair && options.operation != Operation::Uninstall &&
             options.operation != Operation::Rollback && options.operation != Operation::Automatic)
+            options.operation = Operation::Invalid;
+        if (!options.qualificationToken.empty() &&
+            options.operation != Operation::Automatic &&
+            options.operation != Operation::Install && options.operation != Operation::Repair &&
+            options.operation != Operation::Uninstall && options.operation != Operation::Rollback &&
+            options.operation != Operation::Reconcile)
             options.operation = Operation::Invalid;
         return options;
     }
@@ -2337,7 +2555,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         }
         if (options.operation == Operation::SelfTest)
         {
-            const OwnedMutex setupMutex = AcquireSetupMutex();
+            const ProductLocks productLocks = AcquireProductLocks();
             RunInternalSelfTest(instance);
             WriteParentConsole(L"A4SMenuSetup: servicing self-test passed");
             return ERROR_SUCCESS;
@@ -2353,12 +2571,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
             return Cleanup(options);
         if (options.operation == Operation::Reconcile)
         {
-            const OwnedMutex setupMutex = AcquireSetupMutex();
+            const ProductLocks productLocks = AcquireProductLocks();
             ReconcilePendingJournal();
+            const OperationIdentity identity =
+                AllocateOperationIdentity(options.qualificationToken);
+            CommitOperationIdentity(identity);
             return ERROR_SUCCESS;
         }
 
-        const OwnedMutex setupMutex = AcquireSetupMutex();
+        const ProductLocks productLocks = AcquireProductLocks();
         ReconcilePendingJournal();
         const InstalledState state = ReadInstalledState();
         if (options.operation == Operation::Automatic)
@@ -2369,19 +2590,32 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
         case Operation::Install:
             if (!Confirm(L"Install A4S Menu for the current user?", options))
                 return ERROR_CANCELLED;
-            return InstallOrRepair(instance, options);
+            break;
         case Operation::Repair:
             if (!Confirm(L"Repair or update A4S Menu for the current user?", options))
                 return ERROR_CANCELLED;
-            return InstallOrRepair(instance, options);
+            break;
         case Operation::Uninstall:
             if (!Confirm(L"Uninstall A4S Menu for the current user?", options))
                 return ERROR_CANCELLED;
-            return Uninstall(instance, options);
+            break;
         case Operation::Rollback:
             if (!Confirm(L"Restore the previous A4S Menu version?", options))
                 return ERROR_CANCELLED;
-            return Rollback(options);
+            break;
+        default:
+            Fail(ERROR_BAD_ARGUMENTS, L"Invalid A4SMenuSetup operation.");
+        }
+        const OperationIdentity identity = AllocateOperationIdentity(options.qualificationToken);
+        switch (options.operation)
+        {
+        case Operation::Install:
+        case Operation::Repair:
+            return InstallOrRepair(instance, options, identity);
+        case Operation::Uninstall:
+            return Uninstall(instance, options, identity);
+        case Operation::Rollback:
+            return Rollback(options, identity);
         default:
             Fail(ERROR_BAD_ARGUMENTS, L"Invalid A4SMenuSetup operation.");
         }

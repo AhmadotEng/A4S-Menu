@@ -3,9 +3,11 @@
 Runs the destructive, live per-user installer lifecycle matrix and writes JSON evidence.
 
 .DESCRIPTION
-This tool requires a clean installer-owned starting state, exercises the frozen
-1.0 and current 1.1 one-file installers, and intentionally leaves 1.1 installed
-but quiescent. It never passes --restart-explorer. Every pre-existing user-owned
+This tool requires a clean installer-owned starting state, verifies frozen 1.0
+read-only, exercises current 1.1 install/repair/uninstall, and intentionally
+leaves 1.1 installed but quiescent. Frozen-V1 mutation and V1-to-V2
+upgrade/rollback are deferred to a disposable profile because V1 predates the
+cooperative sequence/token protocol. It never passes --restart-explorer. Every pre-existing user-owned
 value below HKCU\Software\A4SMenu is restored byte-for-byte after the final V2
 registration commits, including Config, Menu, InstallPath, and Enabled. The
 original DataCache.db bytes (or absence) are also restored.
@@ -61,6 +63,7 @@ if (-not [Environment]::Is64BitProcess) {
 
 $stateSubKey = 'Software\A4SMenu'
 $servicingSubKey = 'Software\A4SMenu\Servicing'
+$lifecycleSubKey = 'Software\A4SMenuLifecycle'
 $uninstallSubKey = 'Software\Microsoft\Windows\CurrentVersion\Uninstall\A4SMenu'
 $runSubKey = 'Software\Microsoft\Windows\CurrentVersion\Run'
 $runOnceSubKey = 'Software\Microsoft\Windows\CurrentVersion\RunOnce'
@@ -91,7 +94,10 @@ $script:expectedCleanupHash = $null
 $script:fixturePaths = @()
 $script:lifecycleMutex = $null
 $script:lifecycleMutexHeld = $false
+$script:productLifecycleMutexName = $null
 $script:productSetupMutexName = $null
+$script:pendingProductLocks = $null
+$script:pendingSetupOwnership = $null
 $script:lastOwnedAggregate = $null
 $script:ownedAggregateLedger = [Collections.Generic.List[object]]::new()
 $script:knownPayloadBySlotName = [ordered]@{}
@@ -119,8 +125,13 @@ function Get-CurrentUserSidHashSuffix {
 
 function Get-LifecycleMutexNames {
     $suffix = Get-CurrentUserSidHashSuffix
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    if (-not $sid -or $sid -notmatch '^S-\d(-\d+)+$') {
+        throw 'The raw current-user SID is invalid for product lifecycle coordination.'
+    }
     return [ordered]@{
-        Lifecycle = "Global\A4SMenu.LifecycleQualification.v1.$suffix"
+        Harness = "Global\A4SMenu.LifecycleQualification.v1.$suffix"
+        ProductLifecycle = "Global\A4SMenu.Lifecycle.v1.$sid"
         ProductSetup = "Global\A4SMenu.Setup.v1.$suffix"
     }
 }
@@ -128,7 +139,7 @@ function Get-LifecycleMutexNames {
 function Acquire-LifecycleMutex {
     if ($script:lifecycleMutexHeld) { throw 'The lifecycle mutex is already held by this harness.' }
     $names = Get-LifecycleMutexNames
-    $name = $names.Lifecycle
+    $name = $names.Harness
     try {
         # Global scope makes this lease visible to service/session-0 and every
         # interactive session. An existing object whose ACL denies this user is
@@ -149,30 +160,110 @@ function Acquire-LifecycleMutex {
     }
 }
 
-function Assert-ProductSetupCoordinationAvailable {
-    if (-not $script:productSetupMutexName) {
-        $script:productSetupMutexName = (Get-LifecycleMutexNames).ProductSetup
+function Acquire-ProductMutationLocks {
+    if ($null -ne $script:pendingProductLocks) {
+        throw 'A product mutation-lock lease is already pending acceptance.'
     }
-    $probe = $null
-    $acquired = $false
+    $names = Get-LifecycleMutexNames
+    $script:productLifecycleMutexName = $names.ProductLifecycle
+    $script:productSetupMutexName = $names.ProductSetup
+    $lifecycle = $null
+    $setup = $null
+    $lifecycleHeld = $false
+    $setupHeld = $false
     try {
-        # This is the exact Global SID-scoped mutex used by native Setup. It is
-        # probed, then released so the child Setup can acquire it itself. A
-        # cross-session service lock or access-denied DACL fails closed.
-        $probe = [Threading.Mutex]::new($false, $script:productSetupMutexName)
-        try { $acquired = $probe.WaitOne(0) }
-        catch [Threading.AbandonedMutexException] { $acquired = $true }
-        if (-not $acquired) {
-            throw 'Another native A4S setup operation owns the Global current-user servicing mutex.'
+        # Fixed order shared with native Setup: Lifecycle, then Setup.
+        $lifecycle = [Threading.Mutex]::new($false, $script:productLifecycleMutexName)
+        try { $lifecycleHeld = $lifecycle.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $lifecycleHeld = $true }
+        if (-not $lifecycleHeld) {
+            throw 'Another A4S mutation owns the Global current-user lifecycle mutex.'
         }
-        return [ordered]@{ Name = $script:productSetupMutexName; Available = $true }
+        $setup = [Threading.Mutex]::new($false, $script:productSetupMutexName)
+        try { $setupHeld = $setup.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $setupHeld = $true }
+        if (-not $setupHeld) {
+            throw 'Another A4S setup operation owns the Global current-user Setup mutex.'
+        }
+        return [pscustomobject]@{
+            Lifecycle = $lifecycle
+            Setup = $setup
+            LifecycleHeld = $true
+            SetupHeld = $true
+            Names = $names
+        }
     }
     catch {
-        throw "Native A4S setup coordination is unavailable or access denied: $($_.Exception.Message)"
+        if ($setupHeld -and $null -ne $setup) { $setup.ReleaseMutex() }
+        if ($null -ne $setup) { $setup.Dispose() }
+        if ($lifecycleHeld -and $null -ne $lifecycle) { $lifecycle.ReleaseMutex() }
+        if ($null -ne $lifecycle) { $lifecycle.Dispose() }
+        throw "Native A4S product coordination is unavailable or access denied: $($_.Exception.Message)"
+    }
+}
+
+function Release-ProductMutationLocks {
+    param([AllowNull()] $Lease)
+    if ($null -eq $Lease) { return }
+    if ($Lease.SetupHeld -and $null -ne $Lease.Setup) {
+        $Lease.Setup.ReleaseMutex()
+        $Lease.SetupHeld = $false
+    }
+    if ($null -ne $Lease.Setup) { $Lease.Setup.Dispose(); $Lease.Setup = $null }
+    if ($Lease.LifecycleHeld -and $null -ne $Lease.Lifecycle) {
+        $Lease.Lifecycle.ReleaseMutex()
+        $Lease.LifecycleHeld = $false
+    }
+    if ($null -ne $Lease.Lifecycle) { $Lease.Lifecycle.Dispose(); $Lease.Lifecycle = $null }
+}
+
+function Assert-ProductSetupCoordinationAvailable {
+    $lease = Acquire-ProductMutationLocks
+    try {
+        return [ordered]@{
+            ProductLifecycle = $lease.Names.ProductLifecycle
+            ProductSetup = $lease.Names.ProductSetup
+            Available = $true
+        }
+    }
+    finally { Release-ProductMutationLocks $lease }
+}
+
+function Release-PendingProductMutationLocks {
+    if ($null -ne $script:pendingProductLocks) {
+        Release-ProductMutationLocks $script:pendingProductLocks
+        $script:pendingProductLocks = $null
+    }
+    $script:pendingSetupOwnership = $null
+}
+
+function Suspend-PendingProductMutationLocks {
+    if ($null -eq $script:pendingProductLocks -or $null -eq $script:pendingSetupOwnership) {
+        throw 'No accepted Setup operation is waiting for a cooperative continuation.'
+    }
+    $proof = $script:pendingSetupOwnership
+    $lease = $script:pendingProductLocks
+    $script:pendingProductLocks = $null
+    Release-ProductMutationLocks $lease
+    return $proof
+}
+
+function Resume-PendingProductMutationLocks {
+    param([Parameter(Mandatory)] $Proof)
+    $lease = Acquire-ProductMutationLocks
+    try {
+        $aggregate = Get-StableLifecycleAggregate -Label ($Proof.Label + '-continuation-locked-post')
+        Assert-ExactQualificationOperation -Aggregate $aggregate `
+            -ExpectedSequence ([uint64]$Proof.ExpectedSequence) `
+            -ExpectedToken ([string]$Proof.Token) `
+            -Label ($Proof.Label + ' continuation') | Out-Null
+        $script:pendingProductLocks = $lease
+        $script:pendingSetupOwnership = $Proof
+        $lease = $null
+        return $aggregate
     }
     finally {
-        if ($acquired -and $null -ne $probe) { $probe.ReleaseMutex() }
-        if ($null -ne $probe) { $probe.Dispose() }
+        if ($null -ne $lease) { Release-ProductMutationLocks $lease }
     }
 }
 
@@ -391,7 +482,7 @@ function Add-RegistryTreeNodes {
     param(
         [Parameter(Mandatory)][Microsoft.Win32.RegistryKey] $Key,
         [Parameter(Mandatory)][AllowEmptyString()][string] $RelativePath,
-        [Parameter(Mandatory)][Collections.Generic.List[object]] $Nodes
+        [Parameter(Mandatory)][AllowEmptyCollection()][Collections.Generic.List[object]] $Nodes
     )
 
     $values = [Collections.Generic.List[object]]::new()
@@ -413,9 +504,12 @@ function Add-RegistryTreeNodes {
 }
 
 function Get-RegistryTreeSnapshot {
-    param([Parameter(Mandatory)][string] $SubKey)
+    param(
+        [Parameter(Mandatory)][string] $SubKey,
+        [Microsoft.Win32.RegistryKey] $RegistryRoot = [Microsoft.Win32.Registry]::CurrentUser
+    )
 
-    $root = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey, $false)
+    $root = $RegistryRoot.OpenSubKey($SubKey, $false)
     if ($null -eq $root) {
         return [ordered]@{ SubKey = $SubKey; Exists = $false; Nodes = @() }
     }
@@ -439,6 +533,9 @@ function Get-InstallerRegistrationSnapshot {
         Run = Get-RegistryValueSnapshot -SubKey $runSubKey -Name $runValueName
         CleanupRunOnce = Get-RegistryValueSnapshot -SubKey $runOnceSubKey -Name $cleanupRunOnceName
         RecoveryRunOnce = Get-RegistryValueSnapshot -SubKey $runOnceSubKey -Name $recoveryRunOnceName
+        ServicingSequence = Get-RegistryValueSnapshot -SubKey $lifecycleSubKey -Name 'ServicingSequence'
+        LastOperation = Get-RegistryValueSnapshot -SubKey $lifecycleSubKey -Name 'LastOperation'
+        LifecycleMetadata = Get-RegistryTreeSnapshot -SubKey $lifecycleSubKey
     }
 }
 
@@ -564,9 +661,15 @@ function ConvertFrom-EncodedRegistryData {
     switch ($kind) {
         ([Microsoft.Win32.RegistryValueKind]::String) { return [string]$Value.Data }
         ([Microsoft.Win32.RegistryValueKind]::ExpandString) { return [string]$Value.Data }
-        ([Microsoft.Win32.RegistryValueKind]::MultiString) { return [string[]]@($Value.Data) }
-        ([Microsoft.Win32.RegistryValueKind]::Binary) { return [Convert]::FromBase64String([string]$Value.Data) }
-        ([Microsoft.Win32.RegistryValueKind]::None) { return [Convert]::FromBase64String([string]$Value.Data) }
+        ([Microsoft.Win32.RegistryValueKind]::MultiString) {
+            Write-Output -NoEnumerate ([string[]]@($Value.Data)); return
+        }
+        ([Microsoft.Win32.RegistryValueKind]::Binary) {
+            Write-Output -NoEnumerate ([Convert]::FromBase64String([string]$Value.Data)); return
+        }
+        ([Microsoft.Win32.RegistryValueKind]::None) {
+            Write-Output -NoEnumerate ([Convert]::FromBase64String([string]$Value.Data)); return
+        }
         ([Microsoft.Win32.RegistryValueKind]::DWord) { return [int]::Parse([string]$Value.Data, [Globalization.CultureInfo]::InvariantCulture) }
         ([Microsoft.Win32.RegistryValueKind]::QWord) { return [long]::Parse([string]$Value.Data, [Globalization.CultureInfo]::InvariantCulture) }
         default { throw "Unsupported registry value kind in recovery snapshot: $($Value.Kind)" }
@@ -716,13 +819,31 @@ function Test-RegistryTreeSnapshotsEqual {
     return (Get-ObjectFingerprint $Left) -ceq (Get-ObjectFingerprint $Right)
 }
 
+function Invoke-RegistryMutationCheckpoint {
+    param(
+        [AllowNull()][scriptblock] $Hook,
+        [Parameter(Mandatory)][ref] $Counter,
+        [Parameter(Mandatory)][string] $Name
+    )
+    if ($null -eq $Hook) { return }
+    $Counter.Value = [int]$Counter.Value + 1
+    & $Hook ([int]$Counter.Value) $Name
+}
+
 function Apply-ValidatedRegistryTreeSnapshot {
     param(
         [Parameter(Mandatory)][string] $ExpectedSubKey,
-        [Parameter(Mandatory)] $Snapshot
+        [Parameter(Mandatory)] $Snapshot,
+        [Microsoft.Win32.RegistryKey] $RegistryRoot = [Microsoft.Win32.Registry]::CurrentUser,
+        [AllowNull()][scriptblock] $MutationHook
     )
 
-    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ExpectedSubKey, $false)
+    $mutationStep = 0
+    Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+        -Name 'BeforeDeleteTree'
+    $RegistryRoot.DeleteSubKeyTree($ExpectedSubKey, $false)
+    Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+        -Name 'AfterDeleteTree'
     if (-not (Get-NamedMemberValue $Snapshot 'Exists')) { return }
     $snapshotNodes = Get-NamedMemberValue $Snapshot 'Nodes'
     $orderedNodes = @($snapshotNodes | Sort-Object `
@@ -731,21 +852,35 @@ function Apply-ValidatedRegistryTreeSnapshot {
     foreach ($node in $orderedNodes) {
         $relative = [string](Get-NamedMemberValue $node 'RelativePath')
         $subKey = if ($relative) { "$ExpectedSubKey\$relative" } else { $ExpectedSubKey }
-        $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey, $true)
-        if ($null -eq $key) { throw "Could not restore HKCU\$subKey." }
+        $key = $null
         try {
+            Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                -Name "BeforeCreateKey:$relative"
+            $key = $RegistryRoot.CreateSubKey($subKey, $true)
+            if ($null -eq $key) { throw "Could not restore HKCU\$subKey." }
+            Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                -Name "AfterCreateKey:$relative"
             $nodeValues = Get-NamedMemberValue $node 'Values'
             foreach ($value in $nodeValues) {
                 $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
                     [Microsoft.Win32.RegistryValueKind],
                     [string](Get-NamedMemberValue $value 'Kind'), $false)
-                $key.SetValue([string](Get-NamedMemberValue $value 'Name'),
+                $valueName = [string](Get-NamedMemberValue $value 'Name')
+                Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                    -Name "BeforeSetValue:$relative/$valueName"
+                $key.SetValue($valueName,
                     (ConvertFrom-EncodedRegistryData $value), $kind)
+                Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                    -Name "AfterSetValue:$relative/$valueName"
             }
+            Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                -Name "BeforeFlush:$relative"
             $key.Flush()
+            Invoke-RegistryMutationCheckpoint -Hook $MutationHook -Counter ([ref]$mutationStep) `
+                -Name "AfterFlush:$relative"
         }
         finally {
-            $key.Dispose()
+            if ($null -ne $key) { $key.Dispose() }
         }
     }
 }
@@ -753,13 +888,15 @@ function Apply-ValidatedRegistryTreeSnapshot {
 function Restore-RegistryTreeSnapshot {
     param(
         [Parameter(Mandatory)][string] $ExpectedSubKey,
-        [Parameter(Mandatory)] $Snapshot
+        [Parameter(Mandatory)] $Snapshot,
+        [Microsoft.Win32.RegistryKey] $RegistryRoot = [Microsoft.Win32.Registry]::CurrentUser,
+        [AllowNull()][scriptblock] $MutationHook
     )
 
     # Target validation and an exact immediate pre-state capture both happen
     # before the sole destructive primitive is reached.
     Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot | Out-Null
-    $immediatePreState = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+    $immediatePreState = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey -RegistryRoot $RegistryRoot
     Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
         -Snapshot $immediatePreState | Out-Null
     if (Test-RegistryTreeSnapshotsEqual $immediatePreState $Snapshot) {
@@ -767,8 +904,9 @@ function Restore-RegistryTreeSnapshot {
     }
 
     try {
-        Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot
-        $actual = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+        Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot `
+            -RegistryRoot $RegistryRoot -MutationHook $MutationHook
+        $actual = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey -RegistryRoot $RegistryRoot
         Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $actual | Out-Null
         if (-not (Test-RegistryTreeSnapshotsEqual $actual $Snapshot)) {
             throw 'Registry restoration verification did not match the validated target snapshot.'
@@ -779,8 +917,8 @@ function Restore-RegistryTreeSnapshot {
         $primaryFailure = $_.Exception.Message
         try {
             Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
-                -Snapshot $immediatePreState
-            $rolledBack = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+                -Snapshot $immediatePreState -RegistryRoot $RegistryRoot
+            $rolledBack = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey -RegistryRoot $RegistryRoot
             Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
                 -Snapshot $rolledBack | Out-Null
             if (-not (Test-RegistryTreeSnapshotsEqual $rolledBack $immediatePreState)) {
@@ -792,6 +930,125 @@ function Restore-RegistryTreeSnapshot {
         }
         throw "Registry restoration failed and was rolled back to the exact immediate pre-state: $primaryFailure"
     }
+}
+
+function Invoke-RegistryRestoreBackendSelfTest {
+    $registryRoot = [Microsoft.Win32.Registry]::CurrentUser
+    $sandboxSubKey = 'Software\A4SMenu\Tests\RegistryRestore\' +
+        [Guid]::NewGuid().ToString('N').ToUpperInvariant()
+    if ($sandboxSubKey -notmatch '^Software\\A4SMenu\\Tests\\RegistryRestore\\[0-9A-F]{32}$') {
+        throw 'The registry-backend self-test generated an unsafe sandbox path.'
+    }
+    $original = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
+    if ($original.Exists) { throw "The unique registry sandbox unexpectedly exists: HKCU\$sandboxSubKey" }
+
+    $baselineTarget = [ordered]@{
+        SubKey = $sandboxSubKey
+        Exists = $true
+        Nodes = @(
+            [ordered]@{ RelativePath = ''; Values = @(
+                [ordered]@{ Name = 'OldDword'; Kind = 'DWord'; Data = '7' },
+                [ordered]@{ Name = 'OldText'; Kind = 'String'; Data = 'baseline' }
+            ) },
+            [ordered]@{ RelativePath = 'Legacy'; Values = @(
+                [ordered]@{ Name = 'Bytes'; Kind = 'Binary'; Data = 'AAECAwQ=' }
+            ) }
+        )
+    }
+    $target = [ordered]@{
+        SubKey = $sandboxSubKey
+        Exists = $true
+        Nodes = @(
+            [ordered]@{ RelativePath = ''; Values = @(
+                [ordered]@{ Name = 'Expand'; Kind = 'ExpandString'; Data = '%TEMP%\A4S' },
+                [ordered]@{ Name = 'Qword'; Kind = 'QWord'; Data = '4294967297' }
+            ) },
+            [ordered]@{ RelativePath = 'Child'; Values = @(
+                [ordered]@{ Name = 'Lines'; Kind = 'MultiString'; Data = @('one', 'two') }
+            ) },
+            [ordered]@{ RelativePath = 'Child\Deep'; Values = @(
+                [ordered]@{ Name = 'Payload'; Kind = 'Binary'; Data = 'AP+AQQ==' }
+            ) }
+        )
+    }
+
+    $primaryFailure = $null
+    $cleanupFailure = $null
+    $testedSteps = 0
+    try {
+        Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $baselineTarget `
+            -RegistryRoot $registryRoot | Out-Null
+        $baseline = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
+
+        $noOpHook = { throw 'A byte-exact no-op reached a registry mutation checkpoint.' }
+        $noOp = Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $baseline `
+            -RegistryRoot $registryRoot -MutationHook $noOpHook
+        if ($noOp.Changed -or $noOp.RolledBack) {
+            throw 'The production registry backend did not preserve an exact no-op.'
+        }
+
+        $trace = [Collections.Generic.List[object]]::new()
+        $traceHook = { param($step, $name) $trace.Add([ordered]@{ Step = $step; Name = $name }) }
+        $success = Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $target `
+            -RegistryRoot $registryRoot -MutationHook $traceHook
+        if (-not $success.Changed -or $success.RolledBack -or $trace.Count -eq 0) {
+            throw 'The production registry backend success path did not execute mutations.'
+        }
+        $testedSteps = $trace.Count
+        $actualTarget = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
+        if (-not (Test-RegistryTreeSnapshotsEqual $actualTarget $target)) {
+            throw 'The production registry backend success path is not byte-exact.'
+        }
+
+        for ($failureStep = 1; $failureStep -le $testedSteps; ++$failureStep) {
+            Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $baseline `
+                -RegistryRoot $registryRoot | Out-Null
+            $injections = [Collections.Generic.List[int]]::new()
+            $injectionHook = {
+                param($step, $name)
+                if ($step -eq $failureStep) {
+                    $injections.Add([int]$step)
+                    throw "Injected registry mutation failure at $step ($name)."
+                }
+            }
+            $threw = $false
+            try {
+                Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $target `
+                    -RegistryRoot $registryRoot -MutationHook $injectionHook | Out-Null
+            }
+            catch { $threw = $true }
+            if (-not $threw -or $injections.Count -ne 1 -or
+                $injections[0] -ne $failureStep) {
+                throw "Registry mutation failure step $failureStep did not fail at its intended seam."
+            }
+            $afterFailure = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
+            if (-not (Test-RegistryTreeSnapshotsEqual $afterFailure $baseline)) {
+                throw "Registry mutation failure step $failureStep did not roll back byte-exactly."
+            }
+        }
+    }
+    catch { $primaryFailure = $_ }
+    finally {
+        try {
+            Restore-RegistryTreeSnapshot -ExpectedSubKey $sandboxSubKey -Snapshot $original `
+                -RegistryRoot $registryRoot | Out-Null
+        }
+        catch {
+            $cleanupFailure = $_
+            # This path was generated and regex-validated above; the fallback is
+            # bounded to that one unique test key and never touches product state.
+            try { $registryRoot.DeleteSubKeyTree($sandboxSubKey, $false) } catch {}
+        }
+        $final = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
+        if (-not (Test-RegistryTreeSnapshotsEqual $final $original)) {
+            $cleanupFailure = [Exception]::new('The registry sandbox did not return to its exact original state.')
+        }
+    }
+    if ($null -ne $cleanupFailure) {
+        throw "Registry-backend self-test cleanup failed: $($cleanupFailure.Exception.Message)"
+    }
+    if ($null -ne $primaryFailure) { throw $primaryFailure }
+    return [ordered]@{ Passed = $true; MutationStepsTested = $testedSteps; Sandbox = $sandboxSubKey }
 }
 
 function New-MergedInstalledStateSnapshot {
@@ -1504,21 +1761,40 @@ function Get-StableLifecycleAggregate {
 function Register-OwnedAggregate {
     param(
         [Parameter(Mandatory)] $Aggregate,
-        [Parameter(Mandatory)][ValidateSet('Clean', 'InstalledV1', 'InstalledV2',
+        [Parameter(Mandatory)][ValidateSet('Clean', 'InstalledV2',
             'UninstalledPending', 'UninstalledQuiescent', 'FinalInstalled')] [string] $Kind,
         [Parameter(Mandatory)][string] $Label,
         [AllowNull()] $Validation
     )
-    $entry = [ordered]@{
-        Label = $Label
-        Kind = $Kind
-        Fingerprint = [string]$Aggregate.Fingerprint
-        Aggregate = $Aggregate
-        Validation = $Validation
+    $pending = $script:pendingSetupOwnership
+    try {
+        if ($null -ne $pending) {
+            if ($null -eq $script:pendingProductLocks) {
+                throw "$Label lost its product mutation locks before ownership registration."
+            }
+            $current = Get-StableLifecycleAggregate -Label ($Label + '-locked-registration-cas')
+            if ($current.Fingerprint -cne [string]$Aggregate.Fingerprint) {
+                throw "$Label changed between validation and ownership registration."
+            }
+            Assert-ExactQualificationOperation -Aggregate $current `
+                -ExpectedSequence ([uint64]$pending.ExpectedSequence) `
+                -ExpectedToken ([string]$pending.Token) -Label "$Label ownership CAS" | Out-Null
+        }
+        $entry = [ordered]@{
+            Label = $Label
+            Kind = $Kind
+            Fingerprint = [string]$Aggregate.Fingerprint
+            Aggregate = $Aggregate
+            Validation = $Validation
+            QualificationOperation = $pending
+        }
+        $script:ownedAggregateLedger.Add($entry)
+        $script:lastOwnedAggregate = $entry
+        return $entry
     }
-    $script:ownedAggregateLedger.Add($entry)
-    $script:lastOwnedAggregate = $entry
-    return $entry
+    finally {
+        if ($null -ne $pending) { Release-PendingProductMutationLocks }
+    }
 }
 
 function Find-OwnedAggregate {
@@ -1545,7 +1821,6 @@ function Assert-LastOwnedAggregateImmediatelyBeforeSetup {
     if ($null -eq $script:lastOwnedAggregate) {
         throw "$Label has no previously validated harness-owned state."
     }
-    $setupCoordination = Assert-ProductSetupCoordinationAvailable
     $actual = Assert-AggregateFingerprintImmediatelyBeforeMutation `
         -ExpectedFingerprint $script:lastOwnedAggregate.Fingerprint -Label $Label
     return [ordered]@{
@@ -1554,8 +1829,69 @@ function Assert-LastOwnedAggregateImmediatelyBeforeSetup {
         ExpectedFingerprint = $script:lastOwnedAggregate.Fingerprint
         ActualFingerprint = $actual.Fingerprint
         Aggregate = $actual
-        ProductSetupCoordination = $setupCoordination
+        ProductLifecycleMutex = $script:productLifecycleMutexName
+        ProductSetupMutex = $script:productSetupMutexName
     }
+}
+
+function New-QualificationOperationToken {
+    $bytes = [byte[]]::new(32)
+    [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+    return ([BitConverter]::ToString($bytes)).Replace('-', '')
+}
+
+function Get-LifecycleOperationRecord {
+    param(
+        [Parameter(Mandatory)] $Aggregate,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $registration = $Aggregate.Snapshot.InstallerRegistration
+    $sequenceValue = $registration.ServicingSequence
+    $lastValue = $registration.LastOperation
+    [uint64]$highWater = 0
+    if ($sequenceValue.Present) {
+        if ($sequenceValue.Kind -cne 'QWord' -or
+            -not [uint64]::TryParse([string]$sequenceValue.Data,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$highWater)) {
+            throw "$Label has malformed lifecycle ServicingSequence metadata."
+        }
+    }
+    $lastSequence = [uint64]0
+    $lastToken = ''
+    if ($lastValue.Present) {
+        if ($lastValue.Kind -cne 'String' -or
+            [string]$lastValue.Data -notmatch '^(?<Sequence>[0-9]{20}):(?<Token>[0-9A-F]{64})$' -or
+            -not [uint64]::TryParse($Matches.Sequence,
+                [Globalization.NumberStyles]::None,
+                [Globalization.CultureInfo]::InvariantCulture, [ref]$lastSequence) -or
+            $lastSequence -eq 0 -or $lastSequence -gt $highWater) {
+            throw "$Label has malformed or inconsistent LastOperation metadata."
+        }
+        $lastToken = $Matches.Token
+    }
+    return [ordered]@{
+        HighWater = $highWater
+        LastPresent = [bool]$lastValue.Present
+        LastSequence = $lastSequence
+        LastToken = $lastToken
+    }
+}
+
+function Assert-ExactQualificationOperation {
+    param(
+        [Parameter(Mandatory)] $Aggregate,
+        [Parameter(Mandatory)][uint64] $ExpectedSequence,
+        [Parameter(Mandatory)][string] $ExpectedToken,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $actual = Get-LifecycleOperationRecord -Aggregate $Aggregate -Label $Label
+    if ($actual.HighWater -ne $ExpectedSequence -or -not $actual.LastPresent -or
+        $actual.LastSequence -ne $ExpectedSequence -or
+        $actual.LastToken -cne $ExpectedToken) {
+        throw "$Label was superseded or did not commit its exact qualification operation identity."
+    }
+    return $actual
 }
 
 function Test-InstallerOwnedCleanSnapshot {
@@ -1752,11 +2088,11 @@ function Invoke-CapturedProcess {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $process = $null
     $startError = $null
-    # This is deliberately the final operation before process creation. A
-    # setup launch never crosses an unverified ownership gap in the harness.
-    $preLaunchOwnership = if ($SetupLaunch) {
-        Assert-LastOwnedAggregateImmediatelyBeforeSetup -Label $Label
-    } else { $null }
+    # State-changing Setup coordination is owned by Invoke-RecordedSetupStep,
+    # which releases both native product locks only for the child invocation
+    # and reacquires both before accepting its result. This lower-level process
+    # helper must not create an independent probe gap.
+    $preLaunchOwnership = $null
     try {
         $process = Start-Process -FilePath $full -ArgumentList $Arguments -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -1797,6 +2133,7 @@ function Invoke-CapturedProcess {
         ExplorerPidAfter = $afterExplorer
         ExplorerPidUnchanged = $beforeExplorer -eq $afterExplorer
         PreLaunchOwnership = $preLaunchOwnership
+        QualificationOperation = $null
     }
 }
 
@@ -2389,15 +2726,72 @@ function Invoke-RecordedSetupStep {
     param(
         [Parameter(Mandatory)][string] $Label,
         [Parameter(Mandatory)] $SetupIdentity,
-        [Parameter(Mandatory)][string[]] $Arguments
+        [Parameter(Mandatory)][string[]] $Arguments,
+        [switch] $StateChanging
     )
 
-    $record = Invoke-CapturedProcess -Label $Label -FilePath $SetupIdentity.Path `
-        -Arguments $Arguments -ExpectedSha256 $SetupIdentity.Sha256 `
-        -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
-    $script:evidence.Steps.Add($record)
-    Assert-ProcessSucceededWithoutExplorerRestart $record
-    return $record
+    if (-not $StateChanging) {
+        $record = Invoke-CapturedProcess -Label $Label -FilePath $SetupIdentity.Path `
+            -Arguments $Arguments -ExpectedSha256 $SetupIdentity.Sha256 `
+            -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
+        $script:evidence.Steps.Add($record)
+        Assert-ProcessSucceededWithoutExplorerRestart $record
+        return $record
+    }
+    if ($Arguments -icontains '--qualification-operation-token') {
+        throw "$Label attempted to supply its own qualification token."
+    }
+
+    $lease = $null
+    $record = $null
+    try {
+        $lease = Acquire-ProductMutationLocks
+        $preOwnership = Assert-LastOwnedAggregateImmediatelyBeforeSetup -Label $Label
+        $preIdentity = Get-LifecycleOperationRecord -Aggregate $preOwnership.Aggregate `
+            -Label "$Label pre-state"
+        if ($preIdentity.HighWater -eq [uint64]::MaxValue) {
+            throw "$Label cannot advance an exhausted lifecycle sequence."
+        }
+        [uint64]$expectedSequence = $preIdentity.HighWater + 1
+        $token = New-QualificationOperationToken
+        $childArguments = @($Arguments) + @('--qualification-operation-token', $token)
+
+        # The child must acquire the same locks itself. The harness releases
+        # both, waits for that one child, then reacquires both before observing
+        # or accepting any post-state.
+        Release-ProductMutationLocks $lease
+        $lease = $null
+        $record = Invoke-CapturedProcess -Label $Label -FilePath $SetupIdentity.Path `
+            -Arguments $childArguments -ExpectedSha256 $SetupIdentity.Sha256 `
+            -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
+        $script:evidence.Steps.Add($record)
+
+        $lease = Acquire-ProductMutationLocks
+        $post = Get-StableLifecycleAggregate -Label ($Label + '-locked-post-aggregate')
+        $operation = Assert-ExactQualificationOperation -Aggregate $post `
+            -ExpectedSequence $expectedSequence -ExpectedToken $token -Label "$Label post-state"
+        Assert-ProcessSucceededWithoutExplorerRestart $record
+        $record.PreLaunchOwnership = $preOwnership
+        $record.QualificationOperation = [ordered]@{
+            Token = $token
+            ExpectedSequence = $expectedSequence
+            Observed = $operation
+            LockedPostAggregate = $post
+        }
+        $script:pendingProductLocks = $lease
+        $script:pendingSetupOwnership = [ordered]@{
+            Label = $Label
+            Token = $token
+            ExpectedSequence = $expectedSequence
+            InitialPostFingerprint = $post.Fingerprint
+        }
+        $lease = $null
+        return $record
+    }
+    catch {
+        if ($null -ne $lease) { Release-ProductMutationLocks $lease }
+        throw
+    }
 }
 
 function Add-CheckpointToStep {
@@ -2432,11 +2826,24 @@ function Record-CacheRestoration {
 
 function Get-InstallerCheckpointProjection {
     param([Parameter(Mandatory)] $Checkpoint)
+    $registration = $Checkpoint.InstallerRegistration
     return [ordered]@{
         ActiveSlotPath = $Checkpoint.ActiveSlotPath
         PreviousSlotPath = $Checkpoint.PreviousSlotPath
         InstallVersion = $Checkpoint.InstallVersion
-        InstallerRegistration = $Checkpoint.InstallerRegistration
+        # Operation sequence/token intentionally changes on a byte-identical
+        # repair. Exclude only that lifecycle proof from the canonical
+        # registration no-change comparison.
+        InstallerRegistration = [ordered]@{
+            ActiveSlot = $registration.ActiveSlot
+            PreviousSlot = $registration.PreviousSlot
+            InstallVersion = $registration.InstallVersion
+            Servicing = $registration.Servicing
+            Uninstall = $registration.Uninstall
+            Run = $registration.Run
+            CleanupRunOnce = $registration.CleanupRunOnce
+            RecoveryRunOnce = $registration.RecoveryRunOnce
+        }
         ActiveSlot = $Checkpoint.ActiveSlot
         PreviousSlot = $Checkpoint.PreviousSlot
         RunStartup = $Checkpoint.RunStartup
@@ -2515,19 +2922,35 @@ function Get-CleanStartRecord {
 
 function Wait-ForInstalledCleanupCancellation {
     param([ValidateRange(1, 30)][int] $TimeoutSeconds = 8)
-    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    do {
-        $aggregate = Get-StableLifecycleAggregate -Label 'installed-cleanup-cancellation' `
-            -RequiredSamples 2 -TimeoutSeconds 2
-        $registration = $aggregate.Snapshot.InstallerRegistration
-        if (-not $registration.CleanupRunOnce.Present -and
-            -not $aggregate.Snapshot.Cleanup.HelperFile.Present -and
-            @($aggregate.Snapshot.Cleanup.Processes).Count -eq 0) {
-            return $aggregate
+    $proof = $null
+    $completed = $false
+    if ($null -ne $script:pendingProductLocks) {
+        $proof = Suspend-PendingProductMutationLocks
+    }
+    try {
+        $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+        do {
+            $aggregate = Get-StableLifecycleAggregate -Label 'installed-cleanup-cancellation' `
+                -RequiredSamples 2 -TimeoutSeconds 2
+            $registration = $aggregate.Snapshot.InstallerRegistration
+            if (-not $registration.CleanupRunOnce.Present -and
+                -not $aggregate.Snapshot.Cleanup.HelperFile.Present -and
+                @($aggregate.Snapshot.Cleanup.Processes).Count -eq 0) {
+                $completed = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        } while ([DateTime]::UtcNow -lt $deadline)
+        if (-not $completed) {
+            throw 'A successful reinstall did not cancel and self-delete the stale cleanup helper inside the bounded interval.'
         }
-        Start-Sleep -Milliseconds 100
-    } while ([DateTime]::UtcNow -lt $deadline)
-    throw 'A successful reinstall did not cancel and self-delete the stale cleanup helper inside the bounded interval.'
+    }
+    finally {
+        if ($null -ne $proof) {
+            $aggregate = Resume-PendingProductMutationLocks -Proof $proof
+        }
+    }
+    return $aggregate
 }
 
 function Wait-ForPendingCleanupResolution {
@@ -2558,24 +2981,30 @@ function Restore-VerifiedCleanOriginalState {
         [Parameter(Mandatory)] $OriginalDataCache,
         [Parameter(Mandatory)] $ExpectedAggregate
     )
-    Assert-AggregateFingerprintImmediatelyBeforeMutation `
-        -ExpectedFingerprint $ExpectedAggregate.Fingerprint `
-        -Label 'clean-state restoration' | Out-Null
-    Restore-CleanUserStateProjection -OriginalProjection $OriginalUserState | Out-Null
-    Restore-OriginalDataCache -Original $OriginalDataCache | Out-Null
-    $aggregate = Get-StableLifecycleAggregate -Label 'recovered-clean-original-state'
-    if (-not (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot)) {
-        throw 'Recovered state is not installer-owned clean.'
-    }
-    foreach ($name in @('Config', 'Menu', 'Legacy', 'HostSafety')) {
-        if ((Get-ObjectFingerprint $aggregate.Snapshot.UserStatePartitions[$name]) -cne
-            (Get-ObjectFingerprint (Get-NamedMemberValue $OriginalPartitions $name))) {
-            throw "Recovered $name user-state partition does not match the immutable original."
+    $lease = Acquire-ProductMutationLocks
+    try {
+        Assert-AggregateFingerprintImmediatelyBeforeMutation `
+            -ExpectedFingerprint $ExpectedAggregate.Fingerprint `
+            -Label 'clean-state restoration' | Out-Null
+        Restore-CleanUserStateProjection -OriginalProjection $OriginalUserState | Out-Null
+        Restore-OriginalDataCache -Original $OriginalDataCache | Out-Null
+        $aggregate = Get-StableLifecycleAggregate -Label 'recovered-clean-original-state'
+        if (-not (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot)) {
+            throw 'Recovered state is not installer-owned clean.'
         }
+        foreach ($name in @('Config', 'Menu', 'Legacy', 'HostSafety')) {
+            if ((Get-ObjectFingerprint $aggregate.Snapshot.UserStatePartitions[$name]) -cne
+                (Get-ObjectFingerprint (Get-NamedMemberValue $OriginalPartitions $name))) {
+                throw "Recovered $name user-state partition does not match the immutable original."
+            }
+        }
+        Assert-DataCacheMatches -Actual $aggregate.Snapshot.DataCache -Expected $OriginalDataCache `
+            -Label 'Recovered clean state'
+        Register-OwnedAggregate -Aggregate $aggregate -Kind Clean `
+            -Label 'recovered-clean-original-state' -Validation $null | Out-Null
+        return $aggregate
     }
-    Assert-DataCacheMatches -Actual $aggregate.Snapshot.DataCache -Expected $OriginalDataCache `
-        -Label 'Recovered clean state'
-    return $aggregate
+    finally { Release-ProductMutationLocks $lease }
 }
 
 function Stop-FinalHostQuiescent {
@@ -2619,7 +3048,6 @@ $v1Identity = $null
 $v2Identity = $null
 $v1Payload = $null
 $v2Payload = $null
-$v1Slot = $null
 $v2Slot = $null
 $finalPreviousSlot = $null
 $finalPreviousPayload = $null
@@ -2630,7 +3058,9 @@ try {
     # This independent current-user lock is held continuously through preflight,
     # all process launches, evidence writes, and any recovery decision.
     $lifecycleMutexName = Acquire-LifecycleMutex
-    $script:productSetupMutexName = (Get-LifecycleMutexNames).ProductSetup
+    $mutexNames = Get-LifecycleMutexNames
+    $script:productLifecycleMutexName = $mutexNames.ProductLifecycle
+    $script:productSetupMutexName = $mutexNames.ProductSetup
     $productSetupPreflight = Assert-ProductSetupCoordinationAvailable
 
     $reviewedV1Hash = Normalize-Sha256 $ExpectedV1SetupSha256
@@ -2706,6 +3136,7 @@ try {
         SessionId = $sessionId
         CurrentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
         LifecycleMutexName = $lifecycleMutexName
+        ProductLifecycleMutexName = $script:productLifecycleMutexName
         ProductSetupMutexName = $script:productSetupMutexName
         ProductSetupPreflight = $productSetupPreflight
         PhysicalPaths = [ordered]@{
@@ -2786,70 +3217,38 @@ try {
         -Label 'after-v2-verify' -Validation $afterV2Probe | Out-Null
     Write-Evidence
 
-    $knownMenuHashes = @($v1Payload.Menu.Sha256, $v2Payload.Menu.Sha256)
-    $installV1 = Invoke-RecordedSetupStep -Label 'install-v1-silent' -SetupIdentity $v1Identity `
-        -Arguments @('--install', '--silent')
-    $v1Checkpoint = Add-CheckpointToStep -Step $installV1 -Label 'installed-v1'
-    $v1Slot = $v1Checkpoint.ActiveSlotPath
-    $script:knownPayloadBySlotName[[IO.Path]::GetFileName($v1Slot)] = $v1Payload
-    Assert-InstalledCheckpoint -Checkpoint $v1Checkpoint -ExpectedVersion $expectedV1 `
-        -ExpectedPayload $v1Payload -ExpectedActiveSlot $v1Slot `
-        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
-    Assert-ExpectedHostState -Checkpoint $v1Checkpoint -KnownMenuSha256 $knownMenuHashes
-    Assert-UserStateAndCacheInvariant -Checkpoint $v1Checkpoint `
-        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
-    Register-OwnedAggregate -Aggregate $v1Checkpoint.Aggregate -Kind InstalledV1 `
-        -Label 'installed-v1' -Validation $v1Checkpoint | Out-Null
-    Write-Evidence
-
-    $upgradeV2 = Invoke-RecordedSetupStep -Label 'upgrade-v1-to-v2-silent' -SetupIdentity $v2Identity `
-        -Arguments @('--update', '--silent')
-    $v2Checkpoint = Add-CheckpointToStep -Step $upgradeV2 -Label 'upgraded-v2'
+    # Frozen V1 predates the cooperative lifecycle-token protocol and is
+    # deliberately read-only on a real user profile. Upgrade and rollback
+    # qualification is deferred to a disposable Sandbox/VM profile.
+    $script:evidence.LegacyUpgradeRollback = [ordered]@{
+        Status = 'DeferredToDisposableProfile'
+        Reason = 'Frozen V1 cannot participate in lifecycle token/sequence ownership.'
+        FrozenV1VerifiedReadOnly = $true
+    }
+    $knownMenuHashes = @($v2Payload.Menu.Sha256)
+    $installV2 = Invoke-RecordedSetupStep -Label 'install-v2-silent' -SetupIdentity $v2Identity `
+        -Arguments @('--install', '--silent') -StateChanging
+    $v2Checkpoint = Add-CheckpointToStep -Step $installV2 -Label 'installed-v2'
     $v2Slot = $v2Checkpoint.ActiveSlotPath
     $script:knownPayloadBySlotName[[IO.Path]::GetFileName($v2Slot)] = $v2Payload
     Assert-InstalledCheckpoint -Checkpoint $v2Checkpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
-    Assert-ExpectedHostState -Checkpoint $v2Checkpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
+    Assert-ExpectedHostState -Checkpoint $v2Checkpoint -KnownMenuSha256 $knownMenuHashes
     Assert-UserStateAndCacheInvariant -Checkpoint $v2Checkpoint `
         -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
     Register-OwnedAggregate -Aggregate $v2Checkpoint.Aggregate -Kind InstalledV2 `
-        -Label 'upgraded-v2' -Validation $v2Checkpoint | Out-Null
+        -Label 'installed-v2' -Validation $v2Checkpoint | Out-Null
     Write-Evidence
 
-    $rollback = Invoke-RecordedSetupStep -Label 'rollback-v2-to-v1-silent' `
-        -SetupIdentity $v2Checkpoint.ActiveSlot.Files.Setup -Arguments @('--rollback', '--silent')
-    $rollbackCheckpoint = Add-CheckpointToStep -Step $rollback -Label 'rolled-back-v1'
-    Assert-InstalledCheckpoint -Checkpoint $rollbackCheckpoint -ExpectedVersion $expectedV1 `
-        -ExpectedPayload $v1Payload -ExpectedActiveSlot $v1Slot `
-        -ExpectedPreviousSlot $v2Slot -ExpectedPreviousPayload $v2Payload
-    Assert-ExpectedHostState -Checkpoint $rollbackCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
-    Assert-UserStateAndCacheInvariant -Checkpoint $rollbackCheckpoint `
-        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
-    Register-OwnedAggregate -Aggregate $rollbackCheckpoint.Aggregate -Kind InstalledV1 `
-        -Label 'rolled-back-v1' -Validation $rollbackCheckpoint | Out-Null
-    Write-Evidence
-
-    $upgradeAgain = Invoke-RecordedSetupStep -Label 'upgrade-v1-to-v2-again-silent' `
-        -SetupIdentity $v2Identity -Arguments @('--update', '--silent')
-    $v2AgainCheckpoint = Add-CheckpointToStep -Step $upgradeAgain -Label 'upgraded-v2-again'
-    Assert-InstalledCheckpoint -Checkpoint $v2AgainCheckpoint -ExpectedVersion $expectedV2 `
-        -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
-    Assert-ExpectedHostState -Checkpoint $v2AgainCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
-    Assert-UserStateAndCacheInvariant -Checkpoint $v2AgainCheckpoint `
-        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
-    Register-OwnedAggregate -Aggregate $v2AgainCheckpoint.Aggregate -Kind InstalledV2 `
-        -Label 'upgraded-v2-again' -Validation $v2AgainCheckpoint | Out-Null
-    Write-Evidence
-
-    $beforeRepairFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $v2AgainCheckpoint)
+    $beforeRepairFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $v2Checkpoint)
     $repair = Invoke-RecordedSetupStep -Label 'repair-v2-same-version-silent' `
-        -SetupIdentity $v2AgainCheckpoint.ActiveSlot.Files.Setup -Arguments @('--repair', '--silent')
+        -SetupIdentity $v2Checkpoint.ActiveSlot.Files.Setup -Arguments @('--repair', '--silent') `
+        -StateChanging
     $repairCheckpoint = Add-CheckpointToStep -Step $repair -Label 'repaired-v2-same-version'
     Assert-InstalledCheckpoint -Checkpoint $repairCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
+        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
     Assert-ExpectedHostState -Checkpoint $repairCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
     Assert-UserStateAndCacheInvariant -Checkpoint $repairCheckpoint `
         -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache `
@@ -2864,9 +3263,10 @@ try {
     Write-Evidence
 
     $uninstall = Invoke-RecordedSetupStep -Label 'uninstall-v2-silent' `
-        -SetupIdentity $repairCheckpoint.ActiveSlot.Files.Setup -Arguments @('--uninstall', '--silent')
+        -SetupIdentity $repairCheckpoint.ActiveSlot.Files.Setup `
+        -Arguments @('--uninstall', '--silent') -StateChanging
     $uninstallCheckpoint = Add-CheckpointToStep -Step $uninstall -Label 'uninstalled-v2'
-    Assert-UninstalledCheckpoint -Checkpoint $uninstallCheckpoint -AllowedSlotPaths @($v1Slot, $v2Slot)
+    Assert-UninstalledCheckpoint -Checkpoint $uninstallCheckpoint -AllowedSlotPaths @($v2Slot)
     if ($uninstallCheckpoint.CleanupRunOnce.Present) {
         Assert-DataCacheMatches -Actual $uninstallCheckpoint.DataCache -Expected $originalDataCache `
             -Label 'Pending uninstall'
@@ -2877,7 +3277,6 @@ try {
             }
         }
         $knownMappedSlots = @(
-            [ordered]@{ Slot = $v1Slot; Payload = $v1Payload },
             [ordered]@{ Slot = $v2Slot; Payload = $v2Payload }
         )
         $mappedKnown = [Collections.Generic.List[object]]::new()
@@ -2908,7 +3307,7 @@ try {
     Write-Evidence
 
     $finalInstall = Invoke-RecordedSetupStep -Label 'final-install-v2-silent' `
-        -SetupIdentity $v2Identity -Arguments @('--install', '--silent')
+        -SetupIdentity $v2Identity -Arguments @('--install', '--silent') -StateChanging
     $finalInstall.CleanupCancellation = Wait-ForInstalledCleanupCancellation
     $finalInstallCheckpoint = Add-CheckpointToStep -Step $finalInstall -Label 'final-v2-before-restoration'
     Assert-InstalledCheckpoint -Checkpoint $finalInstallCheckpoint -ExpectedVersion $expectedV2 `
@@ -2926,63 +3325,88 @@ try {
     Write-Evidence
 
     $script:evidence.FinalHostQuiescence = Stop-FinalHostQuiescent -Checkpoint $finalInstallCheckpoint
-    $quiescentCheckpoint = Get-ProductCheckpoint -Label 'final-v2-host-quiescent-before-restoration'
-    Assert-InstalledCheckpoint -Checkpoint $quiescentCheckpoint -ExpectedVersion $expectedV2 `
-        -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
-    Assert-ExpectedHostState -Checkpoint $quiescentCheckpoint -KnownMenuSha256 $knownMenuHashes `
-        -RequireQuiescentStopped
-    Register-OwnedAggregate -Aggregate $quiescentCheckpoint.Aggregate -Kind FinalInstalled `
-        -Label 'final-v2-host-quiescent' -Validation $quiescentCheckpoint | Out-Null
+    $quiescentLease = Acquire-ProductMutationLocks
+    try {
+        $quiescentPre = Get-StableLifecycleAggregate -Label 'final-v2-quiescent-locked-pre'
+        Assert-ExactQualificationOperation -Aggregate $quiescentPre `
+            -ExpectedSequence ([uint64]$finalInstall.QualificationOperation.ExpectedSequence) `
+            -ExpectedToken ([string]$finalInstall.QualificationOperation.Token) `
+            -Label 'final host quiescence' | Out-Null
+        $quiescentCheckpoint = Get-ProductCheckpoint -Label 'final-v2-host-quiescent-before-restoration'
+        Assert-InstalledCheckpoint -Checkpoint $quiescentCheckpoint -ExpectedVersion $expectedV2 `
+            -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
+            -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+        Assert-ExpectedHostState -Checkpoint $quiescentCheckpoint -KnownMenuSha256 $knownMenuHashes `
+            -RequireQuiescentStopped
+        Register-OwnedAggregate -Aggregate $quiescentCheckpoint.Aggregate -Kind FinalInstalled `
+            -Label 'final-v2-host-quiescent' -Validation $quiescentCheckpoint | Out-Null
+    }
+    finally { Release-ProductMutationLocks $quiescentLease }
     Write-Evidence
 
     $finalInstallerRegistration = $quiescentCheckpoint.InstallerRegistration
-    Assert-AggregateFingerprintImmediatelyBeforeMutation `
-        -ExpectedFingerprint $quiescentCheckpoint.Aggregate.Fingerprint `
-        -Label 'final user-state restoration' | Out-Null
-    $script:evidence.UserStateRestoration = Restore-UserStateProjection `
-        -OriginalProjection $originalUserState -FinalInstallerRegistration $finalInstallerRegistration
-    $preCacheRestoration = Get-StableLifecycleAggregate -Label 'final-pre-cache-restoration'
-    Record-CacheRestoration -Original $originalDataCache `
-        -Reason 'after final V2 host became quiescent' `
-        -ExpectedAggregate $preCacheRestoration | Out-Null
-    $restoredCheckpoint = Get-ProductCheckpoint -Label 'final-v2-restored-and-quiescent'
-    Assert-InstalledCheckpoint -Checkpoint $restoredCheckpoint -ExpectedVersion $expectedV2 `
-        -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
-    Assert-ExpectedHostState -Checkpoint $restoredCheckpoint -KnownMenuSha256 $knownMenuHashes `
-        -RequireQuiescentStopped
-    Assert-UserStateAndCacheInvariant -Checkpoint $restoredCheckpoint `
-        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
-    if ((Get-ObjectFingerprint $restoredCheckpoint.UserStateProjection) -cne $originalUserFingerprint) {
-        throw 'Final user-owned registry fingerprint does not match the immutable manifest.'
+    $restorationLease = Acquire-ProductMutationLocks
+    try {
+        Assert-AggregateFingerprintImmediatelyBeforeMutation `
+            -ExpectedFingerprint $quiescentCheckpoint.Aggregate.Fingerprint `
+            -Label 'final user-state restoration' | Out-Null
+        $script:evidence.UserStateRestoration = Restore-UserStateProjection `
+            -OriginalProjection $originalUserState -FinalInstallerRegistration $finalInstallerRegistration
+        Record-CacheRestoration -Original $originalDataCache `
+            -Reason 'after final V2 host became quiescent under both product locks' `
+            -ExpectedAggregate $null | Out-Null
+        $restoredCheckpoint = Get-ProductCheckpoint -Label 'final-v2-restored-and-quiescent'
+        Assert-InstalledCheckpoint -Checkpoint $restoredCheckpoint -ExpectedVersion $expectedV2 `
+            -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
+            -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+        Assert-ExpectedHostState -Checkpoint $restoredCheckpoint -KnownMenuSha256 $knownMenuHashes `
+            -RequireQuiescentStopped
+        Assert-UserStateAndCacheInvariant -Checkpoint $restoredCheckpoint `
+            -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+        if ((Get-ObjectFingerprint $restoredCheckpoint.UserStateProjection) -cne $originalUserFingerprint) {
+            throw 'Final user-owned registry fingerprint does not match the immutable manifest.'
+        }
+        $restoredInstallerFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $restoredCheckpoint)
+        $restoredRegistrationWithLifecycleFingerprint =
+            Get-ObjectFingerprint $restoredCheckpoint.InstallerRegistration
+        Register-OwnedAggregate -Aggregate $restoredCheckpoint.Aggregate -Kind FinalInstalled `
+            -Label 'final-v2-restored-and-quiescent' -Validation $restoredCheckpoint | Out-Null
     }
-    $restoredInstallerFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $restoredCheckpoint)
-    Register-OwnedAggregate -Aggregate $restoredCheckpoint.Aggregate -Kind FinalInstalled `
-        -Label 'final-v2-restored-and-quiescent' -Validation $restoredCheckpoint | Out-Null
+    finally { Release-ProductMutationLocks $restorationLease }
     Write-Evidence
 
     if ($finalQuiescenceVerificationMilliseconds -le $preloadDebounceMilliseconds) {
         throw 'Final verification interval must be longer than the product preload debounce.'
     }
     Start-Sleep -Milliseconds $finalQuiescenceVerificationMilliseconds
-    $stableCheckpoint = Get-ProductCheckpoint -Label 'final-v2-after-quiescence-interval'
-    Assert-InstalledCheckpoint -Checkpoint $stableCheckpoint -ExpectedVersion $expectedV2 `
-        -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
-    Assert-ExpectedHostState -Checkpoint $stableCheckpoint -KnownMenuSha256 $knownMenuHashes `
-        -RequireQuiescentStopped
-    Assert-UserStateAndCacheInvariant -Checkpoint $stableCheckpoint `
-        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
-    if ((Get-ObjectFingerprint (Get-InstallerCheckpointProjection $stableCheckpoint)) -cne
-        $restoredInstallerFingerprint) {
-        throw 'Final installer-owned registration changed during the quiescence interval.'
+    $stabilityLease = Acquire-ProductMutationLocks
+    try {
+        Assert-AggregateFingerprintImmediatelyBeforeMutation `
+            -ExpectedFingerprint $restoredCheckpoint.Aggregate.Fingerprint `
+            -Label 'final quiescence ownership check' | Out-Null
+        $stableCheckpoint = Get-ProductCheckpoint -Label 'final-v2-after-quiescence-interval'
+        Assert-InstalledCheckpoint -Checkpoint $stableCheckpoint -ExpectedVersion $expectedV2 `
+            -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
+            -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+        Assert-ExpectedHostState -Checkpoint $stableCheckpoint -KnownMenuSha256 $knownMenuHashes `
+            -RequireQuiescentStopped
+        Assert-UserStateAndCacheInvariant -Checkpoint $stableCheckpoint `
+            -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+        if ((Get-ObjectFingerprint (Get-InstallerCheckpointProjection $stableCheckpoint)) -cne
+            $restoredInstallerFingerprint) {
+            throw 'Final installer-owned registration changed during the quiescence interval.'
+        }
+        if ((Get-ObjectFingerprint $stableCheckpoint.InstallerRegistration) -cne
+            $restoredRegistrationWithLifecycleFingerprint) {
+            throw 'Final lifecycle sequence/token changed during the quiescence interval.'
+        }
+        if ((Get-ShellExplorerPid) -ne $cleanStart.ExplorerPid) {
+            throw 'Explorer PID changed somewhere in the lifecycle matrix.'
+        }
+        Register-OwnedAggregate -Aggregate $stableCheckpoint.Aggregate -Kind FinalInstalled `
+            -Label 'final-v2-after-quiescence-interval' -Validation $stableCheckpoint | Out-Null
     }
-    if ((Get-ShellExplorerPid) -ne $cleanStart.ExplorerPid) {
-        throw 'Explorer PID changed somewhere in the lifecycle matrix.'
-    }
-    Register-OwnedAggregate -Aggregate $stableCheckpoint.Aggregate -Kind FinalInstalled `
-        -Label 'final-v2-after-quiescence-interval' -Validation $stableCheckpoint | Out-Null
+    finally { Release-ProductMutationLocks $stabilityLease }
     $script:evidence.FinalStability = [ordered]@{
         VerificationMilliseconds = $finalQuiescenceVerificationMilliseconds
         PreloadDebounceMilliseconds = $preloadDebounceMilliseconds
@@ -2997,6 +3421,10 @@ try {
     $completedSuccessfully = $true
 }
 catch {
+    # A validation failure after a child returned must never retain locks into
+    # recovery. The unregistered post-state remains deliberately unowned, so
+    # recovery cannot uninstall or restore over a superseding operation.
+    Release-PendingProductMutationLocks
     $failure = $_
     if ($null -ne $script:evidence) {
         $script:evidence.Failure = [ordered]@{
@@ -3010,6 +3438,7 @@ catch {
 }
 finally {
     try {
+        Release-PendingProductMutationLocks
         if (-not $completedSuccessfully -and $setupExecutionStarted -and $null -ne $script:evidence) {
             $recovery = [ordered]@{
                 StartedUtc = [DateTime]::UtcNow.ToString('o')
@@ -3050,7 +3479,7 @@ finally {
                     $installerClean = Test-InstallerOwnedCleanSnapshot -Snapshot $current.Snapshot
                     $exactPending = Test-ExactPendingCleanupSnapshot -Snapshot $current.Snapshot `
                         -ExpectedSha256 $script:expectedCleanupHash
-                    $knownInstalled = $null -ne $owned -and $owned.Kind -in @('InstalledV1', 'InstalledV2', 'FinalInstalled') -and
+                    $knownInstalled = $null -ne $owned -and $owned.Kind -in @('InstalledV2', 'FinalInstalled') -and
                         $null -ne $owned.Validation
                     $knownUninstalled = $null -ne $owned -and $owned.Kind -in @('UninstalledPending', 'UninstalledQuiescent')
                     $knownRestorableClean = $null -ne $owned -and
@@ -3102,17 +3531,21 @@ finally {
                     'UninstallKnownOwned' {
                         try {
                             $script:lastOwnedAggregate = $owned
-                            $recovery.SetupUninstall = Invoke-CapturedProcess `
-                                -Label 'failure-recovery-uninstall-v2' -FilePath $v2Identity.Path `
-                                -Arguments @('--uninstall', '--silent') -ExpectedSha256 $v2Identity.Sha256 `
-                                -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
-                            Assert-ProcessSucceededWithoutExplorerRestart $recovery.SetupUninstall
+                            $recovery.SetupUninstall = Invoke-RecordedSetupStep `
+                                -Label 'failure-recovery-uninstall-v2' -SetupIdentity $v2Identity `
+                                -Arguments @('--uninstall', '--silent') -StateChanging
                             $recovery.MutationPerformed = $true
                             $recovery.UninstalledCheckpoint = Get-ProductCheckpoint `
                                 -Label 'failure-recovery-uninstalled'
-                            $allowedSlots = @($v1Slot, $v2Slot) | Where-Object { $_ }
+                            $allowedSlots = @($v2Slot) | Where-Object { $_ }
                             Assert-UninstalledCheckpoint -Checkpoint $recovery.UninstalledCheckpoint `
                                 -AllowedSlotPaths $allowedSlots
+                            $recoveryKind = if ($recovery.UninstalledCheckpoint.CleanupRunOnce.Present) {
+                                'UninstalledPending'
+                            } else { 'UninstalledQuiescent' }
+                            Register-OwnedAggregate -Aggregate $recovery.UninstalledCheckpoint.Aggregate `
+                                -Kind $recoveryKind -Label 'failure-recovery-uninstalled' `
+                                -Validation $recovery.UninstalledCheckpoint | Out-Null
                             $canRestoreOriginalState = $true
                             $restoreAggregate = $recovery.UninstalledCheckpoint.Aggregate
                             if ($recovery.UninstalledCheckpoint.CleanupRunOnce.Present) {
@@ -3150,6 +3583,7 @@ finally {
         try { Write-Evidence } catch {}
     }
     finally {
+        Release-PendingProductMutationLocks
         Release-LifecycleMutex
     }
 }

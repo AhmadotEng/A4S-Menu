@@ -4,9 +4,10 @@ Validates the destructive lifecycle harness contract without executing it.
 
 .DESCRIPTION
 This gate parses Test-A4SInstallerLifecycle.ps1 as data, executes selected
-read-only/pure functions extracted from its AST, and inspects setup source. It
-never dot-sources the harness, launches a binary, writes registry/product state,
-or touches the staged/live A4S product.
+functions extracted from its AST, and inspects setup source. It never
+dot-sources the harness, launches a binary, or touches staged/live A4S product
+state. Its one write test uses a cryptographically unique HKCU registry sandbox,
+injects every production-backend mutation failure, and restores absence.
 #>
 [CmdletBinding()]
 param()
@@ -222,8 +223,36 @@ Assert-Contract ((Invoke-RecoveryModel $false $false $false $true $false) -ceq
 Assert-Contract ((Invoke-RecoveryModel $false $false $false $false $false) -ceq
     'RetainUnknownNoMutation') 'unknown state is not retained without mutation'
 
-# Execute the real SID naming seam and require both harness and product leases
-# to be Global/current-user scoped. The contract does not acquire either mutex.
+# Execute the exact lifecycle sequence/token proof. An ABA/superseding write is
+# represented by an advanced high-water value with the old LastOperation.
+foreach ($functionName in @('Get-LifecycleOperationRecord',
+        'Assert-ExactQualificationOperation')) {
+    . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
+}
+$operationToken = 'A' * 64
+$operationAggregate = [ordered]@{ Snapshot = [ordered]@{
+    InstallerRegistration = [ordered]@{
+        ServicingSequence = [ordered]@{ Present = $true; Kind = 'QWord'; Data = '7' }
+        LastOperation = [ordered]@{
+            Present = $true; Kind = 'String'; Data = ('00000000000000000007:' + $operationToken)
+        }
+    }
+} }
+Assert-ExactQualificationOperation -Aggregate $operationAggregate `
+    -ExpectedSequence 7 -ExpectedToken $operationToken -Label 'contract-valid' | Out-Null
+Assert-ThrowsContract {
+    Assert-ExactQualificationOperation -Aggregate $operationAggregate `
+        -ExpectedSequence 7 -ExpectedToken ('B' * 64) -Label 'contract-token-mismatch'
+} 'qualification proof accepted the wrong operation token'
+$operationAggregate.Snapshot.InstallerRegistration.ServicingSequence.Data = '8'
+Assert-ThrowsContract {
+    Assert-ExactQualificationOperation -Aggregate $operationAggregate `
+        -ExpectedSequence 7 -ExpectedToken $operationToken -Label 'contract-ABA'
+} 'qualification proof accepted an advanced sequence with stale LastOperation'
+
+# Execute the real SID naming seam and require a separate harness lease plus
+# both native product locks to be Global/current-user scoped. The contract does
+# not acquire any mutex.
 foreach ($functionName in @('Get-CurrentUserSidHashSuffix', 'Get-LifecycleMutexNames')) {
     . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
 }
@@ -234,24 +263,28 @@ foreach ($marker in @('.GetBinaryForm($bytes, 0)',
         "harness SID hash is incompatible with native setup: missing '$marker'"
 }
 foreach ($marker in @('GetLengthSid(tokenUser->User.Sid)',
-        'static_cast<const std::uint8_t *>(tokenUser->User.Sid), sidBytes',
+        'ConvertSidToStringSidW', 'HashBytes(CurrentUserSidBytes())',
         'Hex(identity).substr(0, 32)')) {
     Assert-ContainsOrdinal $setupSource $marker `
         "native setup SID hash is incompatible with harness coordination: missing '$marker'"
 }
 $mutexNames = Get-LifecycleMutexNames
-Assert-Contract ([string]$mutexNames.Lifecycle -cmatch
+Assert-Contract ([string]$mutexNames.Harness -cmatch
     '^Global\\A4SMenu\.LifecycleQualification\.v1\.[0-9A-F]{32}$') `
-    'lifecycle lease is not Global and SID scoped'
+    'harness lifecycle lease is not Global and SID scoped'
+Assert-Contract ([string]$mutexNames.ProductLifecycle -cmatch
+    '^Global\\A4SMenu\.Lifecycle\.v1\.S-\d(-\d+)+$') `
+    'product lifecycle coordination name is not the exact Global raw-SID scope'
 Assert-Contract ([string]$mutexNames.ProductSetup -cmatch
     '^Global\\A4SMenu\.Setup\.v1\.[0-9A-F]{32}$') `
     'product setup coordination name is not the exact Global SID scope'
 Assert-ContainsOrdinal $setupSource 'kSetupMutexPrefix[] = L"Global\\A4SMenu.Setup.v1."' `
     'native setup mutex prefix does not match the harness product-coordination name'
+Assert-ContainsOrdinal $setupSource 'kLifecycleMutexPrefix[] = L"Global\\A4SMenu.Lifecycle.v1."' `
+    'native lifecycle mutex prefix does not match the harness product-coordination name'
 $acquireSource = (Get-FunctionAst -Ast $ast -Name 'Acquire-LifecycleMutex').Extent.Text
-$productProbeSource = (Get-FunctionAst -Ast $ast `
-    -Name 'Assert-ProductSetupCoordinationAvailable').Extent.Text
-foreach ($leaseSource in @($acquireSource, $productProbeSource)) {
+$productAcquireSource = (Get-FunctionAst -Ast $ast -Name 'Acquire-ProductMutationLocks').Extent.Text
+foreach ($leaseSource in @($acquireSource, $productAcquireSource)) {
     Assert-ContainsOrdinal $leaseSource '[Threading.Mutex]::new($false' `
         'coordination lease does not open/create the named mutex explicitly'
     Assert-ContainsOrdinal $leaseSource '.WaitOne(0)' `
@@ -259,6 +292,38 @@ foreach ($leaseSource in @($acquireSource, $productProbeSource)) {
     Assert-ContainsOrdinal $leaseSource 'catch' `
         'coordination lease does not fail closed on ACL/access errors'
 }
+Assert-OrderedMarkers $productAcquireSource @(
+    '$lifecycle = [Threading.Mutex]::new', '$lifecycle.WaitOne(0)',
+    '$setup = [Threading.Mutex]::new', '$setup.WaitOne(0)') `
+    'fixed Lifecycle-then-Setup lock acquisition order'
+foreach ($marker in @(
+        'constexpr wchar_t kLifecycleKey[] = L"Software\\A4SMenuLifecycle"',
+        'constexpr wchar_t kServicingSequenceValue[] = L"ServicingSequence"',
+        'constexpr wchar_t kLastOperationValue[] = L"LastOperation"',
+        '{ kLifecycleKey, kLastOperationValue }',
+        'SetQword(key.get(), kServicingSequenceValue, identity.sequence)',
+        'SetString(key.get(), kLastOperationValue, FormatOperationIdentity(identity))',
+        'IsSwitch(argument, L"--qualification-operation-token")')) {
+    Assert-ContainsOrdinal $setupSource $marker "native lifecycle identity contract omits '$marker'"
+}
+$journalSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'ServicingJournal BeginJournal(' -EndMarker 'void MarkJournalReady()'
+Assert-OrderedMarkers $journalSource @(
+    'journal.previous = CaptureRegistration()',
+    'journal.operationSequence = identity.sequence',
+    'journal.operationToken = identity.token',
+    'SetQword(key.get(), L"OperationSequence", identity.sequence)',
+    'SetString(key.get(), L"OperationToken", identity.token)',
+    'SetDword(key.get(), L"SnapshotComplete", 1)',
+    'RegFlushKey(key.get())') 'journaled sequence/token transaction'
+$nativeMainSource = $setupSource.Substring($setupSource.IndexOf('int WINAPI wWinMain('))
+Assert-OrderedMarkers $nativeMainSource @(
+    'const ProductLocks productLocks = AcquireProductLocks()',
+    'ReconcilePendingJournal()',
+    'AllocateOperationIdentity(options.qualificationToken)',
+    'InstallOrRepair(instance, options, identity)',
+    'Uninstall(instance, options, identity)',
+    'Rollback(options, identity)') 'normal CLI product-lock and operation identity flow'
 
 # One mutex spans clean preflight, every launch/evidence write, classification,
 # recovery, and final evidence. Release occurs only in the outermost finally.
@@ -285,14 +350,9 @@ $releaseCalls = @($ast.FindAll({
 }, $true))
 Assert-Contract ($acquireCalls.Count -eq 1 -and $releaseCalls.Count -eq 1) `
     'lifecycle mutex must have one acquire and one release call site'
-$lastOwnedSource = (Get-FunctionAst -Ast $ast `
-    -Name 'Assert-LastOwnedAggregateImmediatelyBeforeSetup').Extent.Text
-Assert-OrderedMarkers $lastOwnedSource @('Assert-ProductSetupCoordinationAvailable',
-    'Assert-AggregateFingerprintImmediatelyBeforeMutation') `
-    'native product mutex preflight must precede the final stable ownership aggregate'
-
-# External process creation is centralized. For setup paths, the immediately
-# preceding command is the last-owned aggregate check.
+# External process creation is centralized. State-changing setup orchestration
+# owns both locks for pre-CAS, releases both only for the child, reacquires both,
+# and proves the exact sequence/token before its result can be registered.
 $startCommands = @($ast.FindAll({
     param($node) $node -is [Management.Automation.Language.CommandAst] -and
         $node.GetCommandName() -ieq 'Start-Process'
@@ -302,17 +362,42 @@ $invokeFunction = Get-FunctionAst -Ast $ast -Name 'Invoke-CapturedProcess'
 $startOffset = $startCommands[0].Extent.StartOffset
 Assert-Contract ($startOffset -ge $invokeFunction.Extent.StartOffset -and
     $startOffset -le $invokeFunction.Extent.EndOffset) 'Start-Process escaped Invoke-CapturedProcess'
-$invokeCommands = @($invokeFunction.FindAll({
-    param($node) $node -is [Management.Automation.Language.CommandAst]
-}, $true) | Sort-Object { $_.Extent.StartOffset })
-$startIndex = [Array]::IndexOf($invokeCommands, $startCommands[0])
-Assert-Contract ($startIndex -gt 0 -and
-    $invokeCommands[$startIndex - 1].GetCommandName() -ceq
-        'Assert-LastOwnedAggregateImmediatelyBeforeSetup') `
-    'last-owned aggregate check is not the final command before Start-Process'
 $recordedSetupSource = (Get-FunctionAst -Ast $ast -Name 'Invoke-RecordedSetupStep').Extent.Text
-Assert-OrderedMarkers $recordedSetupSource @('Invoke-CapturedProcess', '-SetupLaunch') `
-    'recorded setup launch ownership guard'
+Assert-OrderedMarkers $recordedSetupSource @(
+    '$lease = Acquire-ProductMutationLocks',
+    'Assert-LastOwnedAggregateImmediatelyBeforeSetup',
+    'New-QualificationOperationToken',
+    'Release-ProductMutationLocks $lease',
+    'Invoke-CapturedProcess',
+    '$lease = Acquire-ProductMutationLocks',
+    'Assert-ExactQualificationOperation',
+    '$script:pendingProductLocks = $lease') `
+    'cooperative setup lock/token handoff and locked acceptance'
+$registerSource = (Get-FunctionAst -Ast $ast -Name 'Register-OwnedAggregate').Extent.Text
+Assert-OrderedMarkers $registerSource @('Get-StableLifecycleAggregate',
+    'Assert-ExactQualificationOperation', '$script:ownedAggregateLedger.Add',
+    'Release-PendingProductMutationLocks') 'lock-held ownership registration CAS'
+foreach ($forbiddenLegacyMutation in @("-Label 'install-v1-silent'",
+        "-Label 'upgrade-v1-to-v2-silent'", "-Label 'rollback-v2-to-v1-silent'")) {
+    Assert-Contract ($mainSource.IndexOf($forbiddenLegacyMutation,
+            [StringComparison]::Ordinal) -lt 0) `
+        "current-profile harness retained legacy state mutation $forbiddenLegacyMutation"
+}
+Assert-Contract ($mainSource.IndexOf('InstalledV1', [StringComparison]::Ordinal) -lt 0) `
+    'current-profile ownership/recovery model retained a legacy V1 installed-state path'
+foreach ($currentMutation in @("-Label 'install-v2-silent'",
+        "-Label 'repair-v2-same-version-silent'", "-Label 'uninstall-v2-silent'",
+        "-Label 'final-install-v2-silent'")) {
+    $offset = $mainSource.IndexOf($currentMutation, [StringComparison]::Ordinal)
+    Assert-Contract ($offset -ge 0) "current V2 mutation is missing: $currentMutation"
+    $following = $mainSource.Substring($offset, [Math]::Min(300, $mainSource.Length - $offset))
+    Assert-Contract ($following.IndexOf('-StateChanging', [StringComparison]::Ordinal) -ge 0) `
+        "current V2 mutation is not token-qualified: $currentMutation"
+}
+foreach ($marker in @('DeferredToDisposableProfile',
+        'Frozen V1 cannot participate in lifecycle token/sequence ownership')) {
+    Assert-ContainsOrdinal $mainSource $marker "legacy disposable-profile deferral omits '$marker'"
+}
 
 # Recovery re-reads and hashes the immutable manifest before taking a stable
 # aggregate. Only the modeled known-owned branch may launch uninstall.
@@ -329,7 +414,7 @@ Assert-OrderedMarkers $recoverySource @(
     "'WaitPendingNoUninstall'",
     "'UninstallKnownOwned'",
     "-Label 'failure-recovery-uninstall-v2'",
-    '-SetupLaunch',
+    '-StateChanging',
     'Assert-UninstalledCheckpoint',
     'Release-LifecycleMutex') 'manifest-first, owned-only recovery flow'
 $knownCase = $recoverySource.IndexOf("'UninstallKnownOwned'", [StringComparison]::Ordinal)
@@ -383,11 +468,15 @@ foreach ($marker in @("@('Config', 'Menu', 'Legacy')", 'HostSafety',
 }
 
 # Execute the real registry snapshot schema/merge/equality seams with valid and
-# adversarial in-memory states. No registry restore function is invoked.
+# adversarial in-memory states, then exercise the same production restoration
+# backend against one unique, bounded HKCU sandbox.
 foreach ($functionName in @('Get-NamedMemberValue', 'Get-ObjectFingerprint',
-        'ConvertFrom-EncodedRegistryData', 'Get-ObjectFieldNames',
+        'ConvertTo-EncodedRegistryValue', 'Add-RegistryTreeNodes',
+        'Get-RegistryTreeSnapshot', 'ConvertFrom-EncodedRegistryData', 'Get-ObjectFieldNames',
         'Assert-ExactObjectFields', 'Assert-ValidRegistryTreeSnapshot',
-        'Test-RegistryTreeSnapshotsEqual', 'New-MergedInstalledStateSnapshot')) {
+        'Test-RegistryTreeSnapshotsEqual', 'Invoke-RegistryMutationCheckpoint',
+        'Apply-ValidatedRegistryTreeSnapshot', 'Restore-RegistryTreeSnapshot',
+        'Invoke-RegistryRestoreBackendSelfTest', 'New-MergedInstalledStateSnapshot')) {
     . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
 }
 $stateSubKey = 'Software\A4SContractOfflineOnly'
@@ -466,8 +555,8 @@ Assert-OrderedMarkers $restoreTreeSource @(
     'Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot',
     'catch',
     '-Snapshot $immediatePreState') 'transactional registry validate/no-op/apply/rollback order'
-Assert-Contract ([regex]::Matches($source, 'DeleteSubKeyTree\(').Count -eq 1) `
-    'registry deletion escaped the sole validated apply primitive'
+Assert-Contract ([regex]::Matches($source, 'DeleteSubKeyTree\(').Count -eq 2) `
+    'registry deletion escaped production apply plus the bounded self-test fallback'
 Assert-Contract ([regex]::Matches($source,
     'Apply-ValidatedRegistryTreeSnapshot').Count -eq 3) `
     'validated registry apply primitive has a caller outside target apply/rollback'
@@ -478,6 +567,12 @@ Assert-ContainsOrdinal $applyTreeSource 'DeleteSubKeyTree($ExpectedSubKey, $fals
 Assert-Contract ($source.IndexOf('function Restore-RegistryValueSnapshot',
         [StringComparison]::Ordinal) -lt 0) `
     'legacy per-value destructive restoration remains'
+$registryBackendTest = Invoke-RegistryRestoreBackendSelfTest
+Assert-Contract ([bool]$registryBackendTest.Passed -and
+    [int]$registryBackendTest.MutationStepsTested -gt 0 -and
+    [string]$registryBackendTest.Sandbox -match
+        '^Software\\A4SMenu\\Tests\\RegistryRestore\\[0-9A-F]{32}$') `
+    'production registry restoration backend no-op/success/failure rollback test failed'
 
 # Execute the installed-process ownership model. Exact active-host records may
 # be empty or one matching process; Setup/Cleanup/duplicates/wrong sessions fail.
@@ -511,8 +606,8 @@ Assert-Contract (-not (Test-ExactInstalledProcessSet @($wrongSession) @($hostPro
     $hostIdentity $session)) 'installed process model accepted a wrong-session host'
 
 Assert-OrderedMarkers $mainSource @(
-    "-Label 'install-v1-silent'", "-Label 'upgrade-v1-to-v2-silent'",
-    "-Label 'rollback-v2-to-v1-silent'", "-Label 'upgrade-v1-to-v2-again-silent'",
+    "-Label 'preflight-v1-verify'", "-Label 'preflight-v2-verify'",
+    "-Label 'install-v2-silent'",
     "-Label 'repair-v2-same-version-silent'", "-Label 'uninstall-v2-silent'",
     "-Label 'final-install-v2-silent'", 'Wait-ForInstalledCleanupCancellation',
     'Stop-FinalHostQuiescent', 'Restore-UserStateProjection',
@@ -531,7 +626,7 @@ Assert-OrderedMarkers $finalInstallSection @(
     'Register-OwnedAggregate') `
     'pre-restoration final-install user/cache validation'
 Assert-Contract ([regex]::Matches($mainSource,
-    'Register-OwnedAggregate[\s\S]{0,240}?Write-Evidence').Count -ge 10) `
+    'Register-OwnedAggregate[\s\S]{0,240}?Write-Evidence').Count -ge 9) `
     'validated states are not registered before fallible evidence writes'
 
 # Setup must cancel a stale helper without deleting the reinstalled product,
@@ -568,7 +663,7 @@ Assert-OrderedMarkers $cleanupSource @(
     'FullPath(CleanupHelperPath())',
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
-    'AcquireSetupMutex()',
+    'AcquireProductLocks()',
     'ServicingRecoveryStateAllowsReconcile()',
     'ReconcilePendingJournal()',
     'ReadRawValue(recovery).present',
@@ -591,7 +686,7 @@ Assert-OrderedMarkers $installSource @(
     'mapped.validatedSlots.size() == 1U',
     'previous = mapped.validatedSlots.front()',
     'BeginJournal(',
-    'PrepareSlotRegistration(newSlot, previous)',
+    'PrepareSlotRegistration(newSlot, previous, identity)',
     'CompleteJournal(journal)',
     'PruneObsoleteSlotsBestEffort') 'mapped rollback-slot retention'
 $moduleInspectionSource = Get-SourceSection -Text $setupSource `

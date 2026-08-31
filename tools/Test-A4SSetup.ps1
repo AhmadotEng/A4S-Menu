@@ -224,7 +224,13 @@ $setupSource = [IO.File]::ReadAllText($setupSourcePath)
 
 foreach ($requiredMarker in @(
     'kSetupMutexPrefix',
-    'AcquireSetupMutex()',
+    'kLifecycleMutexPrefix',
+    'AcquireProductLocks()',
+    'kLifecycleKey',
+    'kServicingSequenceValue',
+    'kLastOperationValue',
+    'AllocateOperationIdentity(',
+    'CommitOperationIdentity(',
     'kServicingKey',
     'kRecoveryRunOnceValue',
     'QueueJournalRecovery(recoveryCommand)',
@@ -256,7 +262,7 @@ Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSou
     'BeginJournal(',
     'QueueJournalRecovery(recoveryCommand)',
     'StopHost()',
-    'PrepareSlotRegistration(newSlot, previous)',
+    'PrepareSlotRegistration(newSlot, previous, identity)',
     'MarkJournalReady()',
     'CommitSlotStartup(newSlot)',
     'CompleteJournal(journal)')
@@ -270,7 +276,7 @@ Assert-SourceOrder -Description 'Uninstall transaction' -Source $uninstallSource
     'BeginJournal(',
     'PrepareCleanup(payloads)',
     'StopHost()',
-    'PrepareUnregisterProduct()',
+    'PrepareUnregisterProduct(identity)',
     'MarkJournalReady()',
     'CommitUnregisteredStartup()',
     'CompleteJournal(journal)',
@@ -281,7 +287,7 @@ Assert-SourceOrder -Description 'Deferred cleanup cancellation' -Source $cleanup
     'FullPath(CleanupHelperPath())',
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
-    'AcquireSetupMutex()',
+    'AcquireProductLocks()',
     'ServicingRecoveryStateAllowsReconcile()',
     'ReconcilePendingJournal()',
     'ReadRawValue(recovery).present',
@@ -344,6 +350,13 @@ Assert-SourceOrder -Description 'Explicit HostSafety reset parsing' -Source $par
     'IsSwitch(argument, L"--repair")',
     'options.resetSafety = true',
     'IsSwitch(argument, L"--update")')
+foreach ($requiredMarker in @('IsSwitch(argument, L"--qualification-operation-token")',
+        'options.qualificationToken.size() != 64U',
+        '!IsUpperHex(options.qualificationToken)')) {
+    if ($parseSource.IndexOf($requiredMarker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Hidden qualification-token parsing contract is missing '$requiredMarker'."
+    }
+}
 if ($parseSource.IndexOf('IsSwitch(argument, L"--update") && SelectOperation(options, Operation::Repair)) {}',
         [StringComparison]::Ordinal) -lt 0) {
     throw '--update no longer selects repair behavior without resetting HostSafety.'
