@@ -13,6 +13,7 @@
 #define A4S_HOST_MUTEX_PREFIX_W               L"Local\\A4SMenu.Host.Instance.v1"
 #define A4S_HOST_ATTEMPT_COOKIE_PROPERTY_W    L"A4SMenu.Host.AttemptCookie.v1"
 #define A4S_HOST_SAFETY_REGISTRY_W            L"Software\\A4SMenu\\HostSafety"
+#define A4S_HOST_SAFETY_MUTEX_PREFIX_W        L"Global\\A4SMenu.HostSafety.v1."
 
 #define A4S_HOST_CONTROL_MESSAGE_W            L"A4SMenu.Host.Control.v1"
 #define A4S_DLL_BOOTSTRAP_MESSAGE_W            L"A4SMenu.Dll.Bootstrap.v1"

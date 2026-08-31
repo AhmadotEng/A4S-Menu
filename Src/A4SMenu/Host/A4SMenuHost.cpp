@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <shellapi.h>
+#include <sddl.h>
 #include <wtsapi32.h>
 
 #include <algorithm>
@@ -201,11 +202,68 @@ namespace
 		return value.QuadPart;
 	}
 
+	class SafetyMutationLock
+	{
+	public:
+		bool acquire()
+		{
+			HANDLE token = nullptr;
+			if (!OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&token))
+				return false;
+			UniqueHandle tokenHandle(token);
+			DWORD bytes = 0;
+			GetTokenInformation(tokenHandle.get(),TokenUser,nullptr,0,&bytes);
+			if (!bytes || GetLastError()!=ERROR_INSUFFICIENT_BUFFER)
+				return false;
+			std::vector<BYTE> storage(bytes);
+			if (!GetTokenInformation(tokenHandle.get(),TokenUser,storage.data(),bytes,&bytes))
+				return false;
+			const auto *user=reinterpret_cast<const TOKEN_USER*>(storage.data());
+			if (!IsValidSid(user->User.Sid))
+				return false;
+			LPWSTR sidText=nullptr;
+			if (!ConvertSidToStringSidW(user->User.Sid,&sidText) || !sidText)
+				return false;
+			std::wstring name=A4S_HOST_SAFETY_MUTEX_PREFIX_W;
+			name+=sidText;
+			LocalFree(sidText);
+			m_mutex.reset(CreateMutexW(nullptr,FALSE,name.c_str()));
+			if (!m_mutex)
+				return false;
+			const DWORD wait=WaitForSingleObject(m_mutex.get(),2000);
+			m_owned=wait==WAIT_OBJECT_0 || wait==WAIT_ABANDONED;
+			return m_owned;
+		}
+
+		~SafetyMutationLock()
+		{
+			if (m_owned)
+				ReleaseMutex(m_mutex.get());
+		}
+
+		SafetyMutationLock()=default;
+		SafetyMutationLock(const SafetyMutationLock&)=delete;
+		SafetyMutationLock& operator=(const SafetyMutationLock&)=delete;
+
+	private:
+		UniqueHandle m_mutex;
+		bool m_owned=false;
+	};
+
 	void LoadSafetyState()
 	{
 		g_runtime.safetyDisabled = false;
 		g_runtime.abnormalExplorerExitTimes.fill(0);
 		g_runtime.abnormalExplorerExitCount = 0;
+		SafetyMutationLock mutationLock;
+		if (!mutationLock.acquire())
+		{
+			// Fail closed: an unreadable or concurrently owned crash guard must
+			// never cause a second injector to bypass the native-Start fallback.
+			g_runtime.safetyDisabled=true;
+			DebugLog(L"could not serialize HostSafety state loading; injection remains disabled");
+			return;
+		}
 		HKEY key = nullptr;
 		if (RegOpenKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)
 			return;
@@ -259,6 +317,9 @@ namespace
 
 	bool PersistSafetyState(DWORD lastExitCode)
 	{
+		SafetyMutationLock mutationLock;
+		if (!mutationLock.acquire())
+			return false;
 		HKEY key = nullptr;
 		DWORD disposition = 0;
 		if (RegCreateKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,nullptr,0,
@@ -286,6 +347,9 @@ namespace
 
 	bool ResetSafetyState()
 	{
+		SafetyMutationLock mutationLock;
+		if (!mutationLock.acquire())
+			return false;
 		const LONG result=RegDeleteTreeW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W);
 		if (result!=ERROR_SUCCESS && result!=ERROR_FILE_NOT_FOUND && result!=ERROR_PATH_NOT_FOUND)
 			return false;

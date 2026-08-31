@@ -6,9 +6,11 @@ $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $dllPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\StartMenuDLL.cpp'
 $containerPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\MenuContainer.cpp'
 $hostPath = Join-Path $repoRoot 'Src\A4SMenu\Host\A4SMenuHost.cpp'
+$identityPath = Join-Path $repoRoot 'Src\A4SMenu\Shared\A4SProductIdentity.h'
 $dllSource = Get-Content -LiteralPath $dllPath -Raw
 $containerSource = Get-Content -LiteralPath $containerPath -Raw
 $hostSource = Get-Content -LiteralPath $hostPath -Raw
+$identitySource = Get-Content -LiteralPath $identityPath -Raw
 
 function Assert-Match {
     param(
@@ -120,6 +122,21 @@ Assert-Match $hostSource '!g_runtime\.sessionEnding\s*&&\s*!g_runtime\.authentic
     'Crash suppression is not limited to session ending or authenticated DISARMED state.'
 Assert-Match $hostSource 'attemptedActivation\s*&&\s*exitCode!=ERROR_SUCCESS\s*&&\s*!g_runtime\.sessionEnding\s*&&\s*!g_runtime\.authenticatedDisarmed' `
     'A nonzero pre-DISARMED Explorer exit is no longer counted.'
+Assert-Match $identitySource 'A4S_HOST_SAFETY_MUTEX_PREFIX_W\s+L"Global\\\\A4SMenu\.HostSafety\.v1\."' `
+    'The cross-session HostSafety mutation mutex identity is missing.'
+foreach ($pattern in @(
+    'class SafetyMutationLock',
+    'ConvertSidToStringSidW',
+    'A4S_HOST_SAFETY_MUTEX_PREFIX_W',
+    'CreateMutexW\(nullptr,FALSE,name\.c_str\(\)\)',
+    'WaitForSingleObject\(m_mutex\.get\(\),2000\)',
+    'void LoadSafetyState\(\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)',
+    'bool PersistSafetyState\(DWORD lastExitCode\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)',
+    'bool ResetSafetyState\(\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)'
+)) {
+    Assert-Match $hostSource $pattern `
+        'A HostSafety read/write/reset path escaped cross-session serialization.'
+}
 
 # Independent executable model for the rolling-window edge that a window
 # anchored to the first failure gets wrong.
