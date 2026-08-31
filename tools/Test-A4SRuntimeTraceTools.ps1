@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch]$SkipStagedBinaryIdentitySmokeTest)
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
@@ -42,9 +42,15 @@ Assert-A4S ($captureText -match 'if \(-not \$AllowMenuAutomation\)') 'capture ga
 Assert-A4S ($captureText -notmatch '(?i)Start-Process|Stop-Process|Restart-Computer|Stop-Computer|--rehook|--reset-safety|Invoke-WebRequest|Invoke-RestMethod') 'capture tool contains a forbidden process, injection, restart, or network primitive'
 Assert-A4S ($captureText -notmatch 'VisibleMenuWindows\(0\)') 'capture cleanup can inspect or toggle based on a menu from an unvalidated process'
 Assert-A4S ($captureText -match 'LoadedImageIdentity' -and $captureText -match 'FileImageIdentity') 'capture preflight does not compare resident and staged PE build identities'
-Assert-A4S ($captureText -match 'ExpectedCycleCount\s*=\s*\$CapturedCycles') 'capture does not bind report completeness to the requested cycle count'
+Assert-A4S ($captureText -match 'ExpectedCycleCount\s*=\s*\$\(if\s*\(\$ManualInteractionSeconds -gt 0\)\s*\{\s*0\s*\}\s*else\s*\{\s*\$CapturedCycles\s*\}\)') 'automated capture does not bind report completeness to the requested cycle count'
 Assert-A4S ($captureText -match '\$sessionCreateAttempted\s*=\s*\$true[\s\S]+Invoke-A4SLogman -Arguments \$startArguments') 'ETW create attempts are not armed for unconditional cleanup before logman runs'
 Assert-A4S ($captureText -match 'Invoke-A4SLogman -Arguments @\(''stop'', \$sessionName, ''-ets''\)') 'ETW session teardown is missing'
+Assert-A4S ($captureText -match 'Write-A4SJsonAtomicallyReplacing' -and $captureText -match 'observerLogonId') 'capture metadata is not durably persisted and logon-bound'
+Assert-A4S ($captureText -match 'ManualInteractionSeconds' -and
+    $captureText -match '\$ManualInteractionSeconds -gt 0 -and \$EnforceTargets' -and
+    $captureText -match 'Open All Programs') 'manual Programs/search phase capture is missing or can be mislabeled as an enforced target trace'
+$coreText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'A4SRuntimeTrace.Core.psm1') -Raw
+Assert-A4S ($coreText -match 'p95UnroundedMilliseconds' -and $coreText -match '1000\.0 / \$RefreshRateHz') 'one-frame target math rounds away sub-millisecond precision'
 
 $captureTokens = $null
 $captureParseErrors = $null
@@ -61,12 +67,14 @@ if (-not ('A4SRuntimeTraceNative' -as [type])) {
 }
 Assert-A4S ($null -ne ('A4SRuntimeTraceNative' -as [type])) 'embedded native interop source did not compile'
 
-$stagedProduct = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\build\stage\A4SProduct'))
-foreach ($stagedName in @('A4SMenuHost.exe', 'A4SMenu.dll')) {
-    $stagedPath = Join-Path $stagedProduct $stagedName
-    if (Test-Path -LiteralPath $stagedPath -PathType Leaf) {
-        $identity = [A4SRuntimeTraceNative]::FileImageIdentity($stagedPath)
-        Assert-A4S ($identity -match '^timestamp=[0-9a-f]{8};size=[0-9a-f]{8};checksum=[0-9a-f]{8};rsds=[0-9a-f]{32};age=[1-9][0-9]*$') "$stagedName has no strong parseable PE/RSDS identity"
+if (-not $SkipStagedBinaryIdentitySmokeTest) {
+    $stagedProduct = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..\build\stage\A4SProduct'))
+    foreach ($stagedName in @('A4SMenuHost.exe', 'A4SMenu.dll')) {
+        $stagedPath = Join-Path $stagedProduct $stagedName
+        if (Test-Path -LiteralPath $stagedPath -PathType Leaf) {
+            $identity = [A4SRuntimeTraceNative]::FileImageIdentity($stagedPath)
+            Assert-A4S ($identity -match '^timestamp=[0-9a-f]{8};size=[0-9a-f]{8};checksum=[0-9a-f]{8};rsds=[0-9a-f]{32};age=[1-9][0-9]*$') "$stagedName has no strong parseable PE/RSDS identity"
+        }
     }
 }
 
@@ -161,6 +169,47 @@ try {
     Assert-A4S ($report.statistics.phases.backdropPrepare.count -eq 1) 'nested phase duration was not reported'
     Assert-A4S ($report.statistics.paintRectangles.count -eq 2) 'paint rectangle events were not counted'
     Assert-A4S ($report.statistics.paintRectangles.totalPixels -eq 300 -and $report.statistics.paintRectangles.maximumPixels -eq 200) 'paint rectangle pixel totals are wrong'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals([string]$report.source.sha256,
+        (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash)) 'synthetic source hash is not bound to the parsed report'
+    $overwriteRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+            -ExpectedProcessId 4242 -ColdSampleCount 1 -ExpectedCycleCount 3 `
+            -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60 -OutputPath $outputPath)
+    } catch { if ($_.Exception.Message -match 'already exists') { $overwriteRejected = $true } }
+    Assert-A4S $overwriteRejected 'derived qualification report was silently overwritten without -Force'
+    [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+        -ExpectedProcessId 4242 -ColdSampleCount 1 -ExpectedCycleCount 3 `
+        -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60 `
+        -OutputPath $outputPath -Force)
+    $forcedReport = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+    Assert-A4S ($forcedReport.counts.cycles -eq 3) 'atomic -Force report replacement produced invalid JSON'
+    Assert-A4S (@(Get-ChildItem -LiteralPath $tempRoot -Filter 'report.json.backup-*').Count -eq 0) 'atomic -Force report replacement leaked a backup artifact'
+
+    $frameEvents = [Collections.Generic.List[object]]::new()
+    function Add-FrameEvent([double]$ms, [int]$eventId, [int]$stageId, [uint64]$operation) {
+        [void]$frameEvents.Add([pscustomobject]@{
+            TimestampUtc = $baseTime.AddTicks([int64][Math]::Round($ms * [TimeSpan]::TicksPerMillisecond)).ToString('o'); Event = $eventId
+            Stage = $stageId; Operation = $operation; Value = 0; CacheHit = $false
+            ActivationSource = 1; Window = '0x200'; ProcessId = 4242; ThreadId = 17
+        })
+    }
+    Add-FrameEvent 0 1 0 0
+    Add-FrameEvent 0.1 2 1 500
+    Add-FrameEvent 0.2 7 0 500
+    Add-FrameEvent 0.3 6 0 500
+    Add-FrameEvent 0.4 2 2 500
+    Add-FrameEvent 1 1 0 500
+    Add-FrameEvent 1.1 10 1 501
+    Add-FrameEvent 5.1840 11 0 500
+    Add-FrameEvent 5.3 10 2 501
+    $withinFrame = ConvertTo-A4SRuntimeReport -Events $frameEvents -ExpectedCycleCount 1 `
+        -MinimumWarmSampleCount 1 -MinimumCloseSampleCount 1 -RefreshRateHz 239
+    Assert-A4S ($withinFrame.targetEvaluation.close.status -eq 'pass') 'a 4.1840 ms close did not fit the exact 239 Hz frame budget'
+    $frameEvents[7].TimestampUtc = $baseTime.AddTicks(51842).ToString('o')
+    $outsideFrame = ConvertTo-A4SRuntimeReport -Events $frameEvents -ExpectedCycleCount 1 `
+        -MinimumWarmSampleCount 1 -MinimumCloseSampleCount 1 -RefreshRateHz 239
+    Assert-A4S ($outsideFrame.targetEvaluation.close.status -eq 'fail') 'a 4.1842 ms close passed the exact 239 Hz frame budget after display rounding'
 
     $xmlPath = Join-Path $tempRoot 'tracerpt.xml'
     $settings = [Xml.XmlWriterSettings]::new()
@@ -286,4 +335,4 @@ try {
     }
 }
 
-Write-Output 'PASS: A4S runtime trace scripts parse cleanly, fail closed without automation consent, validate staged PE/RSDS identities when present, decode synthetic tracerpt XML, reject truncated/mixed/ambiguous traces, enforce sample sufficiency, and diagnose incomplete operations without starting or injecting the product.'
+Write-Output "PASS: A4S runtime trace scripts parse cleanly, fail closed without automation consent, $(if($SkipStagedBinaryIdentitySmokeTest){'compile the PE/RSDS identity helper without reading staged binaries'}else{'validate staged PE/RSDS identities when present'}), decode synthetic tracerpt XML, reject truncated/mixed/ambiguous traces, enforce sample sufficiency, and diagnose incomplete operations without starting or injecting the product."

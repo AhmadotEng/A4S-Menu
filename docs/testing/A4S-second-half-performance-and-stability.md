@@ -6,15 +6,19 @@ changes: they never install the product, start or inject the host, restart or
 kill Explorer, change display settings, lock the session, sleep the computer,
 or sign the user out.
 
+See also the [second-half requirement ledger](../architecture/A4S-second-half-requirements.md)
+and the [custom runtime-trace reference](A4S-runtime-trace.md).
+
 ## Safety boundary
 
-`Get-A4SPerformanceSnapshot.ps1` is read-only. The two tools that visibly open
+`Get-A4SPerformanceSnapshot.ps1` is read-only. The three tools that can visibly open
 the menu refuse to run without `-AllowMenuAutomation`, require an already
 resident host in `READY`, and send commands directly to that host. They cannot
 start a missing host and therefore cannot inject Explorer accidentally. Their
 window observations are restricted to `A4SMenu.CMenuContainer` windows owned
 by the taskbar Explorer process, and failure cleanup uses the normal toggle
-path to close a menu that the test opened.
+path to close exactly one menu that the test opened. They refuse an ambiguous
+cleanup toggle if more than one matching Explorer-owned menu is visible.
 
 Environment transitions remain manual:
 
@@ -31,13 +35,21 @@ After each transition, record the resulting state with the scenario tool.
 Immediately after a fresh Explorer start, before launching A4SMenuHost, run:
 
 ```powershell
+$productDirectory = 'C:\Users\Admin\Downloads\StartAllBack-analysis-handoff\Open-Shell-Menu\build\stage\A4SProduct'
+$runId = Get-Date -Format 'yyyyMMdd-HHmmss'
+$baselinePath = ".\build\test-results\A4S-pre-injection-$runId.json"
+
 .\tools\Get-A4SPerformanceSnapshot.ps1 `
     -RequireCleanProductState `
-    -OutputPath .\build\test-results\A4S-pre-injection.json
+    -ProductDirectory $productDirectory `
+    -OutputPath $baselinePath
 ```
 
-The clean-state switch rejects a snapshot if it observes either a mapped
-`A4SMenu.dll` or a resident A4S host at capture time. After starting the exact staged host and
+The clean-state switch rejects a snapshot if Explorer is more than 120 seconds
+old, either selected product binary is missing, or it observes either a mapped
+`A4SMenu.dll` or a resident A4S host at capture time. It revalidates the
+Explorer/taskbar identity, mappings, host absence, and staged hashes at the end
+of capture. After starting the exact staged host and
 waiting for `READY`, supply that file to the performance probe. It requires the
 same Explorer PID, so the memory delta is a true same-process before/after
 comparison rather than a comparison between unrelated Explorer instances. It
@@ -46,13 +58,19 @@ two snapshots are part of the delta.
 
 The snapshot also records:
 
-- exact staged binary paths and SHA-256 hashes;
+- exact selected product directory, binary paths, lengths, and SHA-256 hashes;
 - taskbar Explorer and resident-host process metrics and I/O counters;
 - all monitor bounds, work areas, and monitor scale from
   `GetScaleFactorForMonitor`, with effective DPI derived from that scale (an
   unavailable value is recorded as unavailable, never invented as 96);
 - taskbar edge and the Windows 11 alignment registry hint;
-- foreground-window geometry and session/process identity.
+- foreground-window geometry, Windows SID, numeric session, token logon ID,
+  process start time, and process identity.
+
+The performance run rejects a baseline older than ten minutes and requires its
+selected host/DLL paths, lengths, and hashes to match the files and resident
+images under test. Baseline memory remains process-wide correlation: the tool
+cannot attribute unrelated Explorer allocations to A4S.
 
 ## Start the staged host for manual qualification
 
@@ -80,16 +98,19 @@ Close the menu and run the performance probe only after the host reports
 ```powershell
 .\tools\Measure-A4SProductPerformance.ps1 `
     -AllowMenuAutomation `
-    -BaselinePath .\build\test-results\A4S-pre-injection.json `
+    -ProductDirectory $productDirectory `
+    -BaselinePath $baselinePath `
     -WarmSamples 30 `
     -IdleSeconds 15 `
+    -OperatorAttestsFirstOpenIsCold `
     -CapturePopInEvidence `
     -EnforceTargets
 ```
 
-The probe verifies that the resident host and DLL are the exact files in the
-selected product directory, and that the observer, host, and taskbar
-Explorer share one interactive session. It then sends the resident-host control
+The probe verifies both file SHA-256 and PE/RSDS build identity against the
+actual resident host image and Explorer-mapped DLL, and requires the selected
+paths, process start times, numeric session, and token logon identity to remain
+stable. It then sends the resident-host control
 message directly. It does not include the startup cost of a transient
 `A4SMenuHost.exe --toggle` process. Each open sample measures command dispatch
 until an Explorer-owned `A4SMenu.CMenuContainer` is observed visible, then
@@ -103,10 +124,48 @@ poll also inherits scheduler granularity and can create conservative timing
 failures. Product-side QPC/ETW markers and a presentation trace are required
 for authoritative frame claims.
 
-The staged product directory is the default. To qualify an installed payload,
-pass its directory explicitly, for example
-`-ProductDirectory (Join-Path $env:LOCALAPPDATA 'A4SMenu')`. The report records
-the exact host and DLL SHA-256 hashes.
+The staged product directory is the default, but qualification commands pass it
+explicitly so a baseline cannot be reused accidentally against another source.
+The installed product root itself does **not** contain the active binaries.
+They live in the immutable directory selected by
+`HKCU\Software\A4SMenu\ActiveSlot` below `%LocalAppData%\A4SMenu\versions`.
+Resolve and validate that directory with the read-only helper, then pass the
+same exact value to both baseline and measurement:
+
+```powershell
+$productDirectory = .\tools\Resolve-A4SInstalledProductDirectory.ps1
+$runId = Get-Date -Format 'yyyyMMdd-HHmmss'
+$baselinePath = ".\build\test-results\A4S-installed-pre-injection-$runId.json"
+
+# With the installed host stopped/unhooked and Explorer freshly restarted:
+.\tools\Get-A4SPerformanceSnapshot.ps1 `
+    -RequireCleanProductState `
+    -ProductDirectory $productDirectory `
+    -OutputPath $baselinePath
+
+$menuHost = Join-Path $productDirectory 'A4SMenuHost.exe'
+Start-Process -FilePath $menuHost
+Start-Sleep -Seconds 2
+& $menuHost --status
+
+.\tools\Measure-A4SProductPerformance.ps1 `
+    -AllowMenuAutomation `
+    -ProductDirectory $productDirectory `
+    -BaselinePath $baselinePath `
+    -WarmSamples 30 `
+    -IdleSeconds 15 `
+    -OperatorAttestsFirstOpenIsCold `
+    -CapturePopInEvidence `
+    -EnforceTargets
+```
+
+The resolver rejects a missing/empty registration, paths outside the canonical
+`versions` directory, non-direct-child slots, reparse-point directories, and
+non-regular host/DLL files. Every qualification tool recognizes an installed
+slot, requires it to remain the registry `ActiveSlot`, and records that binding.
+The clean baseline and performance run additionally require the same selected
+directory, file lengths, hashes, Explorer PID/start time, and logon identity,
+preserving the same-process memory comparison for installed runs.
 
 The current external proxy gates are:
 
@@ -118,9 +177,10 @@ The current external proxy gates are:
   warm open.
 
 The report includes p50, p95, and maximum timings, every raw sample, exact
-binary paths, host and Explorer IDs, same-process memory deltas, and
+binary paths/build identities, host and Explorer IDs/start times/logon identity, same-process memory deltas, and
 process-wide I/O-counter deltas. The JSON
-evidence is written before an enforced target failure is raised.
+evidence is flushed to a new file before an enforced target failure is raised;
+existing qualification evidence is never overwritten.
 
 The I/O-counter gate is not a physical-disk proof. Unrelated Explorer work can
 increment it (false positive), while cache hits, paging, and memory-mapped I/O
@@ -142,7 +202,7 @@ shorter-lived pop-in. Different hashes are inconclusive because acrylic,
 wallpaper, the cursor, and other desktop animation can also alter pixels;
 compare the two images visually.
 
-## Measurement boundaries
+## Product runtime trace
 
 External observation can measure host-toggle/window-visibility proxies, host
 idle CPU, same-Explorer memory growth, and process-wide Explorer I/O counters.
@@ -157,20 +217,68 @@ accurately attribute these internal phases:
 - a lone Windows-key event to first paint;
 - repaint rectangles or the exact first fully populated frame.
 
-The product now includes the A4S-only `A4SMenu.Runtime` TraceLogging provider,
+The product includes the A4S-only `A4SMenu.Runtime` TraceLogging provider,
 which is dormant when no trace session listens. It emits correlated operation
 events for activation source, open/close paths, pinned and Programs
 enumeration, icon load/cache result, backdrop preparation, visibility, first
-paint, search initialization, preload, and hiding. The external PowerShell
-report does not start or parse that provider. An explicit WPR/ETW capture and
-analysis pass is still required; file-I/O and presentation stacks can then
-distinguish A4S activity from unrelated Explorer background work without a
-test-only export or shared-memory ABI in the installed DLL.
+paint, search initialization, preload, hiding, and repaint rectangles. Capture
+30 exact-build cycles with the custom-provider tool after the external run:
 
-Until those markers exist, the report labels Explorer CPU and I/O as
-process-wide correlation, not A4S attribution. It must not be used to claim
-that internal enumeration, icon, acrylic, search, exact frame, or physical-disk
-targets passed.
+```powershell
+.\tools\Capture-A4SRuntimeTrace.ps1 `
+    -AllowMenuAutomation `
+    -ProductDirectory $productDirectory `
+    -CapturedCycles 30 `
+    -WarmupCycles 1 `
+    -RefreshRateHz 239 `
+    -EnforceTargets
+```
+
+`239` is the qualification machine's current configured rate; recheck it if
+the display mode changes. The supplied value is compared with the current-mode
+integer reported by `EnumDisplaySettings`. The report uses the unrounded
+`1000 / refresh-rate` budget (4.184100... ms at 239 Hz), while displaying
+rounded values for readability.
+
+The capture validates the staged paths and SHA-256 hashes, the resident and
+file PE/RSDS identities, Explorer/host PIDs and start times, numeric session,
+token logon identity, disabled StartAllBack state, exact requested cycle count,
+and end-of-run identity. It preserves the raw ETL, decoded-XML hash, report,
+session logs, and capture metadata in a new directory. The parser rejects
+mixed-process, duplicated, incomplete, and under-sampled traces.
+
+Custom markers authoritatively measure application activation-to-visible,
+activation-to-first-paint, close-to-hidden, cache/phase durations, and repaint
+area. `windowVisible`, `firstPaint`, and `windowHidden` remain application
+markers rather than compositor presentation timestamps. The custom provider
+also does not capture kernel file-I/O. Therefore exact presented-frame and
+physical-disk claims remain `notMeasured`; a WPR/ETW presentation plus
+File I/O/stack capture is still required for those two claims. The external
+report's Explorer CPU and I/O values remain process-wide correlation.
+
+The capture session starts only after the host is already `READY`; this safety
+boundary means an initial idle preload may have completed before the provider
+is enabled. Repeat-open cache-hit evidence remains available, but proof of the
+first post-injection preload requires a separately pre-armed ETW/WPR session or
+another startup record that begins before the host is launched.
+
+Open/close cycles do not exercise lazy search or the Programs view. Capture
+those phase markers separately, without target enforcement:
+
+```powershell
+.\tools\Capture-A4SRuntimeTrace.ps1 `
+    -AllowMenuAutomation `
+    -ProductDirectory $productDirectory `
+    -CapturedCycles 0 `
+    -WarmupCycles 0 `
+    -ManualInteractionSeconds 45 `
+    -RefreshRateHz 239
+```
+
+During the announced window, open All Programs, wait for it to populate,
+return to the normal view, type a non-empty search query, and let results
+settle. This trace is phase evidence only: its overall target status cannot be
+`pass`, and `-EnforceTargets` is deliberately rejected in manual mode.
 
 ## Record the stability matrix
 
@@ -180,6 +288,7 @@ open/close cycle without changing that environment:
 ```powershell
 .\tools\Test-A4SCurrentScenario.ps1 `
     -ScenarioName dpi-125-centered `
+    -ProductDirectory $productDirectory `
     -ExpectedMonitorCount 1 `
     -ExpectedPrimaryScalePercent 125 `
     -ExpectedTaskbarAlignment center `
@@ -218,6 +327,13 @@ Use `-ExpectedForegroundMode fullscreen` for a prepared fullscreen state,
 window DPI after opening. These are assertions only; the tool does not switch
 applications, displays, taskbars, or sessions.
 
+Automation defaults to the staged product directory. Pass `-ProductDirectory`
+for an installed slot. An automated scenario will not pass unless the selected
+host/DLL paths, SHA-256 hashes, on-disk PE/RSDS identities, resident PE/RSDS
+identities, PIDs, start times, numeric session, and token logon ID remain exact
+for the whole cycle. Geometry is sampled under per-monitor-v2 thread awareness,
+so recorded menu/monitor rectangles are physical pixels at every tested scale.
+
 Launching a command from a terminal normally makes that terminal foreground.
 For a fullscreen/windowed foreground assertion, add (for example)
 `-ForegroundObservationDelaySeconds 5` and reactivate the target application
@@ -236,7 +352,11 @@ A4S DLL mapping in the taskbar Explorer process, shared session identity, and a
 successful foreground open/close cycle.
 
 Entries append to `build/test-results/A4S-stability-matrix.json` by default.
-Use a unique `-ScenarioName` and optional `-Notes` for every run.
+Use a unique `-ScenarioName` and optional `-Notes` for every run. Duplicate
+names are rejected. A path-derived mutex serializes writers and same-volume
+write-through replacement keeps the aggregate JSON intact. If automation
+fails after the environment snapshot, the failed entry and error are persisted
+before the script returns failure.
 
 The required matrix is:
 
@@ -245,7 +365,7 @@ The required matrix is:
 | DPI | 100%, 125%, 150%, 200% | environment assertions, menu DPI/rect, visual capture |
 | Taskbar | centered and left aligned; bottom required, other edges if supported | alignment/edge assertion, open/close |
 | Monitors | one monitor, two monitors, mixed DPI, opening from each taskbar | topology snapshot, menu monitor/rect |
-| Input | lone Win open/close; Win+R/E/L/X/Tab unaffected; Start click same path | input harness plus marker/source evidence |
+| Input | lone Win open/close; Win+R/E/L/X/Tab unaffected; Start click same path | manual physical-key/Start-click checklist plus activation marker/source and visible-window evidence; no synthesized input |
 | Focus | click another app; Alt+Tab; outside click; foreground loss | manual-focus observation and visual check |
 | Fullscreen | borderless and exclusive fullscreen | pre/post scenario record and application-specific result |
 | Explorer | normal restart, forced crash recovery, initialization failure | new PID record, host recovery/status, native Start fail-safe |
@@ -263,16 +383,22 @@ Run the non-injecting tool gate after edits:
 
 ```powershell
 .\tools\Test-A4SPerformanceTools.ps1
+.\tools\Test-A4SRuntimeTraceTools.ps1
 ```
 
-It parses every performance/stability script, compiles a freshly renamed copy
-of each embedded native helper, verifies `RECT`, `IO_COUNTERS`,
-`MONITORINFOEX`, and `DEVMODE` byte sizes, checks explicit automation gates and
-Explorer-owner filtering, rejects a curated list of destructive commands and
-native APIs, and smoke-tests only the read-only environment snapshot. The
+The gates parse every performance/stability/trace script, compile freshly renamed copies
+of each embedded native helper, verify `RECT`, `IO_COUNTERS`,
+`MONITORINFOEX`, and `DEVMODE` byte sizes, check explicit automation gates and
+Explorer-owner filtering, reject a curated list of destructive commands and
+native APIs, exercise synthetic trace correlation (including the exact 239 Hz
+boundary), and smoke-test only the read-only environment snapshot. The
 denylist is defense in depth rather than proof about arbitrary future code; a
 human review remains required. The gate does not open the menu or alter
 Explorer.
+
+For a parser-only run that must not inspect the current desktop or staged
+binaries, use `Test-A4SPerformanceTools.ps1 -SkipObservationSmokeTest` and
+`Test-A4SRuntimeTraceTools.ps1 -SkipStagedBinaryIdentitySmokeTest`.
 
 ## Current qualification status
 
@@ -284,6 +410,8 @@ stabilizes:
 - clean same-Explorer before/after memory capture;
 - operator-attested cold opening and repeated warm-opening samples;
 - first-paint/pop-in image comparison;
-- ETW-attributed internal phase and warm-I/O timings;
+- ETW-attributed internal phase timings;
+- kernel file-I/O and compositor-presentation evidence (the custom provider
+  deliberately reports these as not measured);
 - all monitor, DPI, alignment, fullscreen, Explorer, and session scenarios;
 - installation, update, repair, rollback, uninstall, and crash-loop guard.

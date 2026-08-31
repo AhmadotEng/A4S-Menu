@@ -33,12 +33,25 @@ function Resolve-A4SOutputPath {
     return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
 }
 
+function Write-A4SJsonCreateNew {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
+    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $json = ($Value | ConvertTo-Json -Depth 12) + [Environment]::NewLine
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+    finally { $stream.Dispose() }
+    [IO.File]::Move($temporary, $Path)
+}
+
 $events = @()
 $sourceType = ''
 $sourcePath = ''
 $sourceHash = ''
 $rawEtlPreserved = $false
 $decodedXml = $null
+$decodedXmlHash = $null
 
 if ($PSCmdlet.ParameterSetName -eq 'Etl') {
     $sourcePath = (Resolve-Path -LiteralPath $EtlPath -ErrorAction Stop).ProviderPath
@@ -57,20 +70,50 @@ if ($PSCmdlet.ParameterSetName -eq 'Etl') {
     }
     $tracerpt = Join-Path $env:SystemRoot 'System32\tracerpt.exe'
     if (-not (Test-Path -LiteralPath $tracerpt -PathType Leaf)) { throw "Windows tracerpt.exe was not found at '$tracerpt'." }
-    $decodeOutput = @(& $tracerpt $sourcePath -o $decodedXml -of XML -lr -y 2>&1)
+    $decodedXmlTemporary = "$decodedXml.partial-$PID-$([Guid]::NewGuid().ToString('N')).xml"
+    $decodeOutput = @(& $tracerpt $sourcePath -o $decodedXmlTemporary -of XML -lr -y 2>&1)
     $decodeExitCode = $LASTEXITCODE
     if ($decodeExitCode -ne 0) {
-        throw "tracerpt failed with exit code $decodeExitCode. Raw ETL remains at '$sourcePath'. Output: $($decodeOutput -join ' ')"
+        throw "tracerpt failed with exit code $decodeExitCode. Raw ETL remains at '$sourcePath'; partial derived output, if any, remains at '$decodedXmlTemporary'. Output: $($decodeOutput -join ' ')"
     }
-    $events = @(ConvertFrom-A4STracerptXml -Path $decodedXml -ExpectedProcessId $ExpectedProcessId)
+    $decodedXmlHash = (Get-FileHash -LiteralPath $decodedXmlTemporary -Algorithm SHA256).Hash
+    $events = @(ConvertFrom-A4STracerptXml -Path $decodedXmlTemporary -ExpectedProcessId $ExpectedProcessId)
+    $postParseXmlHash = (Get-FileHash -LiteralPath $decodedXmlTemporary -Algorithm SHA256).Hash
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($decodedXmlHash, $postParseXmlHash)) {
+        throw "The decoded tracerpt XML changed while it was parsed; refusing non-immutable evidence from '$decodedXmlTemporary'."
+    }
+    $postDecodeSourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $postDecodeSourceHash)) {
+        throw "The raw ETL changed while it was decoded; refusing non-immutable evidence from '$sourcePath'."
+    }
     if ($events.Count -eq 0) {
-        throw "No decodable A4SMenu.Runtime events were found. Raw ETL remains at '$sourcePath'; inspect '$decodedXml' and verify the staged DLL contains provider 74a9f986-c7ab-429a-9571-df0fb7f4a33c."
+        throw "No decodable A4SMenu.Runtime events were found. Raw ETL remains at '$sourcePath'; inspect '$decodedXmlTemporary' and verify the selected DLL contains provider 74a9f986-c7ab-429a-9571-df0fb7f4a33c."
+    }
+    if (Test-Path -LiteralPath $decodedXml -PathType Leaf) {
+        $xmlBackup = "$decodedXml.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
+        $xmlReplaced = $false
+        try {
+            [IO.File]::Replace($decodedXmlTemporary, $decodedXml, $xmlBackup, $true)
+            $xmlReplaced = $true
+        } finally {
+            if ($xmlReplaced -and [IO.File]::Exists($xmlBackup)) { [IO.File]::Delete($xmlBackup) }
+        }
+    } else {
+        [IO.File]::Move($decodedXmlTemporary, $decodedXml)
+    }
+    $publishedXmlHash = (Get-FileHash -LiteralPath $decodedXml -Algorithm SHA256).Hash
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($decodedXmlHash, $publishedXmlHash)) {
+        throw "The atomically published tracerpt XML does not match the parsed bytes at '$decodedXml'."
     }
 } else {
     $sourcePath = (Resolve-Path -LiteralPath $EventJsonPath -ErrorAction Stop).ProviderPath
     $sourceType = 'syntheticJson'
     $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
     $events = @(Import-A4SEventJson -Path $sourcePath -ExpectedProcessId $ExpectedProcessId)
+    $postImportSourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $postImportSourceHash)) {
+        throw "The synthetic event source changed while it was parsed; refusing non-immutable evidence from '$sourcePath'."
+    }
     if ($events.Count -eq 0) { throw "No A4S runtime events were found in '$sourcePath'." }
 }
 
@@ -95,8 +138,24 @@ $report = ConvertTo-A4SRuntimeReport -Events $events -ColdSampleCount $ColdSampl
 $report.source | Add-Member -NotePropertyName sha256 -NotePropertyValue $sourceHash
 $report.source | Add-Member -NotePropertyName rawEtlPreserved -NotePropertyValue $rawEtlPreserved
 if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlPath -NotePropertyValue $decodedXml }
+if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlSha256 -NotePropertyValue $decodedXmlHash }
 
-$report | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $resolvedOutput -Encoding UTF8
+if ((Test-Path -LiteralPath $resolvedOutput) -and $Force) {
+    # Force applies only to derived files in an explicit conversion. Preserve
+    # the old report until the replacement bytes are durable.
+    $temporaryOutput = "$resolvedOutput.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+    Write-A4SJsonCreateNew -Path $temporaryOutput -Value $report
+    $outputBackup = "$resolvedOutput.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $outputReplaced = $false
+    try {
+        [IO.File]::Replace($temporaryOutput, $resolvedOutput, $outputBackup, $true)
+        $outputReplaced = $true
+    } finally {
+        if ($outputReplaced -and [IO.File]::Exists($outputBackup)) { [IO.File]::Delete($outputBackup) }
+    }
+} else {
+    Write-A4SJsonCreateNew -Path $resolvedOutput -Value $report
+}
 Write-Output $resolvedOutput
 
 if ($EnforceTargets -and $report.targetEvaluation.overallCustomTraceStatus -ne 'pass') {

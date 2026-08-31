@@ -1,7 +1,10 @@
 [CmdletBinding()]
 param(
     [string] $OutputPath,
-    [switch] $RequireCleanProductState
+    [string] $ProductDirectory,
+    [switch] $RequireCleanProductState,
+    [ValidateRange(10, 900)]
+    [int] $MaximumCleanExplorerAgeSeconds = 120
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,6 +12,8 @@ $ErrorActionPreference = 'Stop'
 if (-not [Environment]::Is64BitProcess) {
     throw 'Run this probe from 64-bit PowerShell so the x64 Explorer module list is authoritative.'
 }
+
+Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
 
 if (-not ('A4SObservationNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -51,6 +56,28 @@ public static class A4SObservationNative
         public ulong ReadTransferCount;
         public ulong WriteTransferCount;
         public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct LUID
+    {
+        public uint LowPart;
+        public int HighPart;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct TOKEN_STATISTICS
+    {
+        public LUID TokenId;
+        public LUID AuthenticationId;
+        public long ExpirationTime;
+        public int TokenType;
+        public int ImpersonationLevel;
+        public uint DynamicCharged;
+        public uint DynamicAvailable;
+        public uint GroupCount;
+        public uint PrivilegeCount;
+        public LUID ModifiedId;
     }
 
     public sealed class MonitorRecord
@@ -120,6 +147,31 @@ public static class A4SObservationNative
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
 
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool OpenProcessToken(IntPtr process, uint desiredAccess, out IntPtr token);
+
+    [DllImport("advapi32.dll", SetLastError = true)]
+    private static extern bool GetTokenInformation(IntPtr token, int informationClass,
+        IntPtr information, int informationLength, out int returnLength);
+
+    private static IntPtr EnterPhysicalCoordinates()
+    {
+        // DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2. Window and monitor
+        // geometry must remain physical across 100-200% qualification runs.
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        if (previous == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "SetThreadDpiAwarenessContext failed");
+        return previous;
+    }
+
+    private static void RestoreDpiContext(IntPtr previous)
+    {
+        if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+    }
+
     public static string WindowClass(IntPtr window)
     {
         StringBuilder name = new StringBuilder(256);
@@ -135,18 +187,26 @@ public static class A4SObservationNative
 
     public static RECT WindowRect(IntPtr window)
     {
-        RECT rect;
-        if (window == IntPtr.Zero || !GetWindowRect(window, out rect))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetWindowRect failed");
-        return rect;
+        IntPtr previous = EnterPhysicalCoordinates();
+        try
+        {
+            RECT rect;
+            if (window == IntPtr.Zero || !GetWindowRect(window, out rect))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetWindowRect failed");
+            return rect;
+        }
+        finally { RestoreDpiContext(previous); }
     }
 
     public static MonitorRecord[] Monitors()
     {
+        IntPtr previous = EnterPhysicalCoordinates();
         List<MonitorRecord> records = new List<MonitorRecord>();
-        if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
-            delegate(IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr parameter)
-            {
+        try
+        {
+            if (!EnumDisplayMonitors(IntPtr.Zero, IntPtr.Zero,
+                delegate(IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr parameter)
+                {
                 MONITORINFOEX info = new MONITORINFOEX();
                 info.Size = (uint)Marshal.SizeOf(typeof(MONITORINFOEX));
                 if (!GetMonitorInfoW(monitor, ref info))
@@ -184,9 +244,11 @@ public static class A4SObservationNative
                     ScalePercent = scalePercent
                 });
                 return true;
-            }, IntPtr.Zero))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumDisplayMonitors failed");
-        return records.ToArray();
+                }, IntPtr.Zero))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumDisplayMonitors failed");
+            return records.ToArray();
+        }
+        finally { RestoreDpiContext(previous); }
     }
 
     public static IoRecord ProcessIo(uint processId)
@@ -211,8 +273,68 @@ public static class A4SObservationNative
         }
         finally { CloseHandle(process); }
     }
+
+    public static string ProcessLogonId(uint processId)
+    {
+        const uint QueryLimitedInformation = 0x1000;
+        const uint TokenQuery = 0x0008;
+        const int TokenStatistics = 10;
+        IntPtr process = OpenProcess(QueryLimitedInformation, false, processId);
+        if (process == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcess failed for logon identity");
+        try
+        {
+            IntPtr token;
+            if (!OpenProcessToken(process, TokenQuery, out token))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "OpenProcessToken failed");
+            try
+            {
+                int length;
+                GetTokenInformation(token, TokenStatistics, IntPtr.Zero, 0, out length);
+                if (length < Marshal.SizeOf(typeof(TOKEN_STATISTICS)))
+                    throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation size query failed");
+                IntPtr buffer = Marshal.AllocHGlobal(length);
+                try
+                {
+                    if (!GetTokenInformation(token, TokenStatistics, buffer, length, out length))
+                        throw new Win32Exception(Marshal.GetLastWin32Error(), "GetTokenInformation failed");
+                    TOKEN_STATISTICS stats = (TOKEN_STATISTICS)Marshal.PtrToStructure(buffer, typeof(TOKEN_STATISTICS));
+                    return String.Format("{0:x8}:{1:x8}", unchecked((uint)stats.AuthenticationId.HighPart), stats.AuthenticationId.LowPart);
+                }
+                finally { Marshal.FreeHGlobal(buffer); }
+            }
+            finally { CloseHandle(token); }
+        }
+        finally { CloseHandle(process); }
+    }
 }
 '@
+}
+
+function Get-StableFileEvidence {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $resolved = [IO.Path]::GetFullPath($Path)
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $hash = [Convert]::ToHexString($sha.ComputeHash($stream)) }
+        finally { $sha.Dispose() }
+        [ordered]@{ path = $resolved; length = $stream.Length; sha256 = $hash }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Write-DurableJsonCreateNew {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)][string] $Json)
+    if (Test-Path -LiteralPath $Path) { throw "Snapshot output already exists: '$Path'. Qualification evidence is never overwritten." }
+    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Json + [Environment]::NewLine)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+    finally { $stream.Dispose() }
+    [IO.File]::Move($temporary, $Path)
 }
 
 function Get-ProcessRecord {
@@ -224,6 +346,7 @@ function Get-ProcessRecord {
         pid = $Process.Id
         path = $Process.MainModule.FileName
         sessionId = $Process.SessionId
+        logonId = [A4SObservationNative]::ProcessLogonId([uint32]$Process.Id)
         startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o')
         privateBytes = $Process.PrivateMemorySize64
         workingSetBytes = $Process.WorkingSet64
@@ -242,9 +365,26 @@ function Get-ProcessRecord {
     }
 }
 
+function Get-A4SHostProcessRecords {
+    param(
+        [Parameter(Mandatory)][int] $SessionId,
+        [Parameter(Mandatory)][string] $LogonId
+    )
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($process in @(Get-Process -Name A4SMenuHost -ErrorAction SilentlyContinue)) {
+        try {
+            if ($process.SessionId -eq $SessionId -and
+                [A4SObservationNative]::ProcessLogonId([uint32]$process.Id) -eq $LogonId) {
+                [void]$records.Add((Get-ProcessRecord -Process $process))
+            }
+        } finally { $process.Dispose() }
+    }
+    @($records | Sort-Object pid)
+}
+
 function Get-ModulePaths {
     param([Parameter(Mandatory)][Diagnostics.Process] $Process)
-    @($Process.Modules | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
+    @($Process.Modules | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) } | Sort-Object)
 }
 
 function Convert-Rect {
@@ -258,9 +398,16 @@ function Convert-Rect {
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$stageDirectory = Join-Path $repoRoot 'build\stage\A4SProduct'
-$hostExecutable = Join-Path $stageDirectory 'A4SMenuHost.exe'
-$menuDll = Join-Path $stageDirectory 'A4SMenu.dll'
+if (-not $ProductDirectory) { $ProductDirectory = Join-Path $repoRoot 'build\stage\A4SProduct' }
+$resolvedProductDirectory = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ProductDirectory))
+$productRegistration = Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory
+$hostExecutable = Join-Path $resolvedProductDirectory 'A4SMenuHost.exe'
+$menuDll = Join-Path $resolvedProductDirectory 'A4SMenu.dll'
+$selectedHostEvidence = if (Test-Path -LiteralPath $hostExecutable -PathType Leaf) { Get-StableFileEvidence $hostExecutable } else { $null }
+$selectedDllEvidence = if (Test-Path -LiteralPath $menuDll -PathType Leaf) { Get-StableFileEvidence $menuDll } else { $null }
+if ($RequireCleanProductState -and (-not $selectedHostEvidence -or -not $selectedDllEvidence)) {
+    throw "A clean qualification baseline also requires A4SMenuHost.exe and A4SMenu.dll in the selected product directory '$resolvedProductDirectory' so the later run can be bound to the same payload hashes."
+}
 
 $taskbar = [A4SObservationNative]::FindWindowW('Shell_TrayWnd', $null)
 if ($taskbar -eq [IntPtr]::Zero) {
@@ -271,8 +418,24 @@ if ([A4SObservationNative]::GetWindowThreadProcessId($taskbar, [ref]$explorerPro
     throw 'Could not resolve the taskbar Explorer process.'
 }
 $explorerProcess = [Diagnostics.Process]::GetProcessById([int]$explorerProcessId)
+$explorerStartTicks = $explorerProcess.StartTime.ToUniversalTime().Ticks
+$observerProcess = [Diagnostics.Process]::GetCurrentProcess()
+$observerSessionId = $observerProcess.SessionId
+$observerLogonId = [A4SObservationNative]::ProcessLogonId([uint32]$observerProcess.Id)
+$explorerLogonId = [A4SObservationNative]::ProcessLogonId($explorerProcessId)
+if ($explorerProcess.SessionId -ne $observerSessionId -or $explorerLogonId -ne $observerLogonId) {
+    throw 'The observation process and taskbar Explorer do not share one interactive logon session.'
+}
+$hostProcessRecords = @(Get-A4SHostProcessRecords -SessionId $observerSessionId -LogonId $observerLogonId)
+if ($RequireCleanProductState) {
+    $explorerAgeSeconds = ([DateTime]::UtcNow - $explorerProcess.StartTime.ToUniversalTime()).TotalSeconds
+    if ($explorerAgeSeconds -lt 0 -or $explorerAgeSeconds -gt $MaximumCleanExplorerAgeSeconds) {
+        throw "A clean resource baseline requires a fresh taskbar Explorer (age=$([Math]::Round($explorerAgeSeconds, 3)) seconds; maximum=$MaximumCleanExplorerAgeSeconds)."
+    }
+}
 $modulePaths = @(Get-ModulePaths -Process $explorerProcess)
 $a4sMappings = @($modulePaths | Where-Object { [IO.Path]::GetFileName($_) -ieq 'A4SMenu.dll' })
+$competingStartMenuMappings = @($modulePaths | Where-Object { [IO.Path]::GetFileName($_) -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
 
 $residentHostWindow = [A4SObservationNative]::FindWindowW('A4SMenu.Host.Window.v1', 'A4SMenuHost')
 $residentHostRecord = $null
@@ -286,8 +449,9 @@ if ($residentHostWindow -ne [IntPtr]::Zero) {
     }
 }
 
-if ($RequireCleanProductState -and ($a4sMappings.Count -ne 0 -or $residentHostRecord)) {
-    throw "A clean pre-injection baseline requires no A4SMenu.dll mapping and no resident A4SMenuHost. Found mappings=$($a4sMappings.Count), host=$([bool]$residentHostRecord)."
+if ($RequireCleanProductState -and ($a4sMappings.Count -ne 0 -or $residentHostRecord -or
+    $hostProcessRecords.Count -ne 0 -or $competingStartMenuMappings.Count -ne 0)) {
+    throw "A clean pre-injection baseline requires no A4SMenu.dll mapping, same-logon A4SMenuHost process/window, or competing StartAllBack/StartIsBack/Open-Shell Explorer module. Found A4S mappings=$($a4sMappings.Count), hostWindow=$([bool]$residentHostRecord), hostProcesses=$($hostProcessRecords.Count), competing='$($competingStartMenuMappings -join '; ')'."
 }
 
 $taskbarRect = [A4SObservationNative]::WindowRect($taskbar)
@@ -376,21 +540,27 @@ try {
 } catch { }
 
 $snapshot = [ordered]@{
-    schemaVersion = 1
+    schemaVersion = 2
     capturedUtc = [DateTime]::UtcNow.ToString('o')
     machine = $env:COMPUTERNAME
     user = [Environment]::UserName
-    observerSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    observerSessionId = $observerSessionId
+    observerLogonId = $observerLogonId
     os = [ordered]@{
         version = [Environment]::OSVersion.Version.ToString()
         logicalProcessors = [Environment]::ProcessorCount
         processArchitecture = [Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture.ToString()
     }
     product = [ordered]@{
-        stagedHost = if (Test-Path -LiteralPath $hostExecutable -PathType Leaf) { [ordered]@{ path = $hostExecutable; sha256 = (Get-FileHash -LiteralPath $hostExecutable -Algorithm SHA256).Hash } } else { $null }
-        stagedDll = if (Test-Path -LiteralPath $menuDll -PathType Leaf) { [ordered]@{ path = $menuDll; sha256 = (Get-FileHash -LiteralPath $menuDll -Algorithm SHA256).Hash } } else { $null }
+        directory = $resolvedProductDirectory
+        registration = $productRegistration
+        selectedHost = $selectedHostEvidence
+        selectedDll = $selectedDllEvidence
         mappedDllPaths = $a4sMappings
+        competingStartMenuModulePaths = $competingStartMenuMappings
         residentHost = $residentHostRecord
+        hostProcesses = $hostProcessRecords
     }
     explorer = Get-ProcessRecord -Process $explorerProcess
     desktop = [ordered]@{
@@ -417,6 +587,55 @@ $snapshot = [ordered]@{
     }
 }
 
+# Fail closed if Explorer, the host, a mapped product image, or either staged
+# binary changed while this multi-source snapshot was being assembled.
+$finalTaskbar = [A4SObservationNative]::FindWindowW('Shell_TrayWnd', $null)
+[uint32]$finalExplorerProcessId = 0
+if ($finalTaskbar -eq [IntPtr]::Zero -or $finalTaskbar -ne $taskbar -or
+    [A4SObservationNative]::GetWindowThreadProcessId($finalTaskbar, [ref]$finalExplorerProcessId) -eq 0 -or
+    $finalExplorerProcessId -ne $explorerProcessId) {
+    throw 'The taskbar Explorer identity changed while the observation snapshot was being captured.'
+}
+$finalExplorer = [Diagnostics.Process]::GetProcessById([int]$finalExplorerProcessId)
+try {
+    if ($finalExplorer.StartTime.ToUniversalTime().Ticks -ne $explorerStartTicks) {
+        throw 'The taskbar Explorer PID was reused while the observation snapshot was being captured.'
+    }
+    $finalModulePaths = @(Get-ModulePaths -Process $finalExplorer)
+    $finalMappings = @($finalModulePaths | Where-Object { [IO.Path]::GetFileName($_) -ieq 'A4SMenu.dll' })
+    $finalCompetingMappings = @($finalModulePaths | Where-Object { [IO.Path]::GetFileName($_) -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
+    if (($finalMappings -join "`n") -ne ($a4sMappings -join "`n")) {
+        throw 'The set of mapped A4SMenu.dll images changed while the observation snapshot was being captured.'
+    }
+    if (($finalCompetingMappings -join "`n") -ne ($competingStartMenuMappings -join "`n")) {
+        throw 'The set of competing StartAllBack/StartIsBack/Open-Shell modules changed while the observation snapshot was being captured.'
+    }
+} finally { $finalExplorer.Dispose() }
+$finalHostWindow = [A4SObservationNative]::FindWindowW('A4SMenu.Host.Window.v1', 'A4SMenuHost')
+if ($finalHostWindow -ne $residentHostWindow) {
+    throw 'The resident A4S host changed while the observation snapshot was being captured.'
+}
+$finalHostProcessRecords = @(Get-A4SHostProcessRecords -SessionId $observerSessionId -LogonId $observerLogonId)
+$initialHostProcessKeys = @($hostProcessRecords | ForEach-Object { "$($_.pid)|$($_.startTimeUtc)|$($_.path)" } | Sort-Object)
+$finalHostProcessKeys = @($finalHostProcessRecords | ForEach-Object { "$($_.pid)|$($_.startTimeUtc)|$($_.path)" } | Sort-Object)
+if (($finalHostProcessKeys -join "`n") -ne ($initialHostProcessKeys -join "`n")) {
+    throw 'The set of same-logon A4SMenuHost processes changed while the observation snapshot was being captured.'
+}
+foreach ($evidencePair in @(
+    [pscustomobject]@{ before = $selectedHostEvidence; after = $(if ($selectedHostEvidence) { Get-StableFileEvidence $hostExecutable } else { $null }) }
+    [pscustomobject]@{ before = $selectedDllEvidence; after = $(if ($selectedDllEvidence) { Get-StableFileEvidence $menuDll } else { $null }) }
+)) {
+    if ($evidencePair.before -and ($evidencePair.before.length -ne $evidencePair.after.length -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$evidencePair.before.sha256, [string]$evidencePair.after.sha256))) {
+        throw 'A staged product binary changed while the observation snapshot was being captured.'
+    }
+}
+$finalProductRegistration = Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory
+if ($finalProductRegistration.kind -ne $productRegistration.kind -or
+    -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$finalProductRegistration.activeSlot, [string]$productRegistration.activeSlot)) {
+    throw 'The selected product registration/ActiveSlot changed while the observation snapshot was being captured.'
+}
+
 $explorerProcess.Dispose()
 $json = $snapshot | ConvertTo-Json -Depth 10
 if ($OutputPath) {
@@ -425,7 +644,7 @@ if ($OutputPath) {
     if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
         New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
     }
-    [IO.File]::WriteAllText($resolvedOutput, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
+    Write-DurableJsonCreateNew -Path $resolvedOutput -Json $json
     Write-Host "Wrote A4S observation snapshot: $resolvedOutput"
 }
 $json

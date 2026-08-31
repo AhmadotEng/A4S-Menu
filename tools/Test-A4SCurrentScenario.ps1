@@ -4,6 +4,7 @@ param(
     [ValidatePattern('^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$')]
     [string] $ScenarioName,
     [string] $MatrixPath,
+    [string] $ProductDirectory,
     [ValidateSet('left', 'center')]
     [string] $ExpectedTaskbarAlignment,
     [ValidateSet('left', 'right', 'top', 'bottom')]
@@ -50,6 +51,8 @@ if (($ExpectedMenuMonitor -or $PSBoundParameters.ContainsKey('ExpectedMenuScaleP
 if (-not [Environment]::Is64BitProcess) {
     throw 'Run this scenario probe from 64-bit PowerShell.'
 }
+
+Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
 
 if (-not ('A4SScenarioNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -98,7 +101,7 @@ public static class A4SScenarioNative
     }
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    private static extern IntPtr FindWindowW(string className, string windowName);
+    public static extern IntPtr FindWindowW(string className, string windowName);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern uint RegisterWindowMessageW(string message);
@@ -136,6 +139,22 @@ public static class A4SScenarioNative
 
     [DllImport("dwmapi.dll")]
     private static extern int DwmFlush();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr SetThreadDpiAwarenessContext(IntPtr dpiContext);
+
+    private static IntPtr EnterPhysicalCoordinates()
+    {
+        IntPtr previous = SetThreadDpiAwarenessContext(new IntPtr(-4));
+        if (previous == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "SetThreadDpiAwarenessContext failed");
+        return previous;
+    }
+
+    private static void RestoreDpiContext(IntPtr previous)
+    {
+        if (previous != IntPtr.Zero) SetThreadDpiAwarenessContext(previous);
+    }
 
     public static IntPtr HostWindow()
     {
@@ -190,30 +209,35 @@ public static class A4SScenarioNative
 
     public static WindowRecord Describe(IntPtr window)
     {
-        RECT rect;
-        if (!GetWindowRect(window, out rect))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetWindowRect failed");
-        IntPtr monitor = MonitorFromWindow(window, 2);
-        MONITORINFOEX info = new MONITORINFOEX();
-        info.Size = (uint)Marshal.SizeOf(typeof(MONITORINFOEX));
-        if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info))
-            throw new Win32Exception(Marshal.GetLastWin32Error(), "GetMonitorInfo failed");
-        uint dpi = 0;
-        try { dpi = GetDpiForWindow(window); }
-        catch (EntryPointNotFoundException) { }
-        return new WindowRecord {
-            Handle = window.ToInt64(),
-            Left = rect.Left,
-            Top = rect.Top,
-            Width = rect.Right - rect.Left,
-            Height = rect.Bottom - rect.Top,
-            Monitor = info.DeviceName,
-            MonitorLeft = info.Monitor.Left,
-            MonitorTop = info.Monitor.Top,
-            MonitorWidth = info.Monitor.Right - info.Monitor.Left,
-            MonitorHeight = info.Monitor.Bottom - info.Monitor.Top,
-            Dpi = dpi
-        };
+        IntPtr previous = EnterPhysicalCoordinates();
+        try
+        {
+            RECT rect;
+            if (!GetWindowRect(window, out rect))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetWindowRect failed");
+            IntPtr monitor = MonitorFromWindow(window, 2);
+            MONITORINFOEX info = new MONITORINFOEX();
+            info.Size = (uint)Marshal.SizeOf(typeof(MONITORINFOEX));
+            if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetMonitorInfo failed");
+            uint dpi = 0;
+            try { dpi = GetDpiForWindow(window); }
+            catch (EntryPointNotFoundException) { }
+            return new WindowRecord {
+                Handle = window.ToInt64(),
+                Left = rect.Left,
+                Top = rect.Top,
+                Width = rect.Right - rect.Left,
+                Height = rect.Bottom - rect.Top,
+                Monitor = info.DeviceName,
+                MonitorLeft = info.Monitor.Left,
+                MonitorTop = info.Monitor.Top,
+                MonitorWidth = info.Monitor.Right - info.Monitor.Left,
+                MonitorHeight = info.Monitor.Bottom - info.Monitor.Top,
+                Dpi = dpi
+            };
+        }
+        finally { RestoreDpiContext(previous); }
     }
 
     public static void FlushDwmChecked()
@@ -231,6 +255,7 @@ function Wait-MenuState {
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
         $windows = @([A4SScenarioNative]::VisibleMenuWindows($OwnerProcessId))
+        if ($Visible -and $windows.Count -gt 1) { throw "Found $($windows.Count) visible A4S menu windows; expected exactly one." }
         if (($Visible -and $windows.Count -gt 0) -or (-not $Visible -and $windows.Count -eq 0)) {
             return $windows
         }
@@ -239,14 +264,108 @@ function Wait-MenuState {
     throw "The menu did not become $(if($Visible){'visible'}else{'hidden'}) within $TimeoutMilliseconds ms."
 }
 
+function Get-StableFileEvidence {
+    param([Parameter(Mandatory)][string] $Path)
+    $resolved = [IO.Path]::GetFullPath($Path)
+    $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $hash = [Convert]::ToHexString($sha.ComputeHash($stream)) }
+        finally { $sha.Dispose() }
+        [pscustomobject][ordered]@{ path = $resolved; length = $stream.Length; sha256 = $hash }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Write-A4SMatrixAtomically {
+    param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)] $Value)
+    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $json = ($Value | ConvertTo-Json -Depth 15) + [Environment]::NewLine
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
+    if (Test-Path -LiteralPath $Path -PathType Leaf) {
+        $backup = "$Path.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
+        $replaced = $false
+        try {
+            [IO.File]::Replace($temporary, $Path, $backup, $true)
+            $replaced = $true
+        } finally {
+            if ($replaced -and [IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
+        }
+    } else {
+        [IO.File]::Move($temporary, $Path)
+    }
+}
+
+function Get-A4SMatrixMutexName {
+    param([Parameter(Mandatory)][string] $Path)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Path.ToUpperInvariant()))) }
+    finally { $sha.Dispose() }
+    "Local\A4SMenu.ScenarioMatrix.v1.$hash"
+}
+
+function Assert-A4SScenarioContext {
+    param(
+        [Parameter(Mandatory)][IntPtr] $ExpectedHostWindow,
+        [Parameter(Mandatory)][uint32] $ExpectedHostProcessId,
+        [Parameter(Mandatory)][int64] $ExpectedHostStartTicks,
+        [Parameter(Mandatory)][uint32] $ExpectedExplorerProcessId,
+        [Parameter(Mandatory)][int64] $ExpectedExplorerStartTicks,
+        [Parameter(Mandatory)][string] $ExpectedLogonId
+    )
+    $currentHostWindow = [A4SScenarioNative]::HostWindow()
+    [uint32]$currentHostProcessId = 0
+    if ($currentHostWindow -eq [IntPtr]::Zero -or $currentHostWindow -ne $ExpectedHostWindow -or
+        [A4SScenarioNative]::GetWindowThreadProcessId($currentHostWindow, [ref]$currentHostProcessId) -eq 0 -or
+        $currentHostProcessId -ne $ExpectedHostProcessId) { throw 'The validated resident host changed during the scenario.' }
+    $taskbar = [A4SScenarioNative]::FindWindowW('Shell_TrayWnd', $null)
+    [uint32]$currentExplorerProcessId = 0
+    if ($taskbar -eq [IntPtr]::Zero -or
+        [A4SScenarioNative]::GetWindowThreadProcessId($taskbar, [ref]$currentExplorerProcessId) -eq 0 -or
+        $currentExplorerProcessId -ne $ExpectedExplorerProcessId) { throw 'The taskbar Explorer changed during the scenario.' }
+    $hostProcess = [Diagnostics.Process]::GetProcessById([int]$currentHostProcessId)
+    $explorerProcess = [Diagnostics.Process]::GetProcessById([int]$currentExplorerProcessId)
+    try {
+        if ($hostProcess.StartTime.ToUniversalTime().Ticks -ne $ExpectedHostStartTicks -or
+            $explorerProcess.StartTime.ToUniversalTime().Ticks -ne $ExpectedExplorerStartTicks) {
+            throw 'A validated scenario process exited and its PID was reused.'
+        }
+        if ((Get-A4SProcessLogonId -ProcessId $currentHostProcessId) -ne $ExpectedLogonId -or
+            (Get-A4SProcessLogonId -ProcessId $currentExplorerProcessId) -ne $ExpectedLogonId) {
+            throw 'The scenario host or Explorer logon identity changed.'
+        }
+    } finally { $hostProcess.Dispose(); $explorerProcess.Dispose() }
+    if ([A4SScenarioNative]::HostStatus($currentHostWindow) -ne 3) { throw 'A4SMenuHost left READY during the scenario.' }
+}
+
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $MatrixPath) { $MatrixPath = Join-Path $repoRoot 'build\test-results\A4S-stability-matrix.json' }
 $resolvedMatrix = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($MatrixPath))
+if (-not $ProductDirectory) { $ProductDirectory = Join-Path $repoRoot 'build\stage\A4SProduct' }
+$resolvedProductDirectory = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ProductDirectory))
+$productRegistration = if ($AllowMenuAutomation) { Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory } else { $null }
+$expectedHost = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenuHost.exe'))
+$expectedDll = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenu.dll'))
+if ($AllowMenuAutomation) {
+    foreach ($requiredFile in @($expectedHost, $expectedDll)) {
+        if (-not (Test-Path -LiteralPath $requiredFile -PathType Leaf)) { throw "Required scenario product binary is missing: '$requiredFile'." }
+    }
+}
 $matrix = [ordered]@{ schemaVersion = 1; entries = @() }
 if (Test-Path -LiteralPath $resolvedMatrix -PathType Leaf) {
     $existing = Get-Content -LiteralPath $resolvedMatrix -Raw | ConvertFrom-Json
     if ($existing.schemaVersion -ne 1) { throw "Unsupported stability-matrix schema in $resolvedMatrix." }
     $matrix.entries = @($existing.entries)
+}
+if (@($matrix.entries | Where-Object scenario -eq $ScenarioName).Count -ne 0) {
+    throw "Scenario '$ScenarioName' already exists in $resolvedMatrix. Use a unique name so evidence cannot be silently replaced or made ambiguous."
 }
 $comparisonEntry = $null
 if ($CompareWithScenario) {
@@ -259,9 +378,15 @@ if ($ForegroundObservationDelaySeconds -gt 0) {
     Write-Host "Foreground observation begins in $ForegroundObservationDelaySeconds seconds. Activate the application state that this scenario should record."
     Start-Sleep -Seconds $ForegroundObservationDelaySeconds
 }
-$snapshotJson = & (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1')
+$snapshotJson = & (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1') -ProductDirectory $resolvedProductDirectory
 $snapshot = $snapshotJson | ConvertFrom-Json
 $assertions = [Collections.Generic.List[object]]::new()
+$automation = $null
+$scenarioError = $null
+$menu = $null
+$focusAfterDismissal = $null
+
+try {
 
 function Add-Assertion {
     param([string] $Name, [object] $Expected, [object] $Actual, [bool] $Passed)
@@ -307,11 +432,10 @@ if ($ExpectedExplorerRelationship) {
     Add-Assertion 'explorer-process-identity-relationship' $ExpectedExplorerRelationship $actualExplorerRelationship ($actualExplorerRelationship -eq $ExpectedExplorerRelationship)
 }
 if ($ExpectedSessionRelationship) {
-    $actualSessionRelationship = if ($snapshot.explorer.sessionId -eq $comparisonEntry.environment.explorer.sessionId) { 'same' } else { 'changed' }
-    Add-Assertion 'session-id-relationship' $ExpectedSessionRelationship $actualSessionRelationship ($actualSessionRelationship -eq $ExpectedSessionRelationship)
+    $actualSessionRelationship = if ([string]$snapshot.explorer.logonId -eq [string]$comparisonEntry.environment.explorer.logonId) { 'same' } else { 'changed' }
+    Add-Assertion 'logon-session-identity-relationship' $ExpectedSessionRelationship $actualSessionRelationship ($actualSessionRelationship -eq $ExpectedSessionRelationship)
 }
 
-$automation = $null
 if ($AllowMenuAutomation) {
     [uint32]$explorerProcessId = $snapshot.explorer.pid
     if (-not $explorerProcessId) { throw 'The snapshot did not identify the taskbar Explorer process.' }
@@ -321,21 +445,50 @@ if ($AllowMenuAutomation) {
     [void][A4SScenarioNative]::GetWindowThreadProcessId($hostWindow, [ref]$residentHostProcessId)
     if (-not $residentHostProcessId) { throw 'Could not resolve the resident A4S host process.' }
     $residentHostProcess = [Diagnostics.Process]::GetProcessById([int]$residentHostProcessId)
+    $explorerProcess = [Diagnostics.Process]::GetProcessById([int]$explorerProcessId)
     try {
         if ($residentHostProcess.SessionId -ne $snapshot.observerSessionId -or $snapshot.explorer.sessionId -ne $snapshot.observerSessionId) {
             throw "The observer, Explorer, and A4S host must share one interactive session. observer=$($snapshot.observerSessionId) explorer=$($snapshot.explorer.sessionId) host=$($residentHostProcess.SessionId)."
         }
+        $observerLogonId = [string]$snapshot.observerLogonId
+        if ((Get-A4SProcessLogonId -ProcessId $residentHostProcessId) -ne $observerLogonId -or
+            (Get-A4SProcessLogonId -ProcessId $explorerProcessId) -ne $observerLogonId) {
+            throw 'The observer, Explorer, and A4S host do not share one logon identity.'
+        }
+        $hostStartTicks = $residentHostProcess.StartTime.ToUniversalTime().Ticks
+        $explorerStartTicks = $explorerProcess.StartTime.ToUniversalTime().Ticks
+        $actualHostPath = [IO.Path]::GetFullPath($residentHostProcess.MainModule.FileName)
+        $mappedDllModules = @($explorerProcess.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
+        $competingModules = @($explorerProcess.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
+        $mappedDllPaths = @($mappedDllModules | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHostPath, $expectedHost) -or
+            $mappedDllModules.Count -ne 1 -or $competingModules.Count -ne 0 -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDllPaths[0], $expectedDll)) {
+            throw "Scenario automation is not bound to the selected product directory '$resolvedProductDirectory'."
+        }
+        $hostFileEvidence = Get-StableFileEvidence $expectedHost
+        $dllFileEvidence = Get-StableFileEvidence $expectedDll
+        $hostFileIdentity = Get-A4SFileImageIdentity $expectedHost
+        $hostLoadedIdentity = Get-A4SLoadedImageIdentity -ProcessId $residentHostProcessId -BaseAddress $residentHostProcess.MainModule.BaseAddress
+        $dllFileIdentity = Get-A4SFileImageIdentity $expectedDll
+        $dllLoadedIdentity = Get-A4SLoadedImageIdentity -ProcessId $explorerProcessId -BaseAddress $mappedDllModules[0].BaseAddress
+        if ($hostFileIdentity -ne $hostLoadedIdentity -or $dllFileIdentity -ne $dllLoadedIdentity) {
+            throw 'A resident scenario product image differs from the exact file at its selected path.'
+        }
     } finally {
         $residentHostProcess.Dispose()
+        $explorerProcess.Dispose()
     }
-    if ([A4SScenarioNative]::HostStatus($hostWindow) -ne 3) { throw 'A4SMenuHost is not READY.' }
-    if (@($snapshot.product.mappedDllPaths).Count -ne 1) { throw "Expected exactly one A4SMenu.dll mapping in taskbar Explorer PID $explorerProcessId." }
+    [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
+        -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
+        -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
     if (@([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId)).Count -ne 0) { throw 'Close the menu before running scenario automation.' }
 
-    $menu = $null
     $dismissedManually = $false
-    $focusAfterDismissal = $null
     try {
+        [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
+            -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
+            -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
         [A4SScenarioNative]::Toggle($hostWindow)
         $visibleWindows = @(Wait-MenuState -Visible $true -OwnerProcessId $explorerProcessId)
         if ($visibleWindows.Count -ne 1) { throw "Open/close automation found $($visibleWindows.Count) visible A4S menu windows; expected one." }
@@ -366,20 +519,68 @@ if ($AllowMenuAutomation) {
         }
     } finally {
         $leftVisible = @([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId))
-        if ($leftVisible.Count -gt 0) {
+        if ($leftVisible.Count -eq 1) {
             try {
+                [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
+                    -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
+                    -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
                 [A4SScenarioNative]::Toggle($hostWindow)
                 [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId)
             } catch {
                 Write-Warning "Could not confirm menu cleanup after scenario automation: $($_.Exception.Message)"
             }
+        } elseif ($leftVisible.Count -gt 1) {
+            Write-Warning "Cleanup found $($leftVisible.Count) visible A4S menu windows and refused an ambiguous toggle."
         }
     }
+    [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
+        -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
+        -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
+    $postHostEvidence = Get-StableFileEvidence $expectedHost
+    $postDllEvidence = Get-StableFileEvidence $expectedDll
+    $postProductRegistration = Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory
+    $postExplorer = [Diagnostics.Process]::GetProcessById([int]$explorerProcessId)
+    $postHost = [Diagnostics.Process]::GetProcessById([int]$residentHostProcessId)
+    try {
+        $postMapped = @($postExplorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
+        $postCompeting = @($postExplorer.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
+        if ($postProductRegistration.kind -ne $productRegistration.kind -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$postProductRegistration.activeSlot, [string]$productRegistration.activeSlot) -or
+            $postMapped.Count -ne 1 -or $postCompeting.Count -ne 0 -or $postHostEvidence.length -ne $hostFileEvidence.length -or
+            $postDllEvidence.length -ne $dllFileEvidence.length -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($postHost.MainModule.FileName), $expectedHost) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($postMapped[0].FileName), $expectedDll) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($postHostEvidence.sha256, $hostFileEvidence.sha256) -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($postDllEvidence.sha256, $dllFileEvidence.sha256) -or
+            (Get-A4SLoadedImageIdentity -ProcessId $residentHostProcessId -BaseAddress $postHost.MainModule.BaseAddress) -ne $hostLoadedIdentity -or
+            (Get-A4SLoadedImageIdentity -ProcessId $explorerProcessId -BaseAddress $postMapped[0].BaseAddress) -ne $dllLoadedIdentity) {
+            throw 'The staged or resident product identity changed during scenario automation.'
+        }
+    } finally { $postExplorer.Dispose(); $postHost.Dispose() }
     $automation = [ordered]@{
         openClosePassed = $true
         manualFocusDismissalRequested = [bool]$ObserveManualFocusDismissal
         manualFocusDismissalPassed = if ($ObserveManualFocusDismissal) { $dismissedManually } else { $null }
         focusAfterDismissal = $focusAfterDismissal
+        product = [ordered]@{
+            directory = $resolvedProductDirectory
+            registration = $productRegistration
+            hostPath = $expectedHost
+            hostSha256 = $hostFileEvidence.sha256
+            hostLength = $hostFileEvidence.length
+            hostFileIdentity = $hostFileIdentity
+            hostLoadedIdentity = $hostLoadedIdentity
+            dllPath = $expectedDll
+            dllSha256 = $dllFileEvidence.sha256
+            dllLength = $dllFileEvidence.length
+            dllFileIdentity = $dllFileIdentity
+            dllLoadedIdentity = $dllLoadedIdentity
+            hostPid = $residentHostProcessId
+            hostStartTimeUtc = [DateTime]::new($hostStartTicks, [DateTimeKind]::Utc).ToString('o')
+            explorerPid = $explorerProcessId
+            explorerStartTimeUtc = [DateTime]::new($explorerStartTicks, [DateTimeKind]::Utc).ToString('o')
+            logonId = $observerLogonId
+        }
         menuWindow = [ordered]@{
             hwnd = ('0x{0:X}' -f $menu.Handle)
             rect = [ordered]@{ left = $menu.Left; top = $menu.Top; width = $menu.Width; height = $menu.Height }
@@ -397,25 +598,64 @@ if ($AllowMenuAutomation) {
         Add-Assertion 'menu-scale-percent' $ExpectedMenuScalePercent $actualMenuScale ([Math]::Abs($actualMenuScale - $ExpectedMenuScalePercent) -lt 0.01)
     }
 }
+} catch {
+    $scenarioError = $_
+    $automation = [ordered]@{
+        openClosePassed = $false
+        manualFocusDismissalRequested = [bool]$ObserveManualFocusDismissal
+        manualFocusDismissalPassed = if ($ObserveManualFocusDismissal) { $false } else { $null }
+        focusAfterDismissal = $focusAfterDismissal
+        error = $_.Exception.Message
+        menuWindow = if ($menu) { [ordered]@{
+            hwnd = ('0x{0:X}' -f $menu.Handle)
+            rect = [ordered]@{ left = $menu.Left; top = $menu.Top; width = $menu.Width; height = $menu.Height }
+            monitor = $menu.Monitor
+            dpi = $menu.Dpi
+        } } else { $null }
+    }
+}
 
 $entry = [ordered]@{
     scenario = $ScenarioName
     capturedUtc = [DateTime]::UtcNow.ToString('o')
     notes = $Notes
     assertions = $assertions
-    assertionsPassed = @($assertions | Where-Object { -not $_.passed }).Count -eq 0
+    assertionsPassed = -not $scenarioError -and @($assertions | Where-Object { -not $_.passed }).Count -eq 0
     environment = $snapshot
     automation = $automation
+    executionError = if ($scenarioError) { $scenarioError.Exception.Message } else { $null }
 }
 
-$matrix.entries += $entry
 $matrixDirectory = Split-Path -Parent $resolvedMatrix
 if (-not (Test-Path -LiteralPath $matrixDirectory -PathType Container)) {
     New-Item -ItemType Directory -Path $matrixDirectory -Force | Out-Null
 }
-[IO.File]::WriteAllText($resolvedMatrix, (($matrix | ConvertTo-Json -Depth 15) + [Environment]::NewLine), [Text.UTF8Encoding]::new($false))
+$matrixMutex = [Threading.Mutex]::new($false, (Get-A4SMatrixMutexName $resolvedMatrix))
+$matrixLockHeld = $false
+try {
+    try { $matrixLockHeld = $matrixMutex.WaitOne([TimeSpan]::FromSeconds(30)) }
+    catch [Threading.AbandonedMutexException] { $matrixLockHeld = $true }
+    if (-not $matrixLockHeld) { throw "Timed out waiting to append scenario evidence to '$resolvedMatrix'." }
+    $currentMatrix = [ordered]@{ schemaVersion = 1; entries = @() }
+    if (Test-Path -LiteralPath $resolvedMatrix -PathType Leaf) {
+        $current = Get-Content -LiteralPath $resolvedMatrix -Raw | ConvertFrom-Json
+        if ($current.schemaVersion -ne 1) { throw "Unsupported stability-matrix schema in $resolvedMatrix." }
+        $currentMatrix.entries = @($current.entries)
+    }
+    if (@($currentMatrix.entries | Where-Object scenario -eq $ScenarioName).Count -ne 0) {
+        throw "Scenario '$ScenarioName' was written concurrently; refusing to replace or duplicate evidence."
+    }
+    $currentMatrix.entries += $entry
+    Write-A4SMatrixAtomically -Path $resolvedMatrix -Value $currentMatrix
+} finally {
+    if ($matrixLockHeld) { $matrixMutex.ReleaseMutex() }
+    $matrixMutex.Dispose()
+}
 
 Write-Host "Recorded A4S scenario '$ScenarioName': $resolvedMatrix"
+if ($scenarioError) {
+    throw "Scenario execution failed: $($scenarioError.Exception.Message). Evidence was preserved."
+}
 if (-not $entry.assertionsPassed) {
     $failed = @($assertions | Where-Object { -not $_.passed } | ForEach-Object { "$($_.name): expected '$($_.expected)', actual '$($_.actual)'" })
     throw "Scenario environment assertions failed: $($failed -join '; '). Evidence was preserved."

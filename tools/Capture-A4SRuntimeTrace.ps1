@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [switch]$AllowMenuAutomation,
-    [ValidateRange(1, 500)]
+    [ValidateRange(0, 500)]
     [int]$CapturedCycles = 20,
     [ValidateRange(0, 20)]
     [int]$WarmupCycles = 1,
@@ -12,6 +12,8 @@ param(
     [int]$VisibleSettleMilliseconds = 75,
     [ValidateRange(0, 2000)]
     [int]$HiddenSettleMilliseconds = 25,
+    [ValidateRange(0, 300)]
+    [int]$ManualInteractionSeconds = 0,
     [ValidateRange(1, 250)]
     [double]$WarmOpenTargetMilliseconds = 50,
     [ValidateRange(0, 1000)]
@@ -38,6 +40,23 @@ if (-not [Environment]::Is64BitProcess) {
 if ($OperatorAttestsFirstCapturedCycleIsCold -and $WarmupCycles -ne 0) {
     throw '-OperatorAttestsFirstCapturedCycleIsCold requires -WarmupCycles 0.'
 }
+if ($CapturedCycles -eq 0 -and $ManualInteractionSeconds -eq 0) {
+    throw 'At least one automated captured cycle or a positive -ManualInteractionSeconds window is required.'
+}
+if ($ManualInteractionSeconds -gt 0 -and $EnforceTargets) {
+    throw '-EnforceTargets is reserved for a closed automated-cycle trace; capture manual Programs/search phases in a separate non-enforcing trace.'
+}
+if ($ManualInteractionSeconds -gt 0 -and $CapturedCycles -ne 0) {
+    throw '-ManualInteractionSeconds is a separate phase trace and requires -CapturedCycles 0.'
+}
+if ($OperatorAttestsFirstCapturedCycleIsCold -and $CapturedCycles -eq 0) {
+    throw '-OperatorAttestsFirstCapturedCycleIsCold requires at least one automated captured cycle.'
+}
+if ($EnforceTargets -and ($CapturedCycles - $(if ($OperatorAttestsFirstCapturedCycleIsCold) { 1 } else { 0 })) -lt 20) {
+    throw '-EnforceTargets requires at least 20 warm automated cycles (21 total when the first is classified cold).'
+}
+
+Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
 
 if (-not ('A4SRuntimeTraceNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -358,6 +377,26 @@ function Resolve-A4SUnresolvedPath {
     return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
 }
 
+function Write-A4SJsonAtomicallyReplacing {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "Cannot enrich missing trace report '$Path'." }
+    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $json = ($Value | ConvertTo-Json -Depth 14) + [Environment]::NewLine
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+        [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+    try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
+    finally { $stream.Dispose() }
+    $backup = "$Path.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
+    $replaced = $false
+    try {
+        [IO.File]::Replace($temporary, $Path, $backup, $true)
+        $replaced = $true
+    } finally {
+        if ($replaced -and [IO.File]::Exists($backup)) { [IO.File]::Delete($backup) }
+    }
+}
+
 function Wait-A4SMenuVisibility {
     param(
         [Parameter(Mandatory)][bool]$Visible,
@@ -414,7 +453,8 @@ function Assert-A4SResidentContext {
         [Parameter(Mandatory)][uint32]$ExpectedHostProcessId,
         [Parameter(Mandatory)][int64]$ExpectedHostStartTicks,
         [Parameter(Mandatory)][uint32]$ExpectedExplorerProcessId,
-        [Parameter(Mandatory)][int64]$ExpectedExplorerStartTicks
+        [Parameter(Mandatory)][int64]$ExpectedExplorerStartTicks,
+        [Parameter(Mandatory)][string]$ExpectedLogonId
     )
     $currentHostWindow = [A4SRuntimeTraceNative]::HostWindow()
     if ($currentHostWindow -eq [IntPtr]::Zero -or $currentHostWindow -ne $ExpectedHostWindow) {
@@ -434,9 +474,18 @@ function Assert-A4SResidentContext {
     }
     $currentHost = [Diagnostics.Process]::GetProcessById([int]$ExpectedHostProcessId)
     $currentExplorer = [Diagnostics.Process]::GetProcessById([int]$ExpectedExplorerProcessId)
-    if ($currentHost.StartTime.ToUniversalTime().Ticks -ne $ExpectedHostStartTicks -or
-        $currentExplorer.StartTime.ToUniversalTime().Ticks -ne $ExpectedExplorerStartTicks) {
-        throw 'A validated process exited and its PID was reused during capture.'
+    try {
+        if ($currentHost.StartTime.ToUniversalTime().Ticks -ne $ExpectedHostStartTicks -or
+            $currentExplorer.StartTime.ToUniversalTime().Ticks -ne $ExpectedExplorerStartTicks) {
+            throw 'A validated process exited and its PID was reused during capture.'
+        }
+        if ((Get-A4SProcessLogonId -ProcessId $ExpectedHostProcessId) -ne $ExpectedLogonId -or
+            (Get-A4SProcessLogonId -ProcessId $ExpectedExplorerProcessId) -ne $ExpectedLogonId) {
+            throw 'The resident host or Explorer logon identity changed during capture.'
+        }
+    } finally {
+        $currentHost.Dispose()
+        $currentExplorer.Dispose()
     }
     if ([A4SRuntimeTraceNative]::HostStatus($currentHostWindow, 2500) -ne 3) {
         throw 'A4SMenuHost is no longer READY.'
@@ -447,6 +496,7 @@ function Assert-A4SResidentContext {
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 if (-not $ProductDirectory) { $ProductDirectory = Join-Path $repoRoot 'build\stage\A4SProduct' }
 $resolvedProductDirectory = Resolve-A4SUnresolvedPath $ProductDirectory
+$productRegistration = Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory
 $expectedHost = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenuHost.exe'))
 $expectedDll = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenu.dll'))
 foreach ($requiredFile in @($expectedHost, $expectedDll)) {
@@ -472,6 +522,11 @@ $observerSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
 if ($residentHost.SessionId -ne $observerSessionId -or $explorer.SessionId -ne $observerSessionId) {
     throw "Observer, resident host, and Explorer must share the interactive session. observer=$observerSessionId host=$($residentHost.SessionId) explorer=$($explorer.SessionId)."
 }
+$observerLogonId = Get-A4SProcessLogonId -ProcessId ([uint32][Diagnostics.Process]::GetCurrentProcess().Id)
+if ((Get-A4SProcessLogonId -ProcessId $residentHostProcessId) -ne $observerLogonId -or
+    (Get-A4SProcessLogonId -ProcessId $explorerProcessId) -ne $observerLogonId) {
+    throw 'Observer, resident host, and Explorer do not share one Windows logon identity.'
+}
 $startAllBackRegistryPath = 'Registry::HKEY_CURRENT_USER\Software\StartIsBack'
 $startAllBackDisabledState = $null
 if (Test-Path -LiteralPath $startAllBackRegistryPath) {
@@ -485,9 +540,13 @@ if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHost, $expectedHost))
     throw "The resident host is not the exact staged host. Expected '$expectedHost'; found '$actualHost'."
 }
 $mappedDlls = @($explorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
+$competingStartMenuModules = @($explorer.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
 $mappedDllPaths = @($mappedDlls | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
 if ($mappedDlls.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDllPaths[0], $expectedDll)) {
     throw "Expected exactly one staged A4SMenu.dll mapping in Explorer PID $explorerProcessId; found '$($mappedDllPaths -join '; ')'."
+}
+if ($competingStartMenuModules.Count -ne 0) {
+    throw "A competing StartAllBack/StartIsBack/Open-Shell module remains mapped in Explorer: '$(@($competingStartMenuModules.FileName) -join '; ')'."
 }
 $initialHostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
 $initialDllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
@@ -515,9 +574,13 @@ if (@([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId)).Count -ne
     throw 'Close the A4S menu before capture. The tool refuses to guess or alter the initial state.'
 }
 
+$observedNominalRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
+$refreshRateSource = if ($RefreshRateHz -gt 0) { 'operator-supplied-and-checked-against-EnumDisplaySettings' } else { 'EnumDisplaySettings-current-mode-integer' }
 if ($RefreshRateHz -eq 0) {
-    $RefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
+    $RefreshRateHz = $observedNominalRefreshRateHz
     if ($RefreshRateHz -eq 0) { throw 'Could not determine the active display refresh rate; pass -RefreshRateHz explicitly.' }
+} elseif ($observedNominalRefreshRateHz -gt 0 -and [Math]::Abs($RefreshRateHz - $observedNominalRefreshRateHz) -gt 1.0) {
+    throw "The supplied refresh rate $RefreshRateHz Hz differs materially from the current-mode integer value $observedNominalRefreshRateHz Hz. Recheck the active display before using a one-frame target."
 }
 if (-not $OutputDirectory) {
     $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff')
@@ -542,6 +605,10 @@ $completedCycles = 0
 
 try {
     for ($warmup = 0; $warmup -lt $WarmupCycles; $warmup++) {
+        [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
+            -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
+            -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
+            -ExpectedLogonId $observerLogonId)
         [void](Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId)
     }
     if ([A4SRuntimeTraceNative]::HostStatus($hostWindow, 2500) -ne 3) { throw 'A4SMenuHost left READY during warm-up.' }
@@ -563,8 +630,16 @@ try {
         throw "logman could not start ETW session '$sessionName' (exit $($startResult.exitCode)): $($startResult.output -join ' ')"
     }
     for ($cycle = 0; $cycle -lt $CapturedCycles; $cycle++) {
+        [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
+            -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
+            -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
+            -ExpectedLogonId $observerLogonId)
         [void](Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId)
         $completedCycles++
+    }
+    if ($ManualInteractionSeconds -gt 0) {
+        Write-Host "Manual trace window: for the next $ManualInteractionSeconds seconds, use the A4S menu normally. Open All Programs, wait for it to populate, return, then type a non-empty search query and let results settle."
+        Start-Sleep -Seconds $ManualInteractionSeconds
     }
 } catch {
     $captureError = $_
@@ -572,7 +647,8 @@ try {
     try {
         [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
-            -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks)
+            -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
+            -ExpectedLogonId $observerLogonId)
         $visible = @([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId))
         if ($visible.Count -eq 1) {
             [A4SRuntimeTraceNative]::Toggle($hostWindow, 2500)
@@ -607,10 +683,14 @@ try {
 try {
     [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
         -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
-        -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks)
+        -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
+        -ExpectedLogonId $observerLogonId)
     $postHostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
     $postDllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($preflightHostSha256, $postHostSha256) -or
+    $postProductRegistration = Get-A4SProductDirectoryRegistration -ProductDirectory $resolvedProductDirectory
+    if ($postProductRegistration.kind -ne $productRegistration.kind -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$postProductRegistration.activeSlot, [string]$productRegistration.activeSlot) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($preflightHostSha256, $postHostSha256) -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals($preflightDllSha256, $postDllSha256)) {
         throw 'A staged product binary changed while the trace was running.'
     }
@@ -622,14 +702,22 @@ try {
     } elseif ($null -ne $startAllBackDisabledState) {
         throw 'StartAllBack registry state changed while the trace was running.'
     }
+    $postMappedDlls = @($explorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
+    $postMappedDllPaths = @($postMappedDlls | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
+    if ($postMappedDlls.Count -ne 1 -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals($postMappedDllPaths[0], $expectedDll)) {
+        throw "The exact Explorer A4SMenu.dll mapping changed during the trace; found '$($postMappedDllPaths -join '; ')'."
+    }
     $postHostLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
         $residentHostProcessId, $residentHost.MainModule.BaseAddress)
     $postDllLoadedIdentity = [A4SRuntimeTraceNative]::LoadedImageIdentity(
-        $explorerProcessId, $mappedDlls[0].BaseAddress)
+        $explorerProcessId, $postMappedDlls[0].BaseAddress)
     if (-not [StringComparer]::Ordinal.Equals($hostFileIdentity, $postHostLoadedIdentity) -or
         -not [StringComparer]::Ordinal.Equals($dllFileIdentity, $postDllLoadedIdentity)) {
         throw 'A resident product image changed identity while the trace was running.'
     }
+    $postCompetingModules = @($explorer.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
+    if ($postCompetingModules.Count -ne 0) { throw 'A competing StartAllBack/StartIsBack/Open-Shell module appeared during the trace.' }
 } catch { $integrityError = $_ }
 
 if ($stopError) {
@@ -659,10 +747,14 @@ try {
         EtlPath = $etlPath
         ExpectedProcessId = $explorerProcessId
         ColdSampleCount = $coldSampleCount
-        ExpectedCycleCount = $CapturedCycles
+        ExpectedCycleCount = $(if ($ManualInteractionSeconds -gt 0) { 0 } else { $CapturedCycles })
         WarmOpenTargetMilliseconds = $WarmOpenTargetMilliseconds
         RefreshRateHz = $RefreshRateHz
         OutputPath = $reportPath
+    }
+    if ($ManualInteractionSeconds -gt 0) {
+        $conversionArguments['MinimumWarmSampleCount'] = 1
+        $conversionArguments['MinimumCloseSampleCount'] = 1
     }
     if ($EnforceTargets) { $conversionArguments['EnforceTargets'] = $true }
     [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') @conversionArguments)
@@ -671,6 +763,16 @@ try {
 if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
     try {
         $report = Get-Content -LiteralPath $reportPath -Raw | ConvertFrom-Json
+        $currentEtlHash = (Get-FileHash -LiteralPath $etlPath -Algorithm SHA256).Hash
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$report.source.sha256, $currentEtlHash)) {
+            throw 'The raw ETL changed after conversion; refusing to publish capture metadata.'
+        }
+        if ($report.source.tracerptXmlPath) {
+            $currentXmlHash = (Get-FileHash -LiteralPath ([string]$report.source.tracerptXmlPath) -Algorithm SHA256).Hash
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$report.source.tracerptXmlSha256, $currentXmlHash)) {
+                throw 'The decoded tracerpt XML changed after conversion; refusing to publish capture metadata.'
+            }
+        }
         $capture = [pscustomobject][ordered]@{
             sessionName = $sessionName
             providerMode = 'real-time plus sequential ETL file'
@@ -679,10 +781,20 @@ if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             requestedCycles = $CapturedCycles
             completedCycles = $completedCycles
             warmupCycles = $WarmupCycles
+            manualInteractionSeconds = $ManualInteractionSeconds
+            tracePurpose = if ($ManualInteractionSeconds -gt 0) { 'manual Programs/search/interaction phase capture; target enforcement disabled' } else { 'automated open/close target capture' }
+            refreshRateHz = $RefreshRateHz
+            refreshRateSource = $refreshRateSource
+            observedNominalRefreshRateHz = $observedNominalRefreshRateHz
             explorerProcessId = $explorerProcessId
+            explorerStartTimeUtc = $explorer.StartTime.ToUniversalTime().ToString('o')
             residentHostProcessId = $residentHostProcessId
+            residentHostStartTimeUtc = $residentHost.StartTime.ToUniversalTime().ToString('o')
+            observerSessionId = $observerSessionId
+            logonId = $observerLogonId
             startAllBackDisabled = if ($null -eq $startAllBackDisabledState) { 'notInstalledOrUnconfigured' } else { [int]$startAllBackDisabledState }
             productDirectory = $resolvedProductDirectory
+            productRegistration = $productRegistration
             hostPath = $expectedHost
             hostSha256 = $preflightHostSha256
             hostFileIdentity = $hostFileIdentity
@@ -695,9 +807,10 @@ if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             cleanupError = if ($cleanupError) { $cleanupError.Exception.Message } else { $null }
             integrityError = if ($integrityError) { $integrityError.Exception.Message } else { $null }
             artifactErrors = @($artifactErrors)
+            rawEtlSha256 = $currentEtlHash
         }
         $report | Add-Member -NotePropertyName capture -NotePropertyValue $capture -Force
-        $report | ConvertTo-Json -Depth 14 | Set-Content -LiteralPath $reportPath -Encoding UTF8
+        Write-A4SJsonAtomicallyReplacing -Path $reportPath -Value $report
     } catch {
         [void]$artifactErrors.Add("Could not enrich the runtime report with capture metadata: $($_.Exception.Message)")
     }

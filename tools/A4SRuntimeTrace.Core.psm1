@@ -196,14 +196,14 @@ function Import-A4SEventJson {
 function Get-A4SDurationMilliseconds {
     param($Start, $End)
     if ($null -eq $Start -or $null -eq $End) { return $null }
-    return [Math]::Round((([DateTimeOffset]$End) - ([DateTimeOffset]$Start)).TotalMilliseconds, 3)
+    return (([DateTimeOffset]$End) - ([DateTimeOffset]$Start)).TotalMilliseconds
 }
 
 function Get-A4SStatistics {
     param([object[]]$Values)
     $numbers = @($Values | Where-Object { $null -ne $_ } | ForEach-Object { [double]$_ } | Sort-Object)
     if ($numbers.Count -eq 0) {
-        return [pscustomobject][ordered]@{ count = 0; p50Milliseconds = $null; p95Milliseconds = $null; maxMilliseconds = $null; meanMilliseconds = $null }
+        return [pscustomobject][ordered]@{ count = 0; p50Milliseconds = $null; p95Milliseconds = $null; p95UnroundedMilliseconds = $null; maxMilliseconds = $null; meanMilliseconds = $null }
     }
     $p50Index = [Math]::Max(0, [Math]::Ceiling(0.50 * $numbers.Count) - 1)
     $p95Index = [Math]::Max(0, [Math]::Ceiling(0.95 * $numbers.Count) - 1)
@@ -211,6 +211,7 @@ function Get-A4SStatistics {
         count = $numbers.Count
         p50Milliseconds = [Math]::Round($numbers[$p50Index], 3)
         p95Milliseconds = [Math]::Round($numbers[$p95Index], 3)
+        p95UnroundedMilliseconds = [double]$numbers[$p95Index]
         maxMilliseconds = [Math]::Round($numbers[-1], 3)
         meanMilliseconds = [Math]::Round((($numbers | Measure-Object -Average).Average), 3)
     }
@@ -448,9 +449,9 @@ function ConvertTo-A4SRuntimeReport {
 		p95Pixels = if ($paintAreas.Count) { [long]$paintAreas[[Math]::Max(0,[Math]::Ceiling($paintAreas.Count*0.95)-1)] } else { $null }
 		maximumPixels = if ($paintAreas.Count) { [long]$paintAreas[-1] } else { $null }
 	}
-    $frameBudget = [Math]::Round(1000.0 / $RefreshRateHz, 3)
-    $warmStatus = if ($warmOpen.count -eq 0) { 'notMeasured' } elseif ($warmOpen.p95Milliseconds -le $WarmOpenTargetMilliseconds) { 'pass' } else { 'fail' }
-    $closeStatus = if ($close.count -eq 0) { 'notMeasured' } elseif ($close.p95Milliseconds -le $frameBudget) { 'pass' } else { 'fail' }
+    $frameBudget = 1000.0 / $RefreshRateHz
+    $warmStatus = if ($warmOpen.count -eq 0) { 'notMeasured' } elseif ($warmOpen.p95UnroundedMilliseconds -le $WarmOpenTargetMilliseconds) { 'pass' } else { 'fail' }
+    $closeStatus = if ($close.count -eq 0) { 'notMeasured' } elseif ($close.p95UnroundedMilliseconds -le $frameBudget) { 'pass' } else { 'fail' }
     $completeStatus = if ($diagnostics.Count -eq 0 -and $cycles.Count -gt 0) { 'pass' } else { 'fail' }
     $cycleCountStatus = if ($ExpectedCycleCount -eq 0) { 'notMeasured' } elseif ($cycles.Count -eq $ExpectedCycleCount) { 'pass' } else { 'fail' }
     $warmSampleStatus = if ($completeWarmCycles.Count -ge $MinimumWarmSampleCount) { 'pass' } else { 'fail' }
@@ -508,7 +509,7 @@ function ConvertTo-A4SRuntimeReport {
         targetEvaluation = [pscustomobject][ordered]@{
             overallCustomTraceStatus = $overallStatus
             warmOpen = [pscustomobject][ordered]@{ metric = 'activationRequested to windowVisible'; p95Milliseconds = $warmOpen.p95Milliseconds; targetMilliseconds = $WarmOpenTargetMilliseconds; status = $warmStatus }
-            close = [pscustomobject][ordered]@{ metric = 'close activationRequested to windowHidden'; p95Milliseconds = $close.p95Milliseconds; refreshRateHz = $RefreshRateHz; frameBudgetMilliseconds = $frameBudget; status = $closeStatus }
+            close = [pscustomobject][ordered]@{ metric = 'close activationRequested to windowHidden'; p95Milliseconds = $close.p95Milliseconds; refreshRateHz = $RefreshRateHz; frameBudgetMilliseconds = [Math]::Round($frameBudget, 6); status = $closeStatus }
             cycleCount = [pscustomobject][ordered]@{ expected = if ($ExpectedCycleCount -gt 0) { $ExpectedCycleCount } else { $null }; actual = $cycles.Count; status = $cycleCountStatus }
             warmSampleSufficiency = [pscustomobject][ordered]@{ minimum = $MinimumWarmSampleCount; actual = $completeWarmCycles.Count; status = $warmSampleStatus }
             closeSampleSufficiency = [pscustomobject][ordered]@{ minimum = $MinimumCloseSampleCount; actual = $completeCycles.Count; status = $closeSampleStatus }

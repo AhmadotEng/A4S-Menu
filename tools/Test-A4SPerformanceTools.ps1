@@ -1,5 +1,5 @@
 [CmdletBinding()]
-param()
+param([switch] $SkipObservationSmokeTest)
 
 $ErrorActionPreference = 'Stop'
 
@@ -91,6 +91,12 @@ foreach ($name in $toolNames) {
 
 $performanceSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Measure-A4SProductPerformance.ps1') -Raw
 $scenarioSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Test-A4SCurrentScenario.ps1') -Raw
+$snapshotSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1') -Raw
+$resolverPath = Join-Path $PSScriptRoot 'Resolve-A4SInstalledProductDirectory.ps1'
+$resolverTokens = $null
+$resolverErrors = $null
+[void][Management.Automation.Language.Parser]::ParseFile($resolverPath, [ref]$resolverTokens, [ref]$resolverErrors)
+if ($resolverErrors.Count) { throw "Resolve-A4SInstalledProductDirectory.ps1 has parse errors: $($resolverErrors -join '; ')" }
 foreach ($sourceRecord in @(
     @{ name = 'Measure-A4SProductPerformance.ps1'; source = $performanceSource },
     @{ name = 'Test-A4SCurrentScenario.ps1'; source = $scenarioSource }
@@ -105,18 +111,72 @@ foreach ($sourceRecord in @(
 if ($performanceSource -match '\b(open|close)PresentedMilliseconds\b|\bcloseWithinOneFrame\b|\bwarmOpenDiskQuiet') {
     throw 'The performance tool contains an overclaimed presentation-frame or physical-disk evidence field.'
 }
+if ($performanceSource -notmatch 'EnterPhysicalCapture' -or $performanceSource -notmatch 'LeavePhysicalCapture') {
+    throw 'Pop-in screen captures are not held under a physical-coordinate DPI context.'
+}
+if ($performanceSource -notmatch 'Get-A4SLoadedImageIdentity' -or
+    $performanceSource -notmatch 'baseline\.product\.selectedHost\.sha256' -or
+    $performanceSource -notmatch 'Write-DurableJsonCreateNew' -or
+    $performanceSource -notmatch 'Get-A4SProductDirectoryRegistration') {
+    throw 'The performance tool is not strongly bound to resident images, the clean-baseline payload hashes, and durable no-overwrite evidence.'
+}
+if ($performanceSource -notmatch '\$EnforceTargets -and -not \$BaselinePath' -or
+    $performanceSource -notmatch '\$EnforceTargets -and \$WarmSamples -lt 20' -or
+    $performanceSource -notmatch '\$EnforceTargets -and \$IdleSeconds -lt 10') {
+    throw 'Enforced performance qualification can run without a clean baseline, sufficient warm samples, or a meaningful idle interval.'
+}
+if ($scenarioSource -notmatch 'Get-A4SLoadedImageIdentity' -or
+    $scenarioSource -notmatch 'Write-A4SMatrixAtomically' -or
+    $scenarioSource -notmatch 'refused an ambiguous toggle' -or
+    $scenarioSource -match 'File\]::Replace\([^\r\n]*\$null') {
+    throw 'The scenario tool lacks exact resident-image binding, atomic matrix persistence, or ambiguous-cleanup protection.'
+}
+if ($snapshotSource -notmatch 'MaximumCleanExplorerAgeSeconds' -or
+    $snapshotSource -notmatch 'The taskbar Explorer identity changed' -or
+    $snapshotSource -notmatch 'ProcessLogonId' -or
+    $snapshotSource -notmatch '\[string\]\s*\$ProductDirectory' -or
+    $snapshotSource -notmatch 'Get-A4SProductDirectoryRegistration' -or
+    $snapshotSource -notmatch 'Get-A4SHostProcessRecords') {
+    throw 'The clean snapshot does not enforce freshness and stable Explorer/logon identity.'
+}
+
+$identityModulePath = Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1'
+$identityTokens = $null
+$identityErrors = $null
+$identityAst = [Management.Automation.Language.Parser]::ParseFile($identityModulePath, [ref]$identityTokens, [ref]$identityErrors)
+if ($identityErrors.Count) { throw "A4SBinaryIdentity.psm1 has parse errors: $($identityErrors -join '; ')" }
+$identityText = Get-Content -LiteralPath $identityModulePath -Raw
+if ($identityText -notmatch 'Get-A4SInstalledActiveSlot' -or
+    $identityText -notmatch 'one direct child of the canonical versions directory' -or
+    $identityText -notmatch 'ReparsePoint' -or
+    (Get-Content -LiteralPath $resolverPath -Raw) -notmatch 'Get-A4SInstalledActiveSlot') {
+    throw 'Installed ActiveSlot resolution is not canonical, reparse-aware, and shared with the qualification tools.'
+}
+$identitySources = @($identityAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.StringConstantExpressionAst] -and
+        $node.Value -match 'public static class A4SBinaryIdentityNative'
+}, $true))
+if ($identitySources.Count -ne 1) { throw 'Could not uniquely locate the shared binary-identity native helper.' }
+$identityClassName = 'A4SBinaryIdentityNativeStaticGate' + [Guid]::NewGuid().ToString('N')
+$identityCompileSource = [Regex]::Replace($identitySources[0].Value, '\bA4SBinaryIdentityNative\b', $identityClassName)
+Add-Type -TypeDefinition $identityCompileSource
+if (-not ($identityClassName -as [type])) { throw 'Could not compile the shared binary-identity native helper.' }
 
 if (-not [Environment]::Is64BitProcess) {
     throw 'Run this static tool gate from 64-bit PowerShell.'
 }
-$snapshot = (& (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1')) | ConvertFrom-Json
-if ($snapshot.schemaVersion -ne 1 -or -not $snapshot.explorer.pid -or
-    $snapshot.observerSessionId -ne $snapshot.explorer.sessionId -or
-    @($snapshot.desktop.monitors).Count -lt 1 -or
-    @($snapshot.desktop.monitors | Where-Object primary).Count -ne 1 -or
-    @($snapshot.desktop.monitors | Where-Object { -not $_.dpiAvailable }).Count -ne 0 -or
-    -not $snapshot.desktop.taskbar.hwnd) {
-    throw 'The read-only observation smoke test returned an incomplete snapshot.'
+if (-not $SkipObservationSmokeTest) {
+    $snapshot = (& (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1')) | ConvertFrom-Json
+    if ($snapshot.schemaVersion -ne 2 -or -not $snapshot.explorer.pid -or
+        $snapshot.observerSessionId -ne $snapshot.explorer.sessionId -or
+        $snapshot.observerLogonId -ne $snapshot.explorer.logonId -or
+        @($snapshot.desktop.monitors).Count -lt 1 -or
+        @($snapshot.desktop.monitors | Where-Object primary).Count -ne 1 -or
+        @($snapshot.desktop.monitors | Where-Object { -not $_.dpiAvailable }).Count -ne 0 -or
+        -not $snapshot.desktop.taskbar.hwnd) {
+        throw 'The read-only observation smoke test returned an incomplete snapshot.'
+    }
 }
 
-Write-Host 'PASS: performance/stability tools parse, fresh native-helper copies compile with verified interop layouts, explicit automation gates and process ownership checks are present, the curated mutation denylist is clear, and the read-only observation smoke test is valid.'
+Write-Host "PASS: performance/stability tools parse, fresh native-helper copies compile with verified interop layouts, exact resident/payload binding and durable evidence contracts are present, and the curated mutation denylist is clear$(if($SkipObservationSmokeTest){' (observation smoke test intentionally skipped)'}else{'; the read-only observation smoke test is valid'})."
