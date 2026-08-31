@@ -21,6 +21,10 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = 'Recover')]
     [ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+    [string] $ExpectedManifestSha256,
+
+    [Parameter(Mandatory, ParameterSetName = 'Recover')]
+    [ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
     [string] $ExpectedCurrentHostSafetySha256,
 
     [Parameter(Mandatory, ParameterSetName = 'Isolated')]
@@ -162,6 +166,9 @@ public static class A4SFailureRecoveryNative
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool MoveFileExW(string existingName, string newName, uint flags);
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool CreateDirectoryW(string path, IntPtr securityAttributes);
 
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr LoadLibraryExW(string fileName, IntPtr file, uint flags);
@@ -501,6 +508,13 @@ public static class A4SFailureRecoveryNative
                 "Could not atomically publish the evidence file.");
     }
 
+    public static void CreateFreshDirectory(string path)
+    {
+        if (!CreateDirectoryW(path, IntPtr.Zero))
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Could not atomically create the fresh directory: " + path);
+    }
+
     public static bool IsLoadableNonProductDll(string path)
     {
         const uint LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR = 0x100;
@@ -628,7 +642,7 @@ function New-SafeFreshDirectory {
     if (Test-Path -LiteralPath $fullPath) {
         throw "$Description must be fresh and absent: $fullPath"
     }
-    [void](New-Item -ItemType Directory -LiteralPath $fullPath -ErrorAction Stop)
+    [A4SFailureRecoveryNative]::CreateFreshDirectory($fullPath)
     $created = Get-CanonicalPathRecord -Path $fullPath -Description $Description -Kind Directory
     if (-not (Test-PathWithin -Path $created.finalPath -Parent $parent.finalPath)) {
         throw "$Description escaped its validated parent after creation: $($created.finalPath)"
@@ -670,23 +684,94 @@ function Remove-A4STemporaryRoot {
     param([Parameter(Mandatory)][object] $Root)
 
     $safe = Assert-SafeTemporaryRoot -Root $Root
-    $children = @(Get-ChildItem -LiteralPath $safe.finalPath -Force -Recurse -ErrorAction Stop)
-    foreach ($child in $children) {
-        $kind = if ($child.PSIsContainer) { 'Directory' } else { 'File' }
-        $validated = Get-CanonicalPathRecord -Path $child.FullName `
-            -Description 'temporary cleanup descendant' -Kind $kind
-        if (-not (Test-PathWithin -Path $validated.finalPath -Parent $safe.finalPath)) {
-            throw "Temporary cleanup descendant escaped the validated root: $($validated.finalPath)"
+    $allowedDirectoryFiles = @{
+        missing = @('A4SMenuHost.exe')
+        corrupt = @('A4SMenuHost.exe', 'A4SMenu.dll')
+        incompatible = @('A4SMenuHost.exe', 'A4SMenu.dll')
+        'safety-reset-no-dll' = @('A4SMenuHost.exe')
+        'valid-runtime' = @('A4SMenuHost.exe', 'A4SMenu.dll')
+    }
+    $allowedDirectories = @($allowedDirectoryFiles.Keys)
+    $allowedRootFiles = @('HostSafetyBackup.json', 'HostSafety.reg')
+    $files = [Collections.ArrayList]::new()
+    $directories = [Collections.ArrayList]::new()
+
+    foreach ($child in @(Get-ChildItem -LiteralPath $safe.finalPath -Force -ErrorAction Stop)) {
+        if ($child.PSIsContainer) {
+            if ([string]$child.Name -notin $allowedDirectories) {
+                throw "Temporary cleanup found an unknown direct directory: $($child.FullName)"
+            }
+            $directory = Get-CanonicalPathRecord -Path $child.FullName `
+                -Description 'temporary cleanup direct directory' -Kind Directory
+            if (-not (Test-PathWithin -Path $directory.finalPath -Parent $safe.finalPath)) {
+                throw "Temporary cleanup directory escaped the validated root: $($directory.finalPath)"
+            }
+            foreach ($grandchild in @(Get-ChildItem -LiteralPath $directory.finalPath `
+                    -Force -ErrorAction Stop)) {
+                if ($grandchild.PSIsContainer -or
+                    [string]$grandchild.Name -notin @($allowedDirectoryFiles[$child.Name])) {
+                    throw "Temporary cleanup permits only exact known files one level below the root: $($grandchild.FullName)"
+                }
+                $file = Get-CanonicalPathRecord -Path $grandchild.FullName `
+                    -Description 'temporary cleanup known file' -Kind File
+                if (-not (Test-PathWithin -Path $file.finalPath -Parent $directory.finalPath)) {
+                    throw "Temporary cleanup file escaped its validated direct directory: $($file.finalPath)"
+                }
+                [void]$files.Add([ordered]@{ record=$file; parent=$directory })
+            }
+            [void]$directories.Add($directory)
+        }
+        else {
+            if ([string]$child.Name -notin $allowedRootFiles) {
+                throw "Temporary cleanup found an unknown direct file: $($child.FullName)"
+            }
+            $file = Get-CanonicalPathRecord -Path $child.FullName `
+                -Description 'temporary cleanup known direct file' -Kind File
+            if (-not (Test-PathWithin -Path $file.finalPath -Parent $safe.finalPath)) {
+                throw "Temporary cleanup direct file escaped the validated root: $($file.finalPath)"
+            }
+            [void]$files.Add([ordered]@{ record=$file; parent=$safe })
         }
     }
+
+    foreach ($entry in @($files)) {
+        $parentNow = Get-CanonicalPathRecord -Path $entry.parent.finalPath `
+            -Description 'temporary cleanup immediate file parent' -Kind Directory
+        $fileNow = Get-CanonicalPathRecord -Path $entry.record.finalPath `
+            -Description 'temporary cleanup immediate known file' -Kind File
+        if ($parentNow.identity -cne $entry.parent.identity -or
+            $fileNow.identity -cne $entry.record.identity -or
+            -not (Test-PathWithin -Path $fileNow.finalPath -Parent $parentNow.finalPath)) {
+            throw 'A temporary cleanup file or its parent changed identity immediately before deletion.'
+        }
+        Remove-Item -LiteralPath $fileNow.finalPath -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $fileNow.finalPath) {
+            throw "Temporary cleanup could not prove exact file deletion: $($fileNow.finalPath)"
+        }
+    }
+
+    foreach ($directory in @($directories)) {
+        $directoryNow = Get-CanonicalPathRecord -Path $directory.finalPath `
+            -Description 'temporary cleanup immediate direct directory' -Kind Directory
+        if ($directoryNow.identity -cne $directory.identity -or
+            @(Get-ChildItem -LiteralPath $directoryNow.finalPath -Force -ErrorAction Stop).Count -ne 0) {
+            throw 'A temporary direct directory changed identity or was not empty immediately before deletion.'
+        }
+        Remove-Item -LiteralPath $directoryNow.finalPath -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $directoryNow.finalPath) {
+            throw "Temporary cleanup could not prove exact directory deletion: $($directoryNow.finalPath)"
+        }
+    }
+
     $safeAgain = Assert-SafeTemporaryRoot -Root $Root
     if ($safeAgain.identity -cne $safe.identity -or
-        $safeAgain.finalPath -ine $safe.finalPath) {
-        throw 'The temporary root changed after descendant validation.'
+        @(Get-ChildItem -LiteralPath $safeAgain.finalPath -Force -ErrorAction Stop).Count -ne 0) {
+        throw 'The temporary root changed identity or was not empty immediately before deletion.'
     }
-    # This is the sole recursive deletion in the harness. The root handle identity
-    # and every descendant final path were revalidated immediately above.
-    Remove-Item -LiteralPath $safe.finalPath -Recurse -Force -ErrorAction Stop
+    Remove-Item -LiteralPath $safeAgain.finalPath -Force -ErrorAction Stop
+    if (Test-Path -LiteralPath $safeAgain.finalPath) {
+        throw "Temporary cleanup could not prove exact root deletion: $($safeAgain.finalPath)"
+    }
 }
 
 function Write-DurableNewText {
@@ -779,40 +864,56 @@ function Set-RetainedTemporaryRootEvidence {
         [Parameter(Mandatory)][string] $Root,
         [Parameter(Mandatory)][bool] $BackupPrepared,
         [Parameter(Mandatory)][string] $Reason,
-        [string] $Bundle
+        [string] $Bundle,
+        [object] $AuthorizedState,
+        [string] $ProbeHost
     )
 
     if ($null -eq $script:Evidence.recovery) {
         $script:Evidence.recovery = [ordered]@{}
     }
-    $script:Evidence.recovery['retainedTemporaryRoot'] = [IO.Path]::GetFullPath($Root)
+    $rootFullPath = [IO.Path]::GetFullPath($Root)
+    $quotedRoot = $rootFullPath.Replace("'", "''")
+    $script:Evidence.recovery['retainedTemporaryRoot'] = $rootFullPath
     $script:Evidence.recovery['retentionReason'] = $Reason
     if ($BackupPrepared) {
-        if (-not $script:Evidence.recovery.Contains('authorizedCurrentHostSafetySha256') -or
-            [string]::IsNullOrWhiteSpace(
-                [string]$script:Evidence.recovery.authorizedCurrentHostSafetySha256)) {
-            try {
-                $aggregate = Get-HostSafetyAggregateRecord
-                $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $aggregate.sha256
+        $script:Evidence.recovery['freshKnownCurrentHostSafetySha256'] = $null
+        $script:Evidence.recovery['freshKnownCurrentStateUtc'] = $null
+        $script:Evidence.recovery['recoveryCommand'] = $null
+        $known = $null
+        try {
+            if ($null -eq $AuthorizedState) {
+                throw 'No harness-produced authorized state sequence is available.'
             }
-            catch {
-                $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $null
-                [void]$script:Evidence.errors.Add(
-                    "Could not record a recovery authorization hash: $($_.Exception.Message)")
-            }
+            $known = Get-A4SConfirmedRecoveryAuthorization `
+                -State $AuthorizedState -ProbeHost $ProbeHost
+            $script:Evidence.recovery['freshKnownCurrentHostSafetySha256'] = $known.sha256
+            $script:Evidence.recovery['freshKnownCurrentStateUtc'] = $known.observedUtc
         }
-        $authorizedHash = [string]$script:Evidence.recovery.authorizedCurrentHostSafetySha256
-        $recoveryStep = if ($authorizedHash -match '\A[A-Fa-f0-9]{64}\z') {
-            "run this harness with -RecoverHostSafety -RecoveryBundle '$Bundle' -ExpectedCurrentHostSafetySha256 '$authorizedHash'"
-        } else {
-            'do not run recovery because an exact current HostSafety aggregate hash could not be persisted'
+        catch {
+            [void]$script:Evidence.errors.Add(
+                "Recovery state could not be re-confirmed under the product mutation boundary: $($_.Exception.Message)")
+        }
+        $manifestHash = if ($script:Evidence.recovery.Contains('manifestSha256')) {
+            [string]$script:Evidence.recovery['manifestSha256']
+        } else { $null }
+        $recoveryStep = if ($null -ne $known -and
+            $manifestHash -match '\A[A-Fa-f0-9]{64}\z' -and
+            -not [string]::IsNullOrWhiteSpace($Bundle)) {
+            $quotedBundle = $Bundle.Replace("'", "''")
+            $command = "run this harness with -RecoverHostSafety -RecoveryBundle '$quotedBundle' -ExpectedManifestSha256 '$manifestHash' -ExpectedCurrentHostSafetySha256 '$($known.sha256)'"
+            $script:Evidence.recovery['recoveryCommand'] = $command
+            $command
+        }
+        else {
+            'do not run automated recovery: preserve the bundle and obtain a manual registry/state review because current HostSafety could not be matched to the last harness-authorized state under the product mutation boundary'
         }
         $script:Evidence.recovery['cleanupInstructions'] =
-            "DO NOT DELETE '$([IO.Path]::GetFullPath($Root))'. Stop every same-user A4SMenuHost in every Windows session; verify the taskbar Explorer has zero A4SMenu.dll mappings and zero A4S menu windows; restart Explorer manually if an image remains pinned; then $recoveryStep. Recovery aborts if HostSafety differs from the persisted aggregate. Delete the retained root only after exact restoration and clean-state inspection."
+            "DO NOT DELETE '$quotedRoot'. Stop every same-user A4SMenuHost in every Windows session; verify the taskbar Explorer has zero A4SMenu.dll mappings and zero A4S menu windows; restart Explorer manually if an image remains pinned; then $recoveryStep. Recovery authenticates the exact manifest and aborts if HostSafety differs from the freshly confirmed aggregate. Delete the retained root only after exact restoration and clean-state inspection."
     }
     else {
         $script:Evidence.recovery['cleanupInstructions'] =
-            "DO NOT DELETE '$([IO.Path]::GetFullPath($Root))' until every same-user A4SMenuHost is stopped and Explorer is conclusively free of A4SMenu.dll mappings/windows. No HostSafety backup completed, so this bundle cannot authorize recovery."
+            "DO NOT DELETE '$quotedRoot' until every same-user A4SMenuHost is stopped and Explorer is conclusively free of A4SMenu.dll mappings/windows. No HostSafety backup completed, so this bundle cannot authorize recovery."
     }
     Save-Evidence
 }
@@ -822,6 +923,7 @@ function Clear-RetainedTemporaryRootEvidence {
         $script:Evidence.recovery['retainedTemporaryRoot'] = $null
         $script:Evidence.recovery['retentionReason'] = $null
         $script:Evidence.recovery['cleanupInstructions'] = $null
+        $script:Evidence.recovery['recoveryCommand'] = $null
         Save-Evidence
     }
 }
@@ -917,7 +1019,9 @@ function Get-RegistryValueRecord {
         'QWord' { [BitConverter]::ToUInt64([BitConverter]::GetBytes([int64]$value), 0); break }
         default { [string]$value; break }
     }
-    return [ordered]@{ name = $Name; kind = $kind.ToString(); value = $encoded }
+    return [pscustomobject][ordered]@{
+        name = $Name; kind = $kind.ToString(); value = $encoded
+    }
 }
 
 function Get-RegistryKeyTreeRecord {
@@ -926,34 +1030,39 @@ function Get-RegistryKeyTreeRecord {
     $values = @($Key.GetValueNames() | Sort-Object | ForEach-Object {
         Get-RegistryValueRecord -Key $Key -Name $_
     })
-    $subkeys = @($Key.GetSubKeyNames() | Sort-Object | ForEach-Object {
-        $name = $_
-        $child = $Key.OpenSubKey($name, $false)
-        if ($null -eq $child) { throw "Registry subkey disappeared during snapshot: $name" }
-        try {
-            $tree = Get-RegistryKeyTreeRecord -Key $child
-            [ordered]@{ name = $name; values = $tree.values; subkeys = $tree.subkeys }
-        }
-        finally { $child.Dispose() }
-    })
-    return [ordered]@{ values = $values; subkeys = $subkeys }
+    $subkeyNames = @($Key.GetSubKeyNames())
+    if ($subkeyNames.Count -ne 0) {
+        throw ('The flat HostSafety schema forbids registry subkeys; found: ' +
+            (($subkeyNames | Sort-Object) -join ', '))
+    }
+    return [pscustomobject][ordered]@{ values = $values; subkeys = @() }
 }
 
-function Get-HostSafetySnapshot {
+function Get-RegistrySnapshot {
+    param([Parameter(Mandatory)][string] $RegistrySubKey)
+
     $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
         [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
     try {
-        $key = $base.OpenSubKey($hostSafetySubKey, $false)
+        $key = $base.OpenSubKey($RegistrySubKey, $false)
         if ($null -eq $key) {
-            return [ordered]@{ exists = $false; values = @(); subkeys = @() }
+            return [pscustomobject][ordered]@{
+                exists = $false; values = @(); subkeys = @()
+            }
         }
         try {
             $tree = Get-RegistryKeyTreeRecord -Key $key
-            return [ordered]@{ exists = $true; values = $tree.values; subkeys = $tree.subkeys }
+            return [pscustomobject][ordered]@{
+                exists = $true; values = $tree.values; subkeys = $tree.subkeys
+            }
         }
         finally { $key.Dispose() }
     }
     finally { $base.Dispose() }
+}
+
+function Get-HostSafetySnapshot {
+    return Get-RegistrySnapshot -RegistrySubKey $hostSafetySubKey
 }
 
 function Compare-HostSafetySnapshot {
@@ -973,16 +1082,26 @@ function Get-TextSha256 {
     finally { $algorithm.Dispose() }
 }
 
-function Get-HostSafetyAggregateRecord {
-    param([object] $Snapshot)
-    if ($null -eq $Snapshot) { $Snapshot = Get-HostSafetySnapshot }
+function Get-RegistryAggregateRecord {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [object] $Snapshot
+    )
+    if ($null -eq $Snapshot) {
+        $Snapshot = Get-RegistrySnapshot -RegistrySubKey $RegistrySubKey
+    }
     Assert-ValidRegistryTree -Tree $Snapshot -IsRoot $true
     $json = $Snapshot | ConvertTo-Json -Depth 32 -Compress
-    return [ordered]@{
+    return [pscustomobject][ordered]@{
         snapshot = $Snapshot
         canonicalJson = $json
         sha256 = Get-TextSha256 -Text $json
     }
+}
+
+function Get-HostSafetyAggregateRecord {
+    param([object] $Snapshot)
+    return Get-RegistryAggregateRecord -RegistrySubKey $hostSafetySubKey -Snapshot $Snapshot
 }
 
 function Assert-AuthorizedHostSafetyAggregate {
@@ -1010,19 +1129,220 @@ function Assert-AuthorizedHostSafetyAggregate {
     return $true
 }
 
-function Add-HostSafetyRestoreAuthorizationCheckpoint {
-    param([Parameter(Mandatory)][string] $Label)
+function New-A4SAuthorizedHostSafetyState {
+    param(
+        [Parameter(Mandatory)][object] $InitialSnapshot,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $InitialSha256,
+        [Parameter(Mandatory)][string] $Action,
+        [AllowEmptyCollection()][string[]] $ExpectedMutationActions = @()
+    )
 
-    $aggregate = Get-HostSafetyAggregateRecord
-    $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $aggregate.sha256
-    Add-EvidenceCheckpoint ([ordered]@{
+    $aggregate = Get-HostSafetyAggregateRecord -Snapshot $InitialSnapshot
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $aggregate `
+        -ExpectedSnapshot $InitialSnapshot -ExpectedSha256 $InitialSha256 `
+        -Boundary 'authorized state initialization')
+    return [pscustomobject][ordered]@{
+        sequence = 0
+        snapshot = Copy-RegistrySnapshotObject -Snapshot $aggregate.snapshot
+        sha256 = $aggregate.sha256
+        lastAction = $Action
+        expectedMutationActions = @($ExpectedMutationActions)
+        nextMutationIndex = 0
+        restored = $false
+        history = [Collections.ArrayList]::new()
+    }
+}
+
+function Publish-A4SAuthorizedHostSafetyState {
+    param([Parameter(Mandatory)][object] $State)
+
+    if ($null -ne $script:Evidence -and $null -ne $script:Evidence.recovery) {
+        $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $State.sha256
+        $script:Evidence.recovery['authorizedStateSequence'] = $State.sequence
+        $script:Evidence.recovery['authorizedStateLastAction'] = $State.lastAction
+        $script:Evidence.recovery['expectedMutationActions'] = @($State.expectedMutationActions)
+        $script:Evidence.recovery['nextExpectedMutationIndex'] = $State.nextMutationIndex
+        $script:Evidence.recovery['authorizedStateRestored'] = $State.restored
+        $script:Evidence.recovery['authorizedStateHistory'] = @($State.history)
+        Save-Evidence
+    }
+}
+
+function Assert-A4SAuthorizedHostSafetySnapshot {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][object] $Snapshot,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    $observed = Get-HostSafetyAggregateRecord -Snapshot $Snapshot
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $observed `
+        -ExpectedSnapshot $State.snapshot -ExpectedSha256 $State.sha256 -Boundary $Label)
+    return $observed
+}
+
+function Assert-A4SAuthorizedCurrentHostSafety {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $current = Get-HostSafetyAggregateRecord
+    [void](Assert-A4SAuthorizedHostSafetySnapshot -State $State `
+        -Snapshot $current.snapshot -Label $Label)
+    return $current
+}
+
+function Get-A4SExpectedAuthorizedActionAdvance {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][string] $Action
+    )
+
+    if ([bool]$State.restored) {
+        throw "$Action tried to advance a HostSafety authorization that was already restored."
+    }
+    $isRestore = $Action -ceq 'restore-validated-manifest'
+    $nextIndex = [int]$State.nextMutationIndex
+    if (-not $isRestore) {
+        if ($nextIndex -ge @($State.expectedMutationActions).Count -or
+            [string]$State.expectedMutationActions[$nextIndex] -cne $Action) {
+            $expected = if ($nextIndex -lt @($State.expectedMutationActions).Count) {
+                [string]$State.expectedMutationActions[$nextIndex]
+            } else { '<restore only>' }
+            throw "$Action is not the next authorized harness mutation; expected $expected."
+        }
+    }
+    return [pscustomobject][ordered]@{
+        isRestore = $isRestore
+        nextMutationIndex = if ($isRestore) { $nextIndex } else { $nextIndex + 1 }
+    }
+}
+
+function Set-A4SAuthorizedHostSafetyTransition {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedPreviousSha256,
+        [Parameter(Mandatory)][object] $ObservedSnapshot,
+        [Parameter(Mandatory)][string] $Action,
+        [Parameter(Mandatory)][object] $Proof
+    )
+
+    if ($State.sha256 -cne $ExpectedPreviousSha256.ToUpperInvariant()) {
+        throw "$Action tried to advance from a stale harness authorization."
+    }
+    $advance = Get-A4SExpectedAuthorizedActionAdvance -State $State -Action $Action
+    $observed = Get-HostSafetyAggregateRecord -Snapshot $ObservedSnapshot
+    $current = Get-HostSafetyAggregateRecord
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $current `
+        -ExpectedSnapshot $observed.snapshot -ExpectedSha256 $observed.sha256 `
+        -Boundary "$Action post-transition current-state proof")
+    $previous = $State.sha256
+    $State.sequence = [int]$State.sequence + 1
+    $State.snapshot = Copy-RegistrySnapshotObject -Snapshot $observed.snapshot
+    $State.sha256 = $observed.sha256
+    $State.lastAction = $Action
+    if ($advance.isRestore) { $State.restored = $true }
+    else { $State.nextMutationIndex = $advance.nextMutationIndex }
+    [void]$State.history.Add([ordered]@{
+        sequence = $State.sequence
         utc = Get-UtcText
-        label = $Label
-        mutation = 'HostSafety exact restore authorization'
-        authorizedCurrentHostSafetySha256 = $aggregate.sha256
-        hostSafety = $aggregate.snapshot
+        action = $Action
+        previousSha256 = $previous
+        authorizedSha256 = $observed.sha256
+        proof = $Proof
     })
-    return $aggregate
+    Publish-A4SAuthorizedHostSafetyState -State $State
+    return $observed
+}
+
+function Confirm-A4SResetSafetyTransition {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedPreviousSha256,
+        [Parameter(Mandatory)][object] $ObservedSnapshot,
+        [Parameter(Mandatory)][string] $Action
+    )
+    if ([bool]$ObservedSnapshot.exists -or @($ObservedSnapshot.values).Count -ne 0 -or
+        @($ObservedSnapshot.subkeys).Count -ne 0) {
+        throw "$Action did not produce the exact known absent HostSafety state."
+    }
+    return Set-A4SAuthorizedHostSafetyTransition -State $State `
+        -ExpectedPreviousSha256 $ExpectedPreviousSha256 `
+        -ObservedSnapshot $ObservedSnapshot -Action $Action `
+        -Proof ([ordered]@{ transition='ResetSafetyState'; exactAbsent=$true })
+}
+
+function Confirm-A4SCrashGuardTransition {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedPreviousSha256,
+        [Parameter(Mandatory)][object] $ObservedSnapshot,
+        [Parameter(Mandatory)][ValidateRange(1, 3)][int] $Stage,
+        [Parameter(Mandatory)][object[]] $Boundaries,
+        [uint64[]] $PriorTimestamps = @()
+    )
+    $proof = Assert-RollingCrashGuardStage -Snapshot $ObservedSnapshot `
+        -ExpectedCount $Stage -ExpectedDisabled ($Stage -eq $crashThreshold) `
+        -Boundaries $Boundaries -PriorTimestamps $PriorTimestamps
+    [void](Set-A4SAuthorizedHostSafetyTransition -State $State `
+        -ExpectedPreviousSha256 $ExpectedPreviousSha256 `
+        -ObservedSnapshot $ObservedSnapshot -Action "guarded-explorer-crash-$Stage" `
+        -Proof $proof)
+    return $proof
+}
+
+function Confirm-A4SRestoreTransition {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [Parameter(Mandatory)][object] $RestoreResult,
+        [Parameter(Mandatory)][object] $DesiredSnapshot,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedManifestSha256
+    )
+    $desired = Get-HostSafetyAggregateRecord -Snapshot $DesiredSnapshot
+    if ([string]$RestoreResult.transaction -cne 'committed' -or
+        [string]$RestoreResult.authorizedPreRestoreSha256 -cne $State.sha256 -or
+        [string]$RestoreResult.snapshotSha256 -cne $desired.sha256 -or
+        [string]$RestoreResult.manifestSha256 -cne $ExpectedManifestSha256.ToUpperInvariant()) {
+        throw 'Committed restore result does not prove the exact authorized manifest transition.'
+    }
+    return Set-A4SAuthorizedHostSafetyTransition -State $State `
+        -ExpectedPreviousSha256 $State.sha256 -ObservedSnapshot $DesiredSnapshot `
+        -Action 'restore-validated-manifest' -Proof ([ordered]@{
+            transition='journaled-restore'
+            manifestSha256=$ExpectedManifestSha256.ToUpperInvariant()
+            mutationStepCount=$RestoreResult.mutationStepCount
+        })
+}
+
+function Get-A4SConfirmedRecoveryAuthorization {
+    param(
+        [Parameter(Mandatory)][object] $State,
+        [string] $ProbeHost
+    )
+
+    Assert-AllTrackedHostsStopped -ProbeHost $ProbeHost
+    $boundary = Enter-A4SProductMutationBoundary
+    try {
+        [void](Assert-A4SProductMutationBoundary -Boundary $boundary `
+            -Label 'retained-root recovery authorization')
+        $current = Assert-A4SAuthorizedCurrentHostSafety -State $State `
+            -Label 'retained-root recovery authorization'
+        return [pscustomobject][ordered]@{
+            snapshot = Copy-RegistrySnapshotObject -Snapshot $current.snapshot
+            sha256 = $current.sha256
+            authorizedSequence = $State.sequence
+            authorizedAction = $State.lastAction
+            observedUtc = Get-UtcText
+            setupMutexName = $boundary.SetupMutexName
+            hostMutexName = $boundary.HostMutexName
+        }
+    }
+    finally { Exit-A4SProductMutationBoundary -Boundary $boundary }
 }
 
 function Assert-ExactPropertySet {
@@ -1051,6 +1371,9 @@ function Assert-ValidRegistryTree {
         if ($Tree.exists -isnot [bool]) { throw 'HostSafety snapshot exists must be Boolean.' }
         if (-not $Tree.exists -and (@($Tree.values).Count -ne 0 -or @($Tree.subkeys).Count -ne 0)) {
             throw 'An absent HostSafety snapshot cannot contain values or subkeys.'
+        }
+        if (@($Tree.subkeys).Count -ne 0) {
+            throw 'HostSafety recovery supports the exact flat product schema only; subkeys are forbidden.'
         }
     }
     elseif ([string]::IsNullOrWhiteSpace([string]$Tree.name) -or
@@ -1095,17 +1418,92 @@ function Assert-ValidRegistryTree {
             catch { throw "HostSafety backup $kind value is out of range." }
         }
     }
-    $subkeyNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
-    foreach ($subkey in @($Tree.subkeys)) {
-        if (-not $subkeyNames.Add([string]$subkey.name)) { throw 'HostSafety backup contains duplicate subkey names.' }
-        Assert-ValidRegistryTree -Tree $subkey -IsRoot $false -Depth ($Depth + 1)
+}
+
+function Read-LockedFileBytesRecord {
+    [CmdletBinding(DefaultParameterSetName = 'Expected')]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Description,
+        [Parameter(Mandatory, ParameterSetName = 'Expected')]
+        [ValidatePattern('\A[A-Fa-f0-9]{64}\z')][string] $ExpectedSha256,
+        [Parameter(Mandatory, ParameterSetName = 'Capture')][switch] $CaptureSha256,
+        [Parameter(Mandatory)][ValidateRange(1, 16777216)][int] $MaximumBytes
+    )
+
+    $record = Get-CanonicalPathRecord -Path $Path -Description $Description -Kind File
+    $stream = [IO.File]::Open($record.finalPath, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $locked = Get-CanonicalPathRecord -Path $record.finalPath `
+            -Description "$Description locked identity" -Kind File
+        if ($locked.identity -cne $record.identity -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                $locked.finalPath, $record.finalPath)) {
+            throw "$Description changed identity before its locked read."
+        }
+        if ($stream.Length -le 0 -or $stream.Length -gt $MaximumBytes) {
+            throw "$Description is empty or exceeds the $MaximumBytes-byte safety limit."
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "$Description ended during its locked read." }
+            $offset += $read
+        }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $sha256 = ([BitConverter]::ToString(
+                $algorithm.ComputeHash($bytes))).Replace('-', '')
+        }
+        finally { $algorithm.Dispose() }
+        if ($PSCmdlet.ParameterSetName -eq 'Expected' -and
+            $sha256 -cne $ExpectedSha256.ToUpperInvariant()) {
+            throw "$Description SHA-256 differs from its previously authorized value."
+        }
+        return [pscustomobject][ordered]@{
+            path = $record.finalPath
+            pathIdentity = $record.identity
+            sha256 = $sha256
+            length = [uint64]$bytes.Length
+            bytes = $bytes
+        }
     }
+    finally { $stream.Dispose() }
+}
+
+function Read-LockedUtf8JsonRecord {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Description,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedSha256
+    )
+
+    $raw = Read-LockedFileBytesRecord -Path $Path -Description $Description `
+        -ExpectedSha256 $ExpectedSha256 -MaximumBytes 1048576
+    $offset = if ($raw.bytes.Length -ge 3 -and $raw.bytes[0] -eq 0xEF -and
+        $raw.bytes[1] -eq 0xBB -and $raw.bytes[2] -eq 0xBF) { 3 } else { 0 }
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString(
+            $raw.bytes, $offset, $raw.bytes.Length - $offset)
+    }
+    catch { throw "$Description is not strict UTF-8: $($_.Exception.Message)" }
+    try { $value = $text | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "$Description is not valid JSON: $($_.Exception.Message)" }
+    $raw | Add-Member -NotePropertyName value -NotePropertyValue $value
+    return $raw
 }
 
 function Assert-RegistryExportTargetsHostSafety {
-    param([Parameter(Mandatory)][string] $Path)
+    param([Parameter(Mandatory)][byte[]] $Bytes)
 
-    $text = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+    $memory = [IO.MemoryStream]::new($Bytes, $false)
+    $reader = [IO.StreamReader]::new($memory, [Text.Encoding]::Unicode,
+        $true, 4096, $false)
+    try { $text = $reader.ReadToEnd() }
+    finally { $reader.Dispose(); $memory.Dispose() }
     if ($text -notmatch '^Windows Registry Editor Version 5\.00') {
         throw 'HostSafety.reg has an unsupported registry export header.'
     }
@@ -1142,37 +1540,25 @@ function Get-ValidatedRecoveryBundle {
     return $record
 }
 
-function Read-ValidatedHostSafetyBackup {
-    param([Parameter(Mandatory)][string] $Bundle)
+function Assert-ValidatedHostSafetyManifestObject {
+    param([Parameter(Mandatory)][object] $Manifest)
 
-    $bundleRecord = Get-ValidatedRecoveryBundle -Bundle $Bundle
-    $manifestPath = Join-Path $bundleRecord.finalPath 'HostSafetyBackup.json'
-    $manifestRecord = Get-CanonicalPathRecord -Path $manifestPath `
-        -Description 'HostSafety recovery manifest' -Kind File
-    if (-not (Test-PathWithin -Path $manifestRecord.finalPath -Parent $bundleRecord.finalPath)) {
-        throw 'HostSafety recovery manifest escaped its bundle.'
-    }
-    if ((Get-Item -LiteralPath $manifestRecord.finalPath -Force).Length -gt 1048576) {
-        throw 'HostSafety recovery manifest exceeds the 1 MiB safety limit.'
-    }
-    try { $manifest = Get-Content -LiteralPath $manifestRecord.finalPath -Raw | ConvertFrom-Json -ErrorAction Stop }
-    catch { throw "HostSafety recovery manifest is not valid JSON: $($_.Exception.Message)" }
-    Assert-ExactPropertySet -Object $manifest -Names @('schemaVersion', 'backupId',
+    Assert-ExactPropertySet -Object $Manifest -Names @('schemaVersion', 'backupId',
         'createdUtc', 'registryHive', 'registryPath', 'registrySubKey', 'registryView',
         'snapshot', 'snapshotSha256', 'regExport') -Description 'HostSafety recovery manifest'
-    if ($manifest.schemaVersion -ne 3 -or
-        [string]$manifest.registryHive -cne 'HKEY_CURRENT_USER' -or
-        [string]$manifest.registryPath -cne $hostSafetyRegPath -or
-        [string]$manifest.registrySubKey -cne $hostSafetySubKey -or
-        [string]$manifest.registryView -cne 'Registry64') {
+    if ($Manifest.schemaVersion -ne 3 -or
+        [string]$Manifest.registryHive -cne 'HKEY_CURRENT_USER' -or
+        [string]$Manifest.registryPath -cne $hostSafetyRegPath -or
+        [string]$Manifest.registrySubKey -cne $hostSafetySubKey -or
+        [string]$Manifest.registryView -cne 'Registry64') {
         throw 'HostSafety recovery manifest has an unsupported schema, hive, target, or registry view.'
     }
     $backupId = [Guid]::Empty
-    if (-not [Guid]::TryParseExact([string]$manifest.backupId, 'N', [ref]$backupId)) {
+    if (-not [Guid]::TryParseExact([string]$Manifest.backupId, 'N', [ref]$backupId)) {
         throw 'HostSafety recovery manifest has an invalid backup ID.'
     }
     $created = [DateTime]::MinValue
-    if (-not [DateTime]::TryParse([string]$manifest.createdUtc,
+    if (-not [DateTime]::TryParse([string]$Manifest.createdUtc,
         [Globalization.CultureInfo]::InvariantCulture,
         [Globalization.DateTimeStyles]::RoundtripKind, [ref]$created)) {
         throw 'HostSafety recovery manifest has an invalid creation timestamp.'
@@ -1180,53 +1566,74 @@ function Read-ValidatedHostSafetyBackup {
     if ($created.Kind -ne [DateTimeKind]::Utc) {
         throw 'HostSafety recovery manifest creation timestamp is not explicitly UTC.'
     }
-    Assert-ValidRegistryTree -Tree $manifest.snapshot -IsRoot $true
-    $snapshotAggregate = Get-HostSafetyAggregateRecord -Snapshot $manifest.snapshot
-    if ([string]$manifest.snapshotSha256 -notmatch '\A[A-Fa-f0-9]{64}\z' -or
-        $snapshotAggregate.sha256 -cne ([string]$manifest.snapshotSha256).ToUpperInvariant()) {
+    Assert-ValidRegistryTree -Tree $Manifest.snapshot -IsRoot $true
+    $snapshotAggregate = Get-HostSafetyAggregateRecord -Snapshot $Manifest.snapshot
+    if ([string]$Manifest.snapshotSha256 -notmatch '\A[A-Fa-f0-9]{64}\z' -or
+        $snapshotAggregate.sha256 -cne ([string]$Manifest.snapshotSha256).ToUpperInvariant()) {
         throw 'HostSafety recovery manifest snapshot aggregate hash is invalid.'
     }
-    $regFile = $null
-    if ([bool]$manifest.snapshot.exists) {
-        if ($null -eq $manifest.regExport) { throw 'Existing HostSafety backup lacks a registry export record.' }
-        Assert-ExactPropertySet -Object $manifest.regExport `
-            -Names @('relativePath', 'sha256', 'length') -Description 'HostSafety registry export record'
-        if ([string]$manifest.regExport.relativePath -cne 'HostSafety.reg') {
+    if ([bool]$Manifest.snapshot.exists) {
+        if ($null -eq $Manifest.regExport) {
+            throw 'Existing HostSafety backup lacks a registry export record.'
+        }
+        Assert-ExactPropertySet -Object $Manifest.regExport `
+            -Names @('relativePath', 'sha256', 'length') `
+            -Description 'HostSafety registry export record'
+        if ([string]$Manifest.regExport.relativePath -cne 'HostSafety.reg') {
             throw 'HostSafety registry export must use the exact direct-child filename HostSafety.reg.'
         }
-        if ([string]$manifest.regExport.sha256 -notmatch '\A[A-Fa-f0-9]{64}\z') {
+        if ([string]$Manifest.regExport.sha256 -notmatch '\A[A-Fa-f0-9]{64}\z') {
             throw 'HostSafety registry export has an invalid SHA-256 value.'
         }
+        try { [void][uint64]$Manifest.regExport.length }
+        catch { throw 'HostSafety registry export has an invalid length.' }
+    }
+    elseif ($null -ne $Manifest.regExport) {
+        throw 'Absent HostSafety backup unexpectedly contains a registry export record.'
+    }
+    return $snapshotAggregate
+}
+
+function Read-ValidatedHostSafetyBackup {
+    param(
+        [Parameter(Mandatory)][string] $Bundle,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedManifestSha256
+    )
+
+    $bundleRecord = Get-ValidatedRecoveryBundle -Bundle $Bundle
+    $manifestPath = Join-Path $bundleRecord.finalPath 'HostSafetyBackup.json'
+    $lockedManifest = Read-LockedUtf8JsonRecord -Path $manifestPath `
+        -Description 'HostSafety recovery manifest' `
+        -ExpectedSha256 $ExpectedManifestSha256
+    if (-not (Test-PathWithin -Path $lockedManifest.path -Parent $bundleRecord.finalPath)) {
+        throw 'HostSafety recovery manifest escaped its bundle.'
+    }
+    $manifest = $lockedManifest.value
+    $snapshotAggregate = Assert-ValidatedHostSafetyManifestObject -Manifest $manifest
+    $regFile = $null
+    if ([bool]$manifest.snapshot.exists) {
         $regFile = Join-Path $bundleRecord.finalPath 'HostSafety.reg'
-        $regRecord = Get-CanonicalPathRecord -Path $regFile `
-            -Description 'HostSafety registry export' -Kind File
-        if (-not (Test-PathWithin -Path $regRecord.finalPath -Parent $bundleRecord.finalPath)) {
+        $regRecord = Read-LockedFileBytesRecord -Path $regFile `
+            -Description 'HostSafety registry export' `
+            -ExpectedSha256 ([string]$manifest.regExport.sha256) `
+            -MaximumBytes 16777216
+        if (-not (Test-PathWithin -Path $regRecord.path -Parent $bundleRecord.finalPath)) {
             throw 'HostSafety registry export escaped its bundle.'
         }
-        $length = (Get-Item -LiteralPath $regRecord.finalPath -Force).Length
-        if ($length -gt 16777216) {
-            throw 'HostSafety registry export exceeds the 16 MiB safety limit.'
-        }
-        if ([uint64]$manifest.regExport.length -ne [uint64]$length) {
+        if ([uint64]$manifest.regExport.length -ne [uint64]$regRecord.length) {
             throw 'HostSafety registry export length does not match the manifest.'
         }
-        $actualHash = (Get-FileHash -LiteralPath $regRecord.finalPath -Algorithm SHA256).Hash
-        if ($actualHash -cne ([string]$manifest.regExport.sha256).ToUpperInvariant()) {
-            throw 'HostSafety registry export hash does not match the manifest.'
-        }
-        Assert-RegistryExportTargetsHostSafety -Path $regRecord.finalPath
-        $regFile = $regRecord.finalPath
-    }
-    elseif ($null -ne $manifest.regExport) {
-        throw 'Absent HostSafety backup unexpectedly contains a registry export record.'
+        Assert-RegistryExportTargetsHostSafety -Bytes $regRecord.bytes
+        $regFile = $regRecord.path
     }
     return [pscustomobject][ordered]@{
         validated = $true
         bundle = $bundleRecord.finalPath
         bundleIdentity = $bundleRecord.identity
-        manifestPath = $manifestRecord.finalPath
-        manifestIdentity = $manifestRecord.identity
-        manifestSha256 = (Get-FileHash -LiteralPath $manifestRecord.finalPath -Algorithm SHA256).Hash
+        manifestPath = $lockedManifest.path
+        manifestIdentity = $lockedManifest.pathIdentity
+        manifestSha256 = $lockedManifest.sha256
         manifest = $manifest
         snapshotSha256 = $snapshotAggregate.sha256
         regFile = $regFile
@@ -1259,12 +1666,14 @@ function Backup-HostSafety {
         $stream = [IO.File]::Open($regRecord.finalPath, [IO.FileMode]::Open,
             [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
         try { $stream.Flush($true) } finally { $stream.Dispose() }
-        Assert-RegistryExportTargetsHostSafety -Path $regRecord.finalPath
-        $item = Get-Item -LiteralPath $regRecord.finalPath -Force
+        $lockedExport = Read-LockedFileBytesRecord -Path $regRecord.finalPath `
+            -Description 'new HostSafety registry export' -CaptureSha256 `
+            -MaximumBytes 16777216
+        Assert-RegistryExportTargetsHostSafety -Bytes $lockedExport.bytes
         $regExport = [ordered]@{
             relativePath = 'HostSafety.reg'
-            sha256 = (Get-FileHash -LiteralPath $regRecord.finalPath -Algorithm SHA256).Hash
-            length = [uint64]$item.Length
+            sha256 = $lockedExport.sha256
+            length = $lockedExport.length
         }
     }
     $postExportSnapshot = Get-HostSafetySnapshot
@@ -1283,15 +1692,11 @@ function Backup-HostSafety {
         snapshotSha256 = $snapshotAggregate.sha256
         regExport = $regExport
     }
-    Write-DurableNewText -Path $manifestPath -Text ($manifest | ConvertTo-Json -Depth 32)
-    return Read-ValidatedHostSafetyBackup -Bundle $bundleRecord.finalPath
-}
-
-function Remove-HostSafetyRegistryTree {
-    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-        [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
-    try { $base.DeleteSubKeyTree($hostSafetySubKey, $false) }
-    finally { $base.Dispose() }
+    $manifestText = $manifest | ConvertTo-Json -Depth 32
+    $manifestSha256 = Get-TextSha256 -Text $manifestText
+    Write-DurableNewText -Path $manifestPath -Text $manifestText
+    return Read-ValidatedHostSafetyBackup -Bundle $bundleRecord.finalPath `
+        -ExpectedManifestSha256 $manifestSha256
 }
 
 function Enter-A4SProductMutationBoundary {
@@ -1313,7 +1718,10 @@ function Assert-A4SProductMutationBoundary {
         [Parameter(Mandatory)][object] $Boundary,
         [Parameter(Mandatory)][string] $Label
     )
-    if (-not $Boundary.IsHeld -or
+    if ($null -eq $Boundary -or
+        $Boundary.GetType().FullName -cne
+            'A4SFailureRecoveryNative+ProductMutationBoundary' -or
+        -not $Boundary.IsHeld -or
         [string]$Boundary.SetupMutexName -notmatch '\AGlobal\\A4SMenu\.Setup\.v1\.[A-F0-9]{32}\z' -or
         [string]$Boundary.HostMutexName -notmatch '\ALocal\\A4SMenu\.Host\.Instance\.v1\.[0-9]+\.[A-F0-9]{16}\z') {
         throw "$Label does not hold the exact product Setup and current-desktop host mutexes."
@@ -1330,9 +1738,9 @@ function Copy-RegistrySnapshotObject {
 function Convert-RegistryValueForWrite {
     param([Parameter(Mandatory)][object] $Record)
     switch ([string]$Record.kind) {
-        'Binary' { return [Convert]::FromBase64String([string]$Record.value) }
-        'None' { return [Convert]::FromBase64String([string]$Record.value) }
-        'MultiString' { return [string[]]@($Record.value) }
+        'Binary' { return ,([Convert]::FromBase64String([string]$Record.value)) }
+        'None' { return ,([Convert]::FromBase64String([string]$Record.value)) }
+        'MultiString' { return ,([string[]]@($Record.value)) }
         'DWord' {
             return [BitConverter]::ToInt32(
                 [BitConverter]::GetBytes([uint32]$Record.value), 0)
@@ -1347,228 +1755,377 @@ function Convert-RegistryValueForWrite {
     }
 }
 
-function Invoke-AuthorizedHostSafetyMutationStep {
+function Test-RegistryAggregateEqual {
     param(
-        [Parameter(Mandatory)][object] $Boundary,
-        [Parameter(Mandatory)][object] $Before,
-        [Parameter(Mandatory)][object] $AfterSnapshot,
-        [Parameter(Mandatory)][scriptblock] $Mutation,
-        [Parameter(Mandatory)][ref] $MutationState,
-        [Parameter(Mandatory)][string] $Label
+        [Parameter(Mandatory)][object] $First,
+        [Parameter(Mandatory)][object] $Second
     )
-
-    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label "$Label preflight")
-    $current = Get-HostSafetyAggregateRecord
-    [void](Assert-AuthorizedHostSafetyAggregate -Current $current `
-        -ExpectedSnapshot $Before.snapshot -ExpectedSha256 $Before.sha256 `
-        -Boundary "$Label preflight")
-    $after = Get-HostSafetyAggregateRecord -Snapshot $AfterSnapshot
-    $MutationState.Value = [ordered]@{
-        label = $Label
-        inFlight = $true
-        allowed = @($Before, $after)
-        lastVerified = $Before
-    }
-    & $Mutation
-    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label "$Label postflight")
-    $observed = Get-HostSafetyAggregateRecord
-    [void](Assert-AuthorizedHostSafetyAggregate -Current $observed `
-        -ExpectedSnapshot $after.snapshot -ExpectedSha256 $after.sha256 `
-        -Boundary "$Label postflight")
-    $MutationState.Value = [ordered]@{
-        label = $Label
-        inFlight = $false
-        allowed = @($observed)
-        lastVerified = $observed
-    }
-    return $observed
+    return [string]$First.sha256 -ceq [string]$Second.sha256 -and
+        (Compare-HostSafetySnapshot -Expected $First.snapshot -Actual $Second.snapshot)
 }
 
-function Set-HostSafetyTreeProgressively {
+function Assert-A4SRegistryTransactionTarget {
     param(
-        [Parameter(Mandatory)][object] $Boundary,
-        [Parameter(Mandatory)][object] $DesiredNode,
-        [Parameter(Mandatory)][object] $ExpectedRoot,
-        [Parameter(Mandatory)][object] $ExpectedNode,
-        [Parameter(Mandatory)][string] $RelativePath,
-        [Parameter(Mandatory)][ref] $CurrentAggregate,
-        [Parameter(Mandatory)][ref] $MutationState
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [switch] $ContractRegistrySandbox
+    )
+    if ([StringComparer]::OrdinalIgnoreCase.Equals($RegistrySubKey, $hostSafetySubKey)) {
+        if ($ContractRegistrySandbox) {
+            throw 'The contract-sandbox switch is forbidden for the production HostSafety key.'
+        }
+        return 'product'
+    }
+    if ($ContractRegistrySandbox -and
+        $RegistrySubKey -match '\ASoftware\\A4SMenuFailureRecoveryContract_[A-Fa-f0-9]{32}\z') {
+        return 'contract-sandbox'
+    }
+    throw "Registry transaction target is not the exact product key or an isolated contract sandbox: $RegistrySubKey"
+}
+
+function Invoke-A4SRegistryPrimitive {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('CreateKey', 'DeleteKey', 'SetValue', 'DeleteValue')]
+        [string] $Operation,
+        [object] $ValueRecord
     )
 
-    foreach ($value in @($DesiredNode.values)) {
-        $nextRoot = Copy-RegistrySnapshotObject -Snapshot $ExpectedRoot
-        $nextNode = $nextRoot
-        if (-not [string]::IsNullOrEmpty($RelativePath)) {
-            foreach ($component in $RelativePath.Split('\')) {
-                $matches = @($nextNode.subkeys | Where-Object { $_.name -ceq $component })
-                if ($matches.Count -ne 1) {
-                    throw "Exact restore model lost the unique '$component' subkey."
+    $separator = $RegistrySubKey.LastIndexOf('\')
+    if ($separator -le 0 -or $separator -ge $RegistrySubKey.Length - 1) {
+        throw "Registry transaction target is not an exact child key: $RegistrySubKey"
+    }
+    $parentPath = $RegistrySubKey.Substring(0, $separator)
+    $leafName = $RegistrySubKey.Substring($separator + 1)
+    $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+        [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
+    try {
+        switch ($Operation) {
+            'CreateKey' {
+                $parent = $base.OpenSubKey($parentPath, $true)
+                if (-not $parent) {
+                    throw "Registry parent is absent; creating paths outside the exact target is forbidden: $parentPath"
                 }
-                $nextNode = $matches[0]
-            }
-        }
-        $nextNode.values = @($nextNode.values) + @(Copy-RegistrySnapshotObject -Snapshot $value)
-        $keyPath = if ([string]::IsNullOrEmpty($RelativePath)) {
-            $hostSafetySubKey
-        } else { "$hostSafetySubKey\$RelativePath" }
-        $record = $value
-        $CurrentAggregate.Value = Invoke-AuthorizedHostSafetyMutationStep `
-            -Boundary $Boundary -Before $CurrentAggregate.Value -AfterSnapshot $nextRoot `
-            -MutationState $MutationState -Label "set value '$keyPath\$($record.name)'" `
-            -Mutation {
-                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                    [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
                 try {
-                    $key = $base.OpenSubKey($keyPath, $true)
-                    if ($null -eq $key) { throw "Registry key disappeared before exact write: $keyPath" }
+                    $existing = $parent.OpenSubKey($leafName, $false)
+                    if ($existing) {
+                        $existing.Dispose()
+                        throw "Registry key already exists: $RegistrySubKey"
+                    }
+                    $key = $parent.CreateSubKey($leafName, $true)
+                    if (-not $key) { throw "Could not create registry key: $RegistrySubKey" }
+                    try { $key.Flush() } finally { $key.Dispose() }
+                    $parent.Flush()
+                }
+                finally { $parent.Dispose() }
+            }
+            'DeleteKey' {
+                $parent = $base.OpenSubKey($parentPath, $true)
+                if (-not $parent) {
+                    throw "Registry parent is absent before exact key deletion: $parentPath"
+                }
+                try {
+                    $key = $parent.OpenSubKey($leafName, $false)
+                    if (-not $key) {
+                        throw "Registry key is absent before exact deletion: $RegistrySubKey"
+                    }
                     try {
-                        $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
-                            [Microsoft.Win32.RegistryValueKind], [string]$record.kind, $false)
-                        $key.SetValue([string]$record.name,
-                            (Convert-RegistryValueForWrite -Record $record), $kind)
-                        $key.Flush()
+                        if ($key.ValueCount -ne 0 -or $key.SubKeyCount -ne 0) {
+                            throw "Registry key is not empty before exact non-recursive deletion: $RegistrySubKey"
+                        }
                     }
                     finally { $key.Dispose() }
+                    $parent.DeleteSubKey($leafName, $true)
+                    $parent.Flush()
                 }
-                finally { $base.Dispose() }
+                finally { $parent.Dispose() }
             }
-        $ExpectedRoot = $nextRoot
-        $ExpectedNode = $nextNode
-    }
-
-    foreach ($desiredChild in @($DesiredNode.subkeys)) {
-        $nextRoot = Copy-RegistrySnapshotObject -Snapshot $ExpectedRoot
-        $nextParent = $nextRoot
-        if (-not [string]::IsNullOrEmpty($RelativePath)) {
-            foreach ($component in $RelativePath.Split('\')) {
-                $matches = @($nextParent.subkeys | Where-Object { $_.name -ceq $component })
-                if ($matches.Count -ne 1) {
-                    throw "Exact restore model lost the unique '$component' subkey."
-                }
-                $nextParent = $matches[0]
-            }
-        }
-        $emptyChild = [pscustomobject][ordered]@{
-            name = [string]$desiredChild.name
-            values = @()
-            subkeys = @()
-        }
-        $nextParent.subkeys = @($nextParent.subkeys) + @($emptyChild)
-        $childRelative = if ([string]::IsNullOrEmpty($RelativePath)) {
-            [string]$desiredChild.name
-        } else { "$RelativePath\$($desiredChild.name)" }
-        $childKeyPath = "$hostSafetySubKey\$childRelative"
-        $CurrentAggregate.Value = Invoke-AuthorizedHostSafetyMutationStep `
-            -Boundary $Boundary -Before $CurrentAggregate.Value -AfterSnapshot $nextRoot `
-            -MutationState $MutationState -Label "create subkey '$childKeyPath'" `
-            -Mutation {
-                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                    [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
+            'SetValue' {
+                if ($null -eq $ValueRecord) { throw 'SetValue requires an exact value record.' }
+                $key = $base.OpenSubKey($RegistrySubKey, $true)
+                if (-not $key) { throw "Registry key is absent before exact value creation: $RegistrySubKey" }
                 try {
-                    $key = $base.CreateSubKey($childKeyPath, $true)
-                    if ($null -eq $key) { throw "Could not create exact registry subkey: $childKeyPath" }
-                    try { $key.Flush() } finally { $key.Dispose() }
+                    if (@($key.GetValueNames() | Where-Object {
+                            [StringComparer]::OrdinalIgnoreCase.Equals($_, [string]$ValueRecord.name)
+                        }).Count -ne 0) {
+                        throw "Registry value already exists before exact creation: $($ValueRecord.name)"
+                    }
+                    $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
+                        [Microsoft.Win32.RegistryValueKind], [string]$ValueRecord.kind, $false)
+                    $key.SetValue([string]$ValueRecord.name,
+                        (Convert-RegistryValueForWrite -Record $ValueRecord), $kind)
+                    $key.Flush()
                 }
-                finally { $base.Dispose() }
+                finally { $key.Dispose() }
             }
-        $ExpectedRoot = $nextRoot
-        $ExpectedNode = $emptyChild
-        Set-HostSafetyTreeProgressively -Boundary $Boundary `
-            -DesiredNode $desiredChild -ExpectedRoot $ExpectedRoot `
-            -ExpectedNode $ExpectedNode -RelativePath $childRelative `
-            -CurrentAggregate $CurrentAggregate -MutationState $MutationState
-        $ExpectedRoot = $CurrentAggregate.Value.snapshot
+            'DeleteValue' {
+                if ($null -eq $ValueRecord) { throw 'DeleteValue requires an exact value record.' }
+                $key = $base.OpenSubKey($RegistrySubKey, $true)
+                if (-not $key) { throw "Registry key is absent before exact value deletion: $RegistrySubKey" }
+                try {
+                    if (@($key.GetValueNames() | Where-Object {
+                            [StringComparer]::OrdinalIgnoreCase.Equals($_, [string]$ValueRecord.name)
+                        }).Count -ne 1) {
+                        throw "Registry value is absent before exact deletion: $($ValueRecord.name)"
+                    }
+                    $key.DeleteValue([string]$ValueRecord.name, $true)
+                    $key.Flush()
+                }
+                finally { $key.Dispose() }
+            }
+        }
+    }
+    finally { $base.Dispose() }
+}
+
+function Invoke-A4SRegistryJournaledStep {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ref] $CurrentAggregate,
+        [Parameter(Mandatory)][object] $AfterSnapshot,
+        [Parameter(Mandatory)][ValidateSet('CreateKey', 'DeleteKey', 'SetValue', 'DeleteValue')]
+        [string] $Operation,
+        [object] $ValueRecord,
+        [Parameter(Mandatory)][ValidateSet('CreateKey', 'DeleteKey', 'SetValue', 'DeleteValue')]
+        [string] $InverseOperation,
+        [object] $InverseValueRecord,
+        [Parameter(Mandatory)][AllowEmptyCollection()][Collections.ArrayList] $Journal,
+        [Parameter(Mandatory)][ref] $StepNumber,
+        [Parameter(Mandatory)][scriptblock] $ValidateBoundary,
+        [int] $InjectFailureAfterStep = 0
+    )
+
+    $StepNumber.Value = [int]$StepNumber.Value + 1
+    $step = [int]$StepNumber.Value
+    [void](& $ValidateBoundary "registry mutation step $step preflight")
+    $before = $CurrentAggregate.Value
+    $observedBefore = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+    if (-not (Test-RegistryAggregateEqual -First $before -Second $observedBefore)) {
+        throw "A4S_UNKNOWN_REGISTRY_STATE: step $step preflight differs from the authorized journal state."
+    }
+    $after = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $AfterSnapshot
+    $entry = [pscustomobject][ordered]@{
+        step = $step
+        operation = $Operation
+        inverseOperation = $InverseOperation
+        inverseValueRecord = if ($InverseValueRecord) {
+            Copy-RegistrySnapshotObject -Snapshot $InverseValueRecord
+        } else { $null }
+        before = $before
+        after = $after
+    }
+    $journaled = $false
+    try {
+        Invoke-A4SRegistryPrimitive -RegistrySubKey $RegistrySubKey `
+            -Operation $Operation -ValueRecord $ValueRecord
+        [void](& $ValidateBoundary "registry mutation step $step postflight")
+        $observedAfter = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+        if (-not (Test-RegistryAggregateEqual -First $after -Second $observedAfter)) {
+            throw "A4S_UNKNOWN_REGISTRY_STATE: step $step produced an unplanned aggregate."
+        }
+        [void]$Journal.Add($entry)
+        $journaled = $true
+        $CurrentAggregate.Value = $observedAfter
+        if ($InjectFailureAfterStep -eq $step) {
+            throw "A4S_INJECTED_REGISTRY_FAILURE: after mutation step $step"
+        }
+        return $observedAfter
+    }
+    catch {
+        $primary = $_
+        $observedFailure = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+        if (Test-RegistryAggregateEqual -First $after -Second $observedFailure) {
+            if (-not $journaled) { [void]$Journal.Add($entry) }
+            $CurrentAggregate.Value = $observedFailure
+        }
+        elseif (Test-RegistryAggregateEqual -First $before -Second $observedFailure) {
+            $CurrentAggregate.Value = $observedFailure
+        }
+        else {
+            throw "A4S_UNKNOWN_REGISTRY_STATE: step $step failed and left neither its authorized before nor after aggregate. Primary error: $($primary.Exception.Message)"
+        }
+        throw $primary
     }
 }
 
-function Set-HostSafetySnapshotExactly {
+function Undo-A4SRegistryJournal {
     param(
-        [Parameter(Mandatory)][object] $Boundary,
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][AllowEmptyCollection()][Collections.ArrayList] $Journal,
+        [Parameter(Mandatory)][scriptblock] $ValidateBoundary
+    )
+
+    for ($index = $Journal.Count - 1; $index -ge 0; $index--) {
+        $entry = $Journal[$index]
+        [void](& $ValidateBoundary "registry rollback step $($entry.step) preflight")
+        $current = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+        if (-not (Test-RegistryAggregateEqual -First $entry.after -Second $current)) {
+            throw "A4S_UNKNOWN_REGISTRY_STATE: rollback step $($entry.step) would overwrite an intervening aggregate."
+        }
+        $inverseError = $null
+        try {
+            Invoke-A4SRegistryPrimitive -RegistrySubKey $RegistrySubKey `
+                -Operation $entry.inverseOperation -ValueRecord $entry.inverseValueRecord
+        }
+        catch { $inverseError = $_ }
+        [void](& $ValidateBoundary "registry rollback step $($entry.step) postflight")
+        $restored = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+        if (-not (Test-RegistryAggregateEqual -First $entry.before -Second $restored)) {
+            $detail = if ($inverseError) { $inverseError.Exception.Message } else { 'no primitive error' }
+            throw "Registry rollback step $($entry.step) did not restore its exact before aggregate ($detail)."
+        }
+    }
+    return Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+}
+
+function Invoke-A4SRegistrySnapshotTransaction {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
         [Parameter(Mandatory)][object] $DesiredSnapshot,
         [Parameter(Mandatory)][object] $ExpectedCurrent,
-        [Parameter(Mandatory)][ref] $MutationState
+        [object] $ProductBoundary,
+        [scriptblock] $ValidateBoundary,
+        [switch] $ContractRegistrySandbox,
+        [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0
     )
 
-    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label 'exact restore entry')
-    $current = Get-HostSafetyAggregateRecord
-    [void](Assert-AuthorizedHostSafetyAggregate -Current $current `
-        -ExpectedSnapshot $ExpectedCurrent.snapshot -ExpectedSha256 $ExpectedCurrent.sha256 `
-        -Boundary 'exact restore entry')
-    $desired = Get-HostSafetyAggregateRecord -Snapshot $DesiredSnapshot
-    if ($current.sha256 -ceq $desired.sha256 -and
-        (Compare-HostSafetySnapshot -Expected $DesiredSnapshot -Actual $current.snapshot)) {
-        $MutationState.Value = [ordered]@{
-            label = 'already exact'; inFlight = $false
-            allowed = @($current); lastVerified = $current
+    $targetKind = Assert-A4SRegistryTransactionTarget -RegistrySubKey $RegistrySubKey `
+        -ContractRegistrySandbox:$ContractRegistrySandbox
+    if ($targetKind -ceq 'product') {
+        if ($null -eq $ProductBoundary -or $null -ne $ValidateBoundary) {
+            throw 'A product transaction requires the real product boundary object and forbids a caller-supplied validator.'
         }
-        return $current
+        $effectiveBoundaryValidator = {
+            param([string] $Label)
+            Assert-A4SProductMutationBoundary -Boundary $ProductBoundary -Label $Label
+        }.GetNewClosure()
+    }
+    else {
+        if ($null -ne $ProductBoundary -or $null -eq $ValidateBoundary) {
+            throw 'A contract-sandbox transaction requires only its explicit test validator.'
+        }
+        $effectiveBoundaryValidator = $ValidateBoundary
+    }
+    Assert-ValidRegistryTree -Tree $DesiredSnapshot -IsRoot $true
+    Assert-ValidRegistryTree -Tree $ExpectedCurrent.snapshot -IsRoot $true
+    [void](& $effectiveBoundaryValidator 'registry transaction entry')
+    $initial = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+    if (-not (Test-RegistryAggregateEqual -First $ExpectedCurrent -Second $initial)) {
+        throw 'A4S_UNKNOWN_REGISTRY_STATE: transaction entry differs from the previously authorized aggregate.'
+    }
+    $desired = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $DesiredSnapshot
+    if (Test-RegistryAggregateEqual -First $initial -Second $desired) {
+        return [pscustomobject][ordered]@{
+            snapshot=$initial.snapshot; snapshotSha256=$initial.sha256
+            mutationStepCount=0; journalEntryCount=0; transaction='committed'
+        }
     }
 
-    $absent = [pscustomobject][ordered]@{ exists = $false; values = @(); subkeys = @() }
-    $current = Invoke-AuthorizedHostSafetyMutationStep -Boundary $Boundary `
-        -Before $current -AfterSnapshot $absent -MutationState $MutationState `
-        -Label 'delete prior HostSafety tree' -Mutation { Remove-HostSafetyRegistryTree }
-    if (-not [bool]$DesiredSnapshot.exists) { return $current }
-
-    $empty = [pscustomobject][ordered]@{ exists = $true; values = @(); subkeys = @() }
-    $current = Invoke-AuthorizedHostSafetyMutationStep -Boundary $Boundary `
-        -Before $current -AfterSnapshot $empty -MutationState $MutationState `
-        -Label 'create HostSafety root' -Mutation {
-            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-                [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
-            try {
-                $key = $base.CreateSubKey($hostSafetySubKey, $true)
-                if ($null -eq $key) { throw 'Could not create HostSafety root.' }
-                try { $key.Flush() } finally { $key.Dispose() }
+    $journal = [Collections.ArrayList]::new()
+    $current = $initial
+    $step = 0
+    try {
+        foreach ($value in @($initial.snapshot.values)) {
+            $afterSnapshot = Copy-RegistrySnapshotObject -Snapshot $current.snapshot
+            $afterSnapshot.values = @($afterSnapshot.values | Where-Object {
+                -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                    [string]$_.name, [string]$value.name)
+            })
+            [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                -CurrentAggregate ([ref]$current) -AfterSnapshot $afterSnapshot `
+                -Operation DeleteValue -ValueRecord $value `
+                -InverseOperation SetValue -InverseValueRecord $value `
+                -Journal $journal -StepNumber ([ref]$step) `
+                -ValidateBoundary $effectiveBoundaryValidator `
+                -InjectFailureAfterStep $InjectFailureAfterStep)
+        }
+        if ([bool]$current.snapshot.exists -and -not [bool]$DesiredSnapshot.exists) {
+            $absent = [pscustomobject][ordered]@{ exists=$false; values=@(); subkeys=@() }
+            [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                -CurrentAggregate ([ref]$current) -AfterSnapshot $absent `
+                -Operation DeleteKey -InverseOperation CreateKey `
+                -Journal $journal -StepNumber ([ref]$step) `
+                -ValidateBoundary $effectiveBoundaryValidator `
+                -InjectFailureAfterStep $InjectFailureAfterStep)
+        }
+        elseif ([bool]$DesiredSnapshot.exists) {
+            if (-not [bool]$current.snapshot.exists) {
+                $empty = [pscustomobject][ordered]@{ exists=$true; values=@(); subkeys=@() }
+                [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                    -CurrentAggregate ([ref]$current) -AfterSnapshot $empty `
+                    -Operation CreateKey -InverseOperation DeleteKey `
+                    -Journal $journal -StepNumber ([ref]$step) `
+                    -ValidateBoundary $effectiveBoundaryValidator `
+                    -InjectFailureAfterStep $InjectFailureAfterStep)
             }
-            finally { $base.Dispose() }
+            foreach ($value in @($DesiredSnapshot.values)) {
+                $afterSnapshot = Copy-RegistrySnapshotObject -Snapshot $current.snapshot
+                $afterSnapshot.values = @($afterSnapshot.values) + @(
+                    Copy-RegistrySnapshotObject -Snapshot $value)
+                [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                    -CurrentAggregate ([ref]$current) -AfterSnapshot $afterSnapshot `
+                    -Operation SetValue -ValueRecord $value `
+                    -InverseOperation DeleteValue -InverseValueRecord $value `
+                    -Journal $journal -StepNumber ([ref]$step) `
+                    -ValidateBoundary $effectiveBoundaryValidator `
+                    -InjectFailureAfterStep $InjectFailureAfterStep)
+            }
         }
-    $currentReference = [ref]$current
-    Set-HostSafetyTreeProgressively -Boundary $Boundary -DesiredNode $DesiredSnapshot `
-        -ExpectedRoot $empty -ExpectedNode $empty -RelativePath '' `
-        -CurrentAggregate $currentReference -MutationState $MutationState
-    $final = Get-HostSafetyAggregateRecord
-    [void](Assert-AuthorizedHostSafetyAggregate -Current $final `
-        -ExpectedSnapshot $DesiredSnapshot -ExpectedSha256 $desired.sha256 `
-        -Boundary 'exact restore final aggregate')
-    return $final
-}
-
-function Get-KnownMutationAggregate {
-    param(
-        [Parameter(Mandatory)][object] $MutationState,
-        [Parameter(Mandatory)][object] $Current,
-        [Parameter(Mandatory)][string] $Boundary
-    )
-    foreach ($allowed in @($MutationState.allowed)) {
-        if ($allowed.sha256 -ceq $Current.sha256 -and
-            (Compare-HostSafetySnapshot -Expected $allowed.snapshot -Actual $Current.snapshot)) {
-            return $Current
+        $final = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+        if (-not (Test-RegistryAggregateEqual -First $desired -Second $final)) {
+            throw 'A4S_UNKNOWN_REGISTRY_STATE: transaction final aggregate differs from the desired snapshot.'
+        }
+        return [pscustomobject][ordered]@{
+            snapshot=$final.snapshot; snapshotSha256=$final.sha256
+            mutationStepCount=$step; journalEntryCount=$journal.Count; transaction='committed'
         }
     }
-    throw "$Boundary observed an unknown/intervening HostSafety aggregate; rollback is forbidden to avoid overwriting external state."
+    catch {
+        $primary = $_
+        if ($primary.Exception.Message.StartsWith('A4S_UNKNOWN_REGISTRY_STATE:',
+            [StringComparison]::Ordinal)) {
+            throw $primary
+        }
+        try {
+            $rolledBack = Undo-A4SRegistryJournal -RegistrySubKey $RegistrySubKey `
+                -Journal $journal -ValidateBoundary $effectiveBoundaryValidator
+        }
+        catch {
+            throw "Registry transaction failed ('$($primary.Exception.Message)') and deterministic journal rollback failed ('$($_.Exception.Message)')."
+        }
+        if (-not (Test-RegistryAggregateEqual -First $initial -Second $rolledBack)) {
+            throw "Registry transaction failed ('$($primary.Exception.Message)') and journal rollback did not restore the exact immediate prestate."
+        }
+        throw "Registry transaction failed and journal rollback restored the exact immediate prestate: $($primary.Exception.Message)"
+    }
 }
 
 function Restore-HostSafety {
     param(
         [Parameter(Mandatory)][string] $Bundle,
-        [string] $ProbeHost,
-        [object] $AuthorizedCurrentSnapshot,
         [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
-        [string] $AuthorizedCurrentSha256
+        [string] $ExpectedManifestSha256,
+        [string] $ProbeHost,
+        [object] $ExpectedCurrentHostSafetySnapshot,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedCurrentHostSafetySha256
     )
 
     Assert-AllTrackedHostsStopped -ProbeHost $ProbeHost
-    $validated = Read-ValidatedHostSafetyBackup -Bundle $Bundle
+    # Manifest authentication is completed from one locked byte stream before
+    # the product mutation boundary is entered or any registry state can change.
+    $validated = Read-ValidatedHostSafetyBackup -Bundle $Bundle `
+        -ExpectedManifestSha256 $ExpectedManifestSha256
     $boundary = Enter-A4SProductMutationBoundary
     $rollback = $null
-    $mutationState = [ordered]@{ label = 'not started'; inFlight = $false; allowed = @(); lastVerified = $null }
     try {
         [void](Assert-A4SProductMutationBoundary -Boundary $boundary -Label 'restore authorization')
         $immediate = Get-HostSafetyAggregateRecord
         [void](Assert-AuthorizedHostSafetyAggregate -Current $immediate `
-            -ExpectedSnapshot $AuthorizedCurrentSnapshot `
-            -ExpectedSha256 $AuthorizedCurrentSha256 -Boundary 'restore authorization')
+            -ExpectedSnapshot $ExpectedCurrentHostSafetySnapshot `
+            -ExpectedSha256 $ExpectedCurrentHostSafetySha256 `
+            -Boundary 'restore authorization')
         $rollbackPath = Join-Path $validated.bundle ('Rollback-' + [Guid]::NewGuid().ToString('N'))
         $rollbackRecord = New-SafeFreshDirectory -Path $rollbackPath `
             -Description 'HostSafety transactional rollback bundle' -ExpectedParent $validated.bundle
@@ -1583,55 +2140,21 @@ function Restore-HostSafety {
         [void](Assert-AuthorizedHostSafetyAggregate -Current $postBackup `
             -ExpectedSnapshot $immediate.snapshot -ExpectedSha256 $immediate.sha256 `
             -Boundary 'post-backup authorization')
-        try {
-            $restored = Set-HostSafetySnapshotExactly -Boundary $boundary `
-                -DesiredSnapshot $validated.manifest.snapshot -ExpectedCurrent $immediate `
-                -MutationState ([ref]$mutationState)
-            return [ordered]@{
-                snapshot = $restored.snapshot
-                snapshotSha256 = $restored.sha256
-                transaction = 'committed'
-                authorizedPreRestoreSha256 = $immediate.sha256
-                setupMutexName = $boundary.SetupMutexName
-                hostMutexName = $boundary.HostMutexName
-                rollbackBundle = $rollback.bundle
-                rollbackManifestSha256 = $rollback.manifestSha256
-            }
-        }
-        catch {
-            $primary = $_
-            [void](Assert-A4SProductMutationBoundary -Boundary $boundary -Label 'rollback authorization')
-            $observed = Get-HostSafetyAggregateRecord
-            try { $known = Get-KnownMutationAggregate -MutationState $mutationState `
-                -Current $observed -Boundary 'rollback authorization' }
-            catch {
-                throw "HostSafety restore failed ('$($primary.Exception.Message)'). $($_.Exception.Message) Exact pre-restore rollback was not attempted. Bundles retained: '$($validated.bundle)' and '$($rollback.bundle)'."
-            }
-            $rollbackState = [ordered]@{
-                label = 'rollback not started'; inFlight = $false
-                allowed = @($known); lastVerified = $known
-            }
-            try {
-                $rolledBack = Set-HostSafetySnapshotExactly -Boundary $boundary `
-                    -DesiredSnapshot $rollback.manifest.snapshot -ExpectedCurrent $known `
-                    -MutationState ([ref]$rollbackState)
-                if ($rolledBack.sha256 -cne $immediate.sha256 -or
-                    -not (Compare-HostSafetySnapshot -Expected $immediate.snapshot `
-                        -Actual $rolledBack.snapshot)) {
-                    throw 'Rollback completed with a non-identical aggregate.'
-                }
-            }
-            catch {
-                $rollbackError = $_
-                $rollbackObserved = Get-HostSafetyAggregateRecord
-                try { [void](Get-KnownMutationAggregate -MutationState $rollbackState `
-                    -Current $rollbackObserved -Boundary 'rollback failure') }
-                catch {
-                    throw "HostSafety restore failed ('$($primary.Exception.Message)'); rollback failed ('$($rollbackError.Exception.Message)'); and an unknown/intervening aggregate was observed ('$($_.Exception.Message)'). No further mutation was attempted."
-                }
-                throw "HostSafety restore failed ('$($primary.Exception.Message)') and exact rollback failed ('$($rollbackError.Exception.Message)'). Known state was retained; both bundles remain."
-            }
-            throw "HostSafety restore failed but the exact authorized immediate state was rolled back successfully. Primary error: $($primary.Exception.Message). Rollback bundle retained at '$($rollback.bundle)'."
+        $restored = Invoke-A4SRegistrySnapshotTransaction `
+            -RegistrySubKey $hostSafetySubKey `
+            -DesiredSnapshot $validated.manifest.snapshot `
+            -ExpectedCurrent $immediate -ProductBoundary $boundary
+        return [ordered]@{
+            snapshot = $restored.snapshot
+            snapshotSha256 = $restored.snapshotSha256
+            transaction = $restored.transaction
+            authorizedPreRestoreSha256 = $immediate.sha256
+            manifestSha256 = $validated.manifestSha256
+            mutationStepCount = $restored.mutationStepCount
+            setupMutexName = $boundary.SetupMutexName
+            hostMutexName = $boundary.HostMutexName
+            rollbackBundle = $rollback.bundle
+            rollbackManifestSha256 = $rollback.manifestSha256
         }
     }
     finally { Exit-A4SProductMutationBoundary -Boundary $boundary }
@@ -2436,6 +2959,8 @@ function Invoke-IsolatedDllFailureQualification {
     $finalMappingCount = -1
     $finalWindowCount = -1
     $safetyRestored = $false
+    $backup = $null
+    $authorizedState = $null
     $operationError = $null
     try {
         $sourceBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost' `
@@ -2465,9 +2990,20 @@ function Invoke-IsolatedDllFailureQualification {
             retainedTemporaryRoot = $null
             retentionReason = $null
             authorizedCurrentHostSafetySha256 = $null
+            authorizedStateSequence = $null
+            authorizedStateLastAction = $null
+            authorizedStateHistory = @()
+            freshKnownCurrentHostSafetySha256 = $null
+            freshKnownCurrentStateUtc = $null
+            recoveryCommand = $null
             cleanupInstructions = $null
         }
         Save-Evidence
+        $authorizedState = New-A4SAuthorizedHostSafetyState `
+            -InitialSnapshot $backup.manifest.snapshot `
+            -InitialSha256 $backup.snapshotSha256 -Action 'initial-backup' `
+            -ExpectedMutationActions @()
+        Publish-A4SAuthorizedHostSafetyState -State $authorizedState
 
         $caseNames = @('missing', 'corrupt', 'incompatible')
         foreach ($caseName in $caseNames) {
@@ -2522,6 +3058,9 @@ function Invoke-IsolatedDllFailureQualification {
                 if ($during.a4sMappings.Count -ne 0 -or $during.visibleMenuWindowCount -ne 0) {
                     throw "$caseName sibling-DLL failure reached Explorer despite pre-injection validation."
                 }
+                [void](Assert-A4SAuthorizedHostSafetySnapshot -State $authorizedState `
+                    -Snapshot $during.hostSafety `
+                    -Label "isolated $caseName failed-host HostSafety checkpoint")
                 Add-EvidenceCheckpoint $during
 
                 [void](Stop-A4STestHost -Executable $caseHost -ResidentProcess $resident)
@@ -2532,6 +3071,9 @@ function Invoke-IsolatedDllFailureQualification {
                 if ($after.a4sMappings.Count -ne 0 -or $after.visibleMenuWindowCount -ne 0) {
                     throw "$caseName cleanup observed an A4S injection."
                 }
+                [void](Assert-A4SAuthorizedHostSafetySnapshot -State $authorizedState `
+                    -Snapshot $after.hostSafety `
+                    -Label "isolated $caseName stopped HostSafety checkpoint")
                 Add-EvidenceCheckpoint $after
                 $finalCaseHostBinding = Get-BinaryBinding -Path $caseHost `
                     -Role "final isolated $caseName A4SMenuHost"
@@ -2584,6 +3126,8 @@ function Invoke-IsolatedDllFailureQualification {
         Assert-SameExplorerIdentity -Expected $initial.explorer -Actual $finalExplorer `
             -Label 'isolated matrix final'
         [void](Assert-NoA4SMapping -Explorer $finalExplorer -Label 'isolated matrix final')
+        [void](Assert-A4SAuthorizedCurrentHostSafety -State $authorizedState `
+            -Label 'isolated matrix final HostSafety checkpoint')
         $noInjectionConclusive = $true
     }
     catch {
@@ -2622,11 +3166,22 @@ function Invoke-IsolatedDllFailureQualification {
         }
         if ($backupPrepared -and $hostsStopped) {
             try {
-                $restoreAuthorization = Add-HostSafetyRestoreAuthorizationCheckpoint `
-                    -Label 'isolated-restore-authorized'
+                $restoreAuthorization = Assert-A4SAuthorizedCurrentHostSafety `
+                    -State $authorizedState -Label 'isolated restore prior authorization'
+                Add-EvidenceCheckpoint ([ordered]@{
+                    utc = Get-UtcText
+                    label = 'isolated-restore-previously-authorized'
+                    authorizedStateSequence = $authorizedState.sequence
+                    authorizedStateLastAction = $authorizedState.lastAction
+                    hostSafetySha256 = $restoreAuthorization.sha256
+                })
                 $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost `
-                    -AuthorizedCurrentSnapshot $restoreAuthorization.snapshot `
-                    -AuthorizedCurrentSha256 $restoreAuthorization.sha256
+                    -ExpectedManifestSha256 $backup.manifestSha256 `
+                    -ExpectedCurrentHostSafetySnapshot $authorizedState.snapshot `
+                    -ExpectedCurrentHostSafetySha256 $authorizedState.sha256
+                [void](Confirm-A4SRestoreTransition -State $authorizedState `
+                    -RestoreResult $restoreResult -DesiredSnapshot $backup.manifest.snapshot `
+                    -ExpectedManifestSha256 $backup.manifestSha256)
                 $safetyRestored = $true
                 $script:Evidence.recovery.restored = $true
                 $script:Evidence.recovery.restoredUtc = Get-UtcText
@@ -2653,7 +3208,8 @@ function Invoke-IsolatedDllFailureQualification {
             try {
                 Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                     -BackupPrepared $backupPrepared -Bundle $bundle `
-                    -Reason 'Validated recursive cleanup was authorized and is in progress.'
+                    -AuthorizedState $authorizedState -ProbeHost $sourceHost `
+                    -Reason 'Validated flat cleanup was authorized and is in progress.'
                 Remove-A4STemporaryRoot -Root $temporaryRoot
                 Clear-RetainedTemporaryRootEvidence
             }
@@ -2661,13 +3217,15 @@ function Invoke-IsolatedDllFailureQualification {
                 [void]$script:Evidence.errors.Add("Temporary case cleanup failed: $($_.Exception.Message)")
                 Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                     -BackupPrepared $backupPrepared -Bundle $bundle `
-                    -Reason "Validated recursive cleanup threw or only partially removed the root: $($_.Exception.Message)"
+                    -AuthorizedState $authorizedState -ProbeHost $sourceHost `
+                    -Reason "Validated flat cleanup threw or only partially removed the root: $($_.Exception.Message)"
                 if ($null -eq $operationError) { $operationError = $_ }
             }
         }
         else {
             Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                 -BackupPrepared $backupPrepared -Bundle $bundle `
+                -AuthorizedState $authorizedState -ProbeHost $sourceHost `
                 -Reason 'Cleanup authorization was denied because host, mapping/window, or HostSafety restoration proof was incomplete.'
         }
         $script:Evidence.trackedHosts = @($script:TrackedHosts)
@@ -2860,6 +3418,8 @@ function Invoke-LiveFailureRecoveryQualification {
     $finalMappingCount = -1
     $finalWindowCount = -1
     $safetyRestored = $false
+    $backup = $null
+    $authorizedState = $null
 
     try {
         $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
@@ -2909,9 +3469,22 @@ function Invoke-LiveFailureRecoveryQualification {
             retainedTemporaryRoot = $null
             retentionReason = $null
             authorizedCurrentHostSafetySha256 = $null
+            authorizedStateSequence = $null
+            authorizedStateLastAction = $null
+            authorizedStateHistory = @()
+            freshKnownCurrentHostSafetySha256 = $null
+            freshKnownCurrentStateUtc = $null
+            recoveryCommand = $null
             cleanupInstructions = $null
         }
         Save-Evidence
+        $authorizedState = New-A4SAuthorizedHostSafetyState `
+            -InitialSnapshot $backup.manifest.snapshot `
+            -InitialSha256 $backup.snapshotSha256 -Action 'initial-backup' `
+            -ExpectedMutationActions @('no-DLL-reset-safety',
+                'guarded-explorer-crash-1', 'guarded-explorer-crash-2',
+                'guarded-explorer-crash-3', 'resident-reset-safety')
+        Publish-A4SAuthorizedHostSafetyState -State $authorizedState
 
         # Establish an empty crash-guard baseline without loading a valid DLL or
         # installing a hook. This host copy has no sibling A4SMenu.dll.
@@ -2922,6 +3495,9 @@ function Invoke-LiveFailureRecoveryQualification {
         Copy-Item -LiteralPath $sourceHost -Destination $resetHost -ErrorAction Stop
         $resetBinding = Get-BinaryBinding -Path $resetHost -Role 'safety-reset A4SMenuHost'
         Assert-BinaryCopyBinding -Source $sourceHostBinding -Copy $resetBinding
+        [void](Assert-A4SAuthorizedCurrentHostSafety -State $authorizedState `
+            -Label 'no-DLL reset pre-action authorization')
+        $preResetAuthorizedSha256 = $authorizedState.sha256
         $resetProcess = Start-A4STestHost -Executable $resetHost -Arguments '--reset-safety' `
             -Role 'safety-reset no-DLL host'
         $resetStopped = $false
@@ -2944,6 +3520,9 @@ function Invoke-LiveFailureRecoveryQualification {
         if ($emptySafety.exists) {
             throw 'The isolated no-DLL --reset-safety preparation did not clear HostSafety.'
         }
+        [void](Confirm-A4SResetSafetyTransition -State $authorizedState `
+            -ExpectedPreviousSha256 $preResetAuthorizedSha256 `
+            -ObservedSnapshot $emptySafety -Action 'no-DLL-reset-safety')
         Assert-SameExplorerIdentity -Expected $initial.explorer `
             -Actual (Get-TaskbarExplorerIdentity) -Label 'HostSafety reset preparation'
         [void](Assert-NoA4SMapping -Explorer $initial.explorer -Label 'HostSafety reset preparation')
@@ -2973,6 +3552,8 @@ function Invoke-LiveFailureRecoveryQualification {
             -KnownHostProcessId $resident.Id
         [void](Assert-A4SReadyBoundary -Checkpoint $ready -ExpectedDll $runtimeDll `
             -ResidentProcess $resident -HostExecutable $runtimeHost -Label 'initial-ready')
+        [void](Assert-A4SAuthorizedHostSafetySnapshot -State $authorizedState `
+            -Snapshot $ready.hostSafety -Label 'initial-ready HostSafety checkpoint')
         $ready.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
             -ExpectedDll $runtimeDll -ExplorerProcessId $ready.explorer.pid `
             -ResidentProcess $resident
@@ -2986,6 +3567,10 @@ function Invoke-LiveFailureRecoveryQualification {
             [void](Assert-A4SReadyBoundary -Checkpoint $before -ExpectedDll $runtimeDll `
                 -ResidentProcess $resident -HostExecutable $runtimeHost `
                 -Label "crash-$crashIndex-armed")
+            [void](Assert-A4SAuthorizedHostSafetySnapshot -State $authorizedState `
+                -Snapshot $before.hostSafety `
+                -Label "crash-$crashIndex previously authorized HostSafety")
+            $preCrashAuthorizedSha256 = $authorizedState.sha256
             Add-EvidenceCheckpoint $before
 
             # Persist intent before the destructive boundary. If PowerShell is
@@ -3069,9 +3654,10 @@ function Invoke-LiveFailureRecoveryQualification {
                 oldExplorerPid = $before.explorer.pid
                 newExplorerPid = $after.explorer.pid
             })
-            $after.rollingGuard = Assert-RollingCrashGuardStage `
-                -Snapshot $after.hostSafety -ExpectedCount $crashIndex `
-                -ExpectedDisabled ($crashIndex -eq $crashThreshold) `
+            $after.rollingGuard = Confirm-A4SCrashGuardTransition `
+                -State $authorizedState `
+                -ExpectedPreviousSha256 $preCrashAuthorizedSha256 `
+                -ObservedSnapshot $after.hostSafety -Stage $crashIndex `
                 -Boundaries @($crashBoundaries) -PriorTimestamps $priorGuardTimes
             [uint64[]]$priorGuardTimes = @($after.rollingGuard.timestamps100ns)
             $after.termination = $termination
@@ -3088,6 +3674,9 @@ function Invoke-LiveFailureRecoveryQualification {
         # The real host reset must clear SAFETY_DISABLED and recover a READY exact
         # mapping. This intentionally occurs only inside the explicitly consented
         # live mode and is followed by a supported logical stop.
+        [void](Assert-A4SAuthorizedCurrentHostSafety -State $authorizedState `
+            -Label 'resident reset pre-action authorization')
+        $preRecoveryResetAuthorizedSha256 = $authorizedState.sha256
         $resetResult = Invoke-A4SHostCommand -Executable $runtimeHost -Argument '--reset-safety'
         if ($resetResult.exitCode -ne 0) {
             throw "Resident --reset-safety failed with exit $($resetResult.exitCode)."
@@ -3102,6 +3691,9 @@ function Invoke-LiveFailureRecoveryQualification {
         if ($recovered.hostSafety.exists) {
             throw '--reset-safety recovered injection but retained crash-guard registry state.'
         }
+        [void](Confirm-A4SResetSafetyTransition -State $authorizedState `
+            -ExpectedPreviousSha256 $preRecoveryResetAuthorizedSha256 `
+            -ObservedSnapshot $recovered.hostSafety -Action 'resident-reset-safety')
         $recovered.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
             -ExpectedDll $runtimeDll -ExplorerProcessId $recovered.explorer.pid `
             -ResidentProcess $resident
@@ -3146,6 +3738,9 @@ function Invoke-LiveFailureRecoveryQualification {
             $cleanupAfter.visibleMenuWindowCount -ne 0) {
             throw 'The acknowledged cleanup restart did not leave a clean replacement Explorer.'
         }
+        [void](Assert-A4SAuthorizedHostSafetySnapshot -State $authorizedState `
+            -Snapshot $cleanupAfter.hostSafety `
+            -Label 'cleanup restart HostSafety checkpoint')
         $cleanupAfter.termination = $cleanupTermination
         $cleanupAfter.replacementFallbackLaunchUsed = $cleanupReplacement.fallbackLaunchUsed
         Add-EvidenceCheckpoint $cleanupAfter
@@ -3233,11 +3828,22 @@ function Invoke-LiveFailureRecoveryQualification {
 
         if ($backupPrepared -and $allTrackedStopped) {
             try {
-                $restoreAuthorization = Add-HostSafetyRestoreAuthorizationCheckpoint `
-                    -Label 'live-restore-authorized'
+                $restoreAuthorization = Assert-A4SAuthorizedCurrentHostSafety `
+                    -State $authorizedState -Label 'live restore prior authorization'
+                Add-EvidenceCheckpoint ([ordered]@{
+                    utc = Get-UtcText
+                    label = 'live-restore-previously-authorized'
+                    authorizedStateSequence = $authorizedState.sequence
+                    authorizedStateLastAction = $authorizedState.lastAction
+                    hostSafetySha256 = $restoreAuthorization.sha256
+                })
                 $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost `
-                    -AuthorizedCurrentSnapshot $restoreAuthorization.snapshot `
-                    -AuthorizedCurrentSha256 $restoreAuthorization.sha256
+                    -ExpectedManifestSha256 $backup.manifestSha256 `
+                    -ExpectedCurrentHostSafetySnapshot $authorizedState.snapshot `
+                    -ExpectedCurrentHostSafetySha256 $authorizedState.sha256
+                [void](Confirm-A4SRestoreTransition -State $authorizedState `
+                    -RestoreResult $restoreResult -DesiredSnapshot $backup.manifest.snapshot `
+                    -ExpectedManifestSha256 $backup.manifestSha256)
                 $safetyRestored = $true
                 $script:Evidence.recovery.restored = $true
                 $script:Evidence.recovery.restoredUtc = Get-UtcText
@@ -3265,7 +3871,8 @@ function Invoke-LiveFailureRecoveryQualification {
             try {
                 Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                     -BackupPrepared $backupPrepared -Bundle $bundle `
-                    -Reason 'Validated post-restart recursive cleanup was authorized and is in progress.'
+                    -AuthorizedState $authorizedState -ProbeHost $sourceHost `
+                    -Reason 'Validated post-restart flat cleanup was authorized and is in progress.'
                 Remove-A4STemporaryRoot -Root $temporaryRoot
                 Clear-RetainedTemporaryRootEvidence
             }
@@ -3273,13 +3880,15 @@ function Invoke-LiveFailureRecoveryQualification {
                 [void]$script:Evidence.errors.Add("Temporary runtime cleanup failed: $($_.Exception.Message)")
                 Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                     -BackupPrepared $backupPrepared -Bundle $bundle `
-                    -Reason "Validated post-restart cleanup threw or only partially removed the root: $($_.Exception.Message)"
+                    -AuthorizedState $authorizedState -ProbeHost $sourceHost `
+                    -Reason "Validated post-restart flat cleanup threw or only partially removed the root: $($_.Exception.Message)"
                 if ($null -eq $operationError) { $operationError = $_ }
             }
         }
         else {
             Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
                 -BackupPrepared $backupPrepared -Bundle $bundle `
+                -AuthorizedState $authorizedState -ProbeHost $sourceHost `
                 -Reason 'Cleanup authorization was denied because restart, host, mapping/window, or HostSafety restoration proof was incomplete.'
         }
 
@@ -3297,13 +3906,14 @@ function Invoke-LiveFailureRecoveryQualification {
 }
 
 if ($PSCmdlet.ParameterSetName -eq 'ContractLibrary') {
-    # Dot-sourced by the offline companion so its executable negative cases call
-    # the exact production validators without loading native code or mutating state.
+    # Return before initialization/dispatch when dot-sourced by the companion.
+    # The companion explicitly loads the path helper and confines mutations to
+    # its random HKCU contract subtree and validated OS-temp root.
     return
 }
 elseif ($PSCmdlet.ParameterSetName -eq 'Offline') {
     & (Join-Path $PSScriptRoot 'Test-A4SFailureRecoveryContracts.ps1')
-    Write-Host 'OFFLINE GO: no runtime, registry, Explorer, staging, or evidence changes were made.'
+    Write-Host 'OFFLINE GO: only a random HKCU contract-test subtree and a validated OS-temp root were created and transactionally removed; product HostSafety, runtime, Explorer, staging, and evidence were unchanged.'
     Write-Host 'ISOLATED/LIVE NO-GO: neither executable mode was run; both remain deferred pending explicit review and authorization.'
     Write-Host 'Live N6/N9 additionally requires the conspicuous crash switch, exact confirmation text, and a verified immutable release record.'
     Write-Host 'Native Start UI behavior is a manual/deferred observation, never a mechanical harness PASS.'
@@ -3331,7 +3941,8 @@ else {
                 # recovery validation, process checks, or registry deletion.
                 Assert-AllTrackedHostsStopped
                 $restoreResult = Restore-HostSafety -Bundle $RecoveryBundle `
-                    -AuthorizedCurrentSha256 $ExpectedCurrentHostSafetySha256
+                    -ExpectedManifestSha256 $ExpectedManifestSha256 `
+                    -ExpectedCurrentHostSafetySha256 $ExpectedCurrentHostSafetySha256
                 Write-Host "HostSafety restored transactionally from the validated Registry64 bundle: $RecoveryBundle"
                 Write-Host "Immediate pre-restore rollback bundle retained at: $($restoreResult.rollbackBundle)"
             }

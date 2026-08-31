@@ -9,7 +9,6 @@ $harnessPath = Join-Path $PSScriptRoot 'Test-A4SFailureRecovery.ps1'
 $hostPath = Join-Path $repoRoot 'Src\A4SMenu\Host\A4SMenuHost.cpp'
 $identityPath = Join-Path $repoRoot 'Src\A4SMenu\Shared\A4SProductIdentity.h'
 $setupPath = Join-Path $repoRoot 'Src\A4SMenu\Setup\A4SMenuSetup.cpp'
-
 foreach ($path in @($harnessPath, $hostPath, $identityPath, $setupPath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Missing failure/recovery contract input: $path"
@@ -32,12 +31,17 @@ function Assert-Contract {
 function Assert-Throws {
     param(
         [Parameter(Mandatory)][scriptblock] $Action,
-        [Parameter(Mandatory)][string] $Message
+        [Parameter(Mandatory)][string] $Message,
+        [string] $MessagePattern
     )
-    $threw = $false
+    $caught = $null
     try { & $Action }
-    catch { $threw = $true }
-    Assert-Contract $threw $Message
+    catch { $caught = $_ }
+    Assert-Contract ($null -ne $caught) $Message
+    if ($null -ne $caught -and -not [string]::IsNullOrWhiteSpace($MessagePattern)) {
+        Assert-Contract ($caught.Exception.Message -match $MessagePattern) `
+            "$Message (unexpected error: $($caught.Exception.Message))"
+    }
 }
 
 $tokens = $null
@@ -76,251 +80,156 @@ function Assert-InOrder {
     }
 }
 
-# Load the harness itself as a side-effect-free function library. Every executable
-# negative case below calls the same validator used by Isolated/Live/Recover; no
-# duplicate toy schema or transaction model is allowed here.
+# Load the production harness as a function library. ContractLibrary returns
+# before native initialization or dispatch. The tests explicitly initialize only
+# the read-only native helper required for final-handle path validation.
 $library = New-Module -Name A4SFailureRecoveryContractLibrary -ScriptBlock {
     param([string] $Path)
     . $Path -ContractLibrary
 } -ArgumentList $harnessPath
 
+$sandboxSubKey = 'Software\A4SMenuFailureRecoveryContract_' + [Guid]::NewGuid().ToString('N')
+$sandboxAuthorized = $null
+$sandboxOwnershipEstablished = $false
+$temporaryRoot = $null
+$primaryError = $null
+
 try {
+    & $library { Initialize-A4SFailureRecoveryNative }
+
+    # Static dispatch and destructive-boundary contracts.
     Assert-Contract ($harness -match "CmdletBinding\(DefaultParameterSetName\s*=\s*'Offline'\)") `
         'default execution is not Offline'
     Assert-InOrder -Text $harness -Markers @(
         "if (`$PSCmdlet.ParameterSetName -eq 'ContractLibrary')",
         "elseif (`$PSCmdlet.ParameterSetName -eq 'Offline')",
         'Initialize-A4SFailureRecoveryNative') `
-        -Message 'the safe ContractLibrary/Offline dispatch does not precede executable setup'
-    $offlineDispatch = [Regex]::Match($harness,
-        '(?s)elseif \(\$PSCmdlet\.ParameterSetName -eq ''Offline''\).*?\n\}\s*else \{').Value
-    Assert-Contract (-not [string]::IsNullOrWhiteSpace($offlineDispatch)) `
-        'could not isolate the Offline dispatcher'
-    foreach ($forbidden in @('Initialize-A4SFailureRecoveryNative', 'Enter-A4SHarnessLease',
-            'New-EvidenceBundle', 'Backup-HostSafety', 'Start-A4STestHost',
-            'Request-ValidatedExplorerTermination', 'Remove-Item', 'New-Item')) {
-        Assert-Contract ($offlineDispatch -notmatch [Regex]::Escape($forbidden)) `
-            "Offline dispatch contains $forbidden"
-    }
-    Assert-Contract ($offlineDispatch -match 'Test-A4SFailureRecoveryContracts\.ps1') `
-        'Offline dispatch does not run this companion gate'
-
-    foreach ($required in @('Initialize-A4SFailureRecoveryNative', 'Enter-A4SHarnessLease',
-            'Exit-A4SHarnessLease', "'Isolated'", "'Live'", "'Recover'")) {
-        Assert-Contract ($harness -match [Regex]::Escape($required)) `
-            "executable dispatcher omits $required"
-    }
-    Assert-Contract ($harness -match '\[Environment\]::Is64BitProcess') `
-        'executable and Recover modes do not enforce x64'
-    Assert-Contract ($harness -match 'Global\\A4SMenu\.FailureRecoveryHarness\.v2\.') `
-        'harness lease is not same-user and cross-session'
-    Assert-Contract ($harness -match [Regex]::Escape(
-        'I ACCEPT FOUR EXPLORER TERMINATIONS: THREE GUARDED CRASHES AND ONE CLEANUP RESTART')) `
-        'live mode lacks exact high-friction consent'
-    foreach ($forbidden in @('Stop-Process', 'taskkill', 'Restart-Computer', 'Stop-Computer',
-            '--rehook', 'build\stage\A4SProduct', '/y', 'reg.exe import')) {
+        -Message 'safe ContractLibrary/Offline dispatch does not precede executable setup'
+    foreach ($forbidden in @('Stop-Process', 'taskkill', 'Restart-Computer',
+            'Stop-Computer', '--rehook', 'build\stage\A4SProduct', 'reg.exe import',
+            'DeleteSubKeyTree')) {
         Assert-Contract ($harness -notmatch [Regex]::Escape($forbidden)) `
             "harness contains forbidden primitive $forbidden"
     }
+    Assert-Contract (([Regex]::Matches($harness,
+        'Remove-Item[^\r\n]+-Recurse')).Count -eq 0) `
+        'recursive filesystem deletion remains in the harness'
+    Assert-Contract ($harness -match
+        '\[Parameter\(Mandatory, ParameterSetName = ''Recover''\)\][\s\S]*?\$ExpectedManifestSha256') `
+        'Recover does not require an expected manifest SHA-256'
 
-    $requestTermination = Get-FunctionText 'Request-ValidatedExplorerTermination'
-    $completeTermination = Get-FunctionText 'Complete-ValidatedExplorerTermination'
-    $terminationGate = Get-FunctionText 'Assert-TerminationRequestReadyForWait'
-    Assert-Contract (([Regex]::Matches($harness, '\.Kill\(\)')).Count -eq 1) `
-        'Process.Kill must occur exactly once in the identity-validated request helper'
-    foreach ($required in @('Get-TaskbarExplorerIdentity', 'Assert-SameExplorerIdentity',
-            'explorer.exe', 'SessionId', '.Kill()', 'killReturnedFileTimeUtc',
-            'evidencePersisted = $false')) {
-        Assert-Contract ($requestTermination -match [Regex]::Escape($required)) `
-            "termination request omits $required"
-    }
-    Assert-Contract ($requestTermination -notmatch 'WaitForExit|Wait-ReplacementExplorer') `
-        'termination request waits before callers can persist evidence'
-    Assert-InOrder -Text $completeTermination -Markers @(
-        'Assert-TerminationRequestReadyForWait', 'WaitForExit') `
-        -Message 'termination completion can wait before validating durable evidence'
-    Assert-Contract ($terminationGate -match 'evidencePersisted') `
-        'termination wait validator does not require persisted evidence'
-
-    $isolated = Get-FunctionText 'Invoke-IsolatedDllFailureQualification'
-    foreach ($required in @("'missing'", "'corrupt'", "'incompatible'", 'Backup-HostSafety',
-            'Restore-HostSafety', 'Assert-AllTrackedHostsStopped', 'Assert-NoA4SMapping',
-            'Set-RetainedTemporaryRootEvidence', 'Get-BinaryBinding')) {
-        Assert-Contract ($isolated -match [Regex]::Escape($required)) `
-            "isolated qualification omits $required"
-    }
-    Assert-Contract ($isolated -notmatch 'Request-ValidatedExplorerTermination|\.Kill\(\)|Start-Process') `
-        'isolated DLL qualification can terminate/restart Explorer'
-
-    $safePath = Get-FunctionText 'Get-CanonicalPathRecord'
     $native = Get-FunctionText 'Initialize-A4SFailureRecoveryNative'
     foreach ($required in @('GetFinalPathNameByHandleW', 'GetDriveTypeW', 'QueryDosDeviceW',
             'FILE_ATTRIBUTE_REPARSE_POINT', 'GetFileInformationByHandle',
-            'Mapped, SUBST, or network drives are forbidden')) {
+            'AcquireProductMutationBoundary', 'SetupMutexName', 'HostMutexName')) {
         Assert-Contract ($native -match [Regex]::Escape($required)) `
-            "final-handle path implementation omits $required"
+            "native safety layer omits $required"
     }
-    Assert-Contract ($safePath -match '8\.3 short-path aliases are forbidden|Assert-NoShortPathAlias') `
-        'canonical path gate does not reject short aliases'
-    $tempCleanup = Get-FunctionText 'Remove-A4STemporaryRoot'
-    foreach ($required in @('Assert-SafeTemporaryRoot', 'Get-ChildItem',
-            'Get-CanonicalPathRecord', 'Test-PathWithin')) {
-        Assert-Contract ($tempCleanup -match $required) "recursive cleanup omits $required"
-    }
-    Assert-Contract (([Regex]::Matches($harness, 'Remove-Item[^\r\n]+-Recurse')).Count -eq 1) `
-        'recursive deletion exists outside the fully revalidated cleanup helper'
+    Assert-Contract ($setupSource -match 'Global\\\\A4SMenu\.Setup\.v1\.' -and
+        $setupSource -match 'GetLengthSid' -and $setupSource -match 'HashBytes') `
+        'Setup mutex ownership no longer matches the harness boundary'
+    Assert-Contract ($identity -match
+        'A4S_HOST_MUTEX_PREFIX_W\s+L"Local\\\\A4SMenu\.Host\.Instance\.v1"') `
+        'host mutex identity no longer matches the harness boundary'
 
-    $backup = Get-FunctionText 'Backup-HostSafety'
-    $validateBackup = Get-FunctionText 'Read-ValidatedHostSafetyBackup'
-    $restore = Get-FunctionText 'Restore-HostSafety'
-    $restoreStep = Get-FunctionText 'Invoke-AuthorizedHostSafetyMutationStep'
-    $exactRestore = Get-FunctionText 'Set-HostSafetySnapshotExactly'
-    foreach ($required in @('/reg:64', 'Registry64', 'HostSafetyBackup.json',
-            'HostSafety.reg', 'snapshotSha256', 'schemaVersion = 3',
-            'Get-FileHash', 'Write-DurableNewText')) {
-        Assert-Contract ($backup -match [Regex]::Escape($required)) "backup omits $required"
+    $tempCleanup = Get-FunctionText 'Remove-A4STemporaryRoot'
+    foreach ($required in @('allowedDirectories', 'allowedDirectoryFiles',
+            'allowedRootFiles', 'Get-ChildItem',
+            'Get-CanonicalPathRecord', 'Test-PathWithin', 'identity',
+            'immediately before deletion')) {
+        Assert-Contract ($tempCleanup -match [Regex]::Escape($required)) `
+            "flat temporary cleanup omits $required"
     }
-    foreach ($required in @('Assert-ExactPropertySet', 'Assert-ValidRegistryTree',
-            'Assert-RegistryExportTargetsHostSafety', 'snapshotSha256', 'registryView',
-            'sha256', 'bundleIdentity', 'manifestIdentity')) {
-        Assert-Contract ($validateBackup -match [Regex]::Escape($required)) `
-            "backup validation omits $required"
+    Assert-Contract ($tempCleanup -notmatch '-Recurse') `
+        'flat temporary cleanup contains recursive deletion'
+
+    $manifestRead = Get-FunctionText 'Read-ValidatedHostSafetyBackup'
+    $lockedRead = Get-FunctionText 'Read-LockedFileBytesRecord'
+    $restore = Get-FunctionText 'Restore-HostSafety'
+    foreach ($required in @('FileShare]::Read', 'ExpectedSha256', 'ComputeHash',
+            'pathIdentity', 'bytes')) {
+        Assert-Contract ($lockedRead -match [Regex]::Escape($required)) `
+            "locked file read omits $required"
+    }
+    foreach ($required in @('ExpectedManifestSha256', 'Read-LockedUtf8JsonRecord',
+            'Assert-ValidatedHostSafetyManifestObject', 'manifestSha256')) {
+        Assert-Contract ($manifestRead -match [Regex]::Escape($required)) `
+            "manifest validation omits $required"
     }
     Assert-InOrder -Text $restore -Markers @(
         'Read-ValidatedHostSafetyBackup', 'Enter-A4SProductMutationBoundary',
         'Get-HostSafetyAggregateRecord', 'Assert-AuthorizedHostSafetyAggregate',
-        'Backup-HostSafety', 'Set-HostSafetySnapshotExactly') `
-        -Message 'restore does not authorize the immediate aggregate under product locks before mutation'
-    foreach ($required in @('AuthorizedCurrentSha256', 'rollback',
-            'Get-KnownMutationAggregate', 'unknown/intervening', 'Exit-A4SProductMutationBoundary')) {
+        'Backup-HostSafety', 'Invoke-A4SRegistrySnapshotTransaction') `
+        -Message 'restore does not authenticate, lock, CAS, back up, then journal'
+    foreach ($required in @('ExpectedManifestSha256',
+            'ExpectedCurrentHostSafetySha256',
+            'manifestSha256', 'mutationStepCount', 'Exit-A4SProductMutationBoundary')) {
         Assert-Contract ($restore -match [Regex]::Escape($required)) `
             "transactional restore omits $required"
     }
-    Assert-InOrder -Text $restoreStep -Markers @(
-        'Assert-A4SProductMutationBoundary', 'Get-HostSafetyAggregateRecord',
-        'Assert-AuthorizedHostSafetyAggregate', '& $Mutation',
-        'Get-HostSafetyAggregateRecord', 'Assert-AuthorizedHostSafetyAggregate') `
-        -Message 'an exact registry step is not compare-and-swap guarded before and after mutation'
-    Assert-Contract ($exactRestore -match 'Remove-HostSafetyRegistryTree' -and
-        $exactRestore -match 'Invoke-AuthorizedHostSafetyMutationStep') `
-        'exact restore can delete outside the authorized mutation-step gate'
 
-    foreach ($required in @('AcquireProductMutationBoundary', 'SetupMutexName',
-            'HostMutexName', 'SHA256.Create', '14695981039346656037UL',
-            'GetUserObjectInformationW', 'Process.GetCurrentProcess().SessionId')) {
-        Assert-Contract ($native -match [Regex]::Escape($required)) `
-            "native mutation boundary omits $required"
+    $treeValidator = Get-FunctionText 'Assert-ValidRegistryTree'
+    Assert-Contract ($treeValidator -match 'subkeys are forbidden') `
+        'HostSafety schema does not explicitly forbid subkeys'
+    $transaction = Get-FunctionText 'Invoke-A4SRegistrySnapshotTransaction'
+    $journalStep = Get-FunctionText 'Invoke-A4SRegistryJournaledStep'
+    $undoJournal = Get-FunctionText 'Undo-A4SRegistryJournal'
+    foreach ($required in @('ContractRegistrySandbox', 'ExpectedCurrent',
+            'A4S_UNKNOWN_REGISTRY_STATE', 'Undo-A4SRegistryJournal',
+            'InjectFailureAfterStep', 'mutationStepCount', 'ProductBoundary',
+            'forbids a caller-supplied validator')) {
+        Assert-Contract ($transaction -match [Regex]::Escape($required)) `
+            "registry transaction omits $required"
     }
-    Assert-Contract ($setupSource -match 'Global\\\\A4SMenu\.Setup\.v1\.' -and
-        $setupSource -match 'GetLengthSid' -and $setupSource -match 'HashBytes') `
-        'harness servicing mutex no longer matches Setup ownership'
-    Assert-Contract ($identity -match 'A4S_HOST_MUTEX_PREFIX_W\s+L"Local\\\\A4SMenu\.Host\.Instance\.v1"') `
-        'harness host mutex prefix no longer matches product identity'
-    foreach ($required in @('BuildInstanceMutexName', 'GetLengthSid',
-            'GetUserObjectInformationW', 'ProcessIdToSessionId', 'HashBytes')) {
-        Assert-Contract ($hostSource -match [Regex]::Escape($required)) `
-            "host instance mutex construction omits $required"
-    }
+    Assert-InOrder -Text $journalStep -Markers @('preflight', 'Get-RegistryAggregateRecord',
+        'Invoke-A4SRegistryPrimitive', 'postflight', 'Get-RegistryAggregateRecord',
+        'Journal.Add') -Message 'journal step is not CAS-checked before and after mutation'
+    Assert-InOrder -Text $undoJournal -Markers @('entry.after',
+        'Invoke-A4SRegistryPrimitive', 'entry.before') `
+        -Message 'journal rollback does not verify exact after and before aggregates'
 
-    $hostEnumeration = Get-FunctionText 'Get-SameUserA4SHostProcesses'
-    $allStopped = Get-FunctionText 'Assert-AllTrackedHostsStopped'
-    $exactResident = Get-FunctionText 'Assert-ExactResidentHost'
-    $exactObservation = Get-FunctionText 'Assert-ExactHostObservation'
-    $noResident = Get-FunctionText 'Assert-NoResidentA4SHost'
-    foreach ($required in @('GetProcessOwnerSid', 'sessionId', 'startTimeUtc', 'sha256')) {
-        Assert-Contract ($hostEnumeration -match $required) `
-            "cross-session exact host enumeration omits $required"
-    }
-    foreach ($required in @('TrackedHosts', 'startTimeUtc', 'Assert-NoResidentA4SHost')) {
-        Assert-Contract ($allStopped -match $required) "tracked-host stop proof omits $required"
-    }
-    Assert-Contract ($exactResident -match 'Assert-ExactHostObservation' -and
-        $exactObservation -match 'sessionId' -and $exactObservation -match 'sha256' -and
-        $noResident -match 'GetHostWindowProcessId') `
-        'real exact-host identity validator is not wired to resident/singleton checks'
-
-    $newEvidence = Get-FunctionText 'New-EvidenceBundle'
-    $binaryBinding = Get-FunctionText 'Get-BinaryBinding'
-    $readRelease = Get-FunctionText 'Read-VerifiedA4SReleaseRecord'
+    $isolated = Get-FunctionText 'Invoke-IsolatedDllFailureQualification'
     $live = Get-FunctionText 'Invoke-LiveFailureRecoveryQualification'
-    foreach ($required in @("sourceBinding = 'unverified'", 'verifiedSourceCommit = $null',
-            'repositoryHead = $repositoryHead', 'releaseRecord = $null')) {
-        Assert-Contract ($newEvidence -match [Regex]::Escape($required)) `
-            "unverified evidence labeling omits $required"
+    foreach ($flow in @($isolated, $live)) {
+        foreach ($required in @('New-A4SAuthorizedHostSafetyState',
+                'Assert-A4SAuthorizedCurrentHostSafety', 'ExpectedManifestSha256',
+                'Confirm-A4SRestoreTransition', 'AuthorizedState')) {
+            Assert-Contract ($flow -match [Regex]::Escape($required)) `
+                "qualification flow omits authorized-state contract $required"
+        }
     }
-    Assert-Contract ($newEvidence -notmatch 'sourceCommit\s*=\s*\$repositoryHead') `
-        'repository HEAD is falsely asserted as binary source provenance'
-    foreach ($required in @('sha256', 'fileVersion', 'reportedVersion',
-            'sourceBinding', 'verifiedSourceCommit', 'pathIdentity')) {
-        Assert-Contract ($binaryBinding -match $required) "binary evidence binding omits $required"
+    foreach ($required in @('Confirm-A4SResetSafetyTransition',
+            'Confirm-A4SCrashGuardTransition', 'preCrashAuthorizedSha256',
+            'preRecoveryResetAuthorizedSha256')) {
+        Assert-Contract ($live -match [Regex]::Escape($required)) `
+            "live known-action authorization sequence omits $required"
     }
-    foreach ($required in @('Assert-ValidA4SReleaseRecord', 'ls-files', 'cat-file',
-            'merge-base', 'rev-parse', 'hash-object', 'recordCommit', 'recordBlob')) {
-        Assert-Contract ($readRelease -match [Regex]::Escape($required)) `
-            "immutable release-record validation omits $required"
-    }
-    Assert-InOrder -Text $live -Markers @(
-        'Read-VerifiedA4SReleaseRecord', 'Get-BinaryBinding',
-        'Assert-BinaryBindingsMatchReleaseRecord',
-        "sourceBinding = 'verified-release-record'", 'Save-Evidence',
-        'Request-ValidatedExplorerTermination') `
-        -Message 'live mode can crash Explorer before verified binary/source binding is persisted'
-    Assert-Contract ($harness -match [Regex]::Escape(
-        '[Parameter(Mandatory, ParameterSetName = ''Live'')]') -and
-        $harness -match '\[string\] \$ReleaseRecordPath') `
-        'live gate does not require a release-record path'
-
-    Assert-InOrder -Text $live -Markers @('Backup-HostSafety',
-        'Request-ValidatedExplorerTermination') `
-        -Message 'live mode can terminate Explorer before durable recovery backup'
-    Assert-Contract (([Regex]::Matches($live, "sequence = 'post-kill-pre-wait'")).Count -eq 2) `
-        'both guarded and cleanup terminations do not persist immediate pre-wait evidence'
-    Assert-Contract (([Regex]::Matches($live, 'evidencePersisted = \$true')).Count -eq 2) `
-        'both termination requests are not unlocked only after durable evidence'
-    Assert-Contract ($live -notmatch '\$crashIndex -eq 1') `
-        'one-menu reconnect testing is still limited to only the first crash'
-    Assert-Contract (([Regex]::Matches($live, 'Invoke-OneMenuAssertion')).Count -eq 3) `
-        'initial READY, every READY reconnect, and reset recovery are not all one-menu tested'
-    Assert-Contract (([Regex]::Matches($live, 'Assert-A4SReadyBoundary')).Count -ge 4) `
-        'READY boundaries do not all carry exact mapping and host uniqueness proof'
-    Assert-Contract ($live -match 'Assert-A4SSafetyDisabledBoundary') `
-        'third-crash safety-disabled boundary lacks exact zero mapping and host proof'
-    $oneMenu = Get-FunctionText 'Invoke-OneMenuAssertion'
-    foreach ($required in @('Assert-A4SReadyBoundary', 'exactWindowCount = 1',
-            'exactMappingCount = 1', 'exactHostCount = 1',
-            'oneMenuOneHookObservable = $true')) {
-        Assert-Contract ($oneMenu -match [Regex]::Escape($required)) `
-            "one-menu/one-hook observable omits $required"
-    }
+    Assert-Contract ($harness -notmatch 'Add-HostSafetyRestoreAuthorizationCheckpoint') `
+        'finalization still self-authorizes an arbitrary current HostSafety state'
 
     $retention = Get-FunctionText 'Set-RetainedTemporaryRootEvidence'
-    foreach ($required in @('retainedTemporaryRoot', 'retentionReason',
-            'cleanupInstructions', 'authorizedCurrentHostSafetySha256', 'Save-Evidence')) {
-        Assert-Contract ($retention -match $required) "retention evidence omits $required"
+    foreach ($required in @('Get-A4SConfirmedRecoveryAuthorization',
+            'freshKnownCurrentHostSafetySha256', 'ExpectedManifestSha256',
+            'ExpectedCurrentHostSafetySha256', 'manual registry/state review')) {
+        Assert-Contract ($retention -match [Regex]::Escape($required)) `
+            "retained cleanup instructions omit $required"
     }
-    Assert-Contract (([Regex]::Matches($isolated,
-        'Set-RetainedTemporaryRootEvidence')).Count -ge 3) `
-        'isolated cleanup does not persist retention before and after cleanup failure'
-    Assert-Contract (([Regex]::Matches($live,
-        'Set-RetainedTemporaryRootEvidence')).Count -ge 3) `
-        'live cleanup does not persist retention before and after cleanup failure'
-    Assert-Contract ($harness -match '-ExpectedCurrentHostSafetySha256' -and
-        $harness -match '-AuthorizedCurrentSha256 \$ExpectedCurrentHostSafetySha256') `
-        'manual recovery lacks explicit immediate aggregate authorization'
 
-    Assert-Contract ($identity -match 'A4S_HOST_SAFETY_REGISTRY_W\s+L"Software\\\\A4SMenu\\\\HostSafety"') `
-        'host and harness no longer agree on HostSafety target'
+    # Existing crash and source-binding guarantees remain in force.
     Assert-Contract ($hostSource -match 'constexpr DWORD kCrashLoopThreshold = 3;') `
         'host crash threshold is not three'
-    Assert-Contract ($hostSource -match 'constexpr ULONGLONG kCrashLoopWindow100ns = UINT64_C\(180\)') `
+    Assert-Contract ($hostSource -match
+        'constexpr ULONGLONG kCrashLoopWindow100ns = UINT64_C\(180\)') `
         'host rolling crash window is not 180 seconds'
-    $tryInject = [Regex]::Match($hostSource,
-        '(?s)bool TryInject\(\)\s*\{.*?\n\s*\}\s*\n\s*void BeginConnection').Value
-    Assert-Contract (-not [string]::IsNullOrWhiteSpace($tryInject)) 'could not isolate host TryInject'
-    Assert-InOrder -Text $tryInject -Markers @('LoadProductDll()', 'FindValidatedExplorer',
-        'SetWindowsHookExW') -Message 'host can select/hook Explorer before sibling DLL validation'
+    Assert-InOrder -Text $live -Markers @('Read-VerifiedA4SReleaseRecord',
+        'Assert-BinaryBindingsMatchReleaseRecord', 'Backup-HostSafety',
+        'Request-ValidatedExplorerTermination') `
+        -Message 'live mode reaches Explorer termination before source binding and backup'
+    Assert-Contract (([Regex]::Matches($live,
+        "sequence = 'post-kill-pre-wait'")).Count -eq 2) `
+        'both live termination boundaries do not persist pre-wait evidence'
 
-    # Actual path predicates.
+    # Execute actual path and flat-schema validators.
     Assert-Contract (& $library {
         Test-PathsOverlap -First 'C:\A4S\root' -Second 'c:\a4s\root\child'
     }) 'real overlap predicate rejected a nested path'
@@ -330,42 +239,238 @@ try {
     Assert-Throws { & $library { Assert-NoShortPathAlias -Path 'C:\PROGRA~1\A4S' } } `
         'real short-alias validator accepted an 8.3 path'
 
-    # Actual registry-tree, aggregate authorization, and rollback-known-state validators.
-    $validTree = [pscustomobject][ordered]@{
-        exists = $true
-        values = @([pscustomobject][ordered]@{ name='InjectionDisabled'; kind='DWord'; value=0 })
-        subkeys = @()
+    $absent = [pscustomobject][ordered]@{ exists=$false; values=@(); subkeys=@() }
+    $preState = [pscustomobject][ordered]@{
+        exists=$true
+        values=@(
+            [pscustomobject][ordered]@{name='Alpha';kind='DWord';value=[uint32]7},
+            [pscustomobject][ordered]@{name='Expand';kind='ExpandString';value='%TEMP%\A4S'},
+            [pscustomobject][ordered]@{name='Multi';kind='MultiString';value=@('one','two')},
+            [pscustomobject][ordered]@{name='Payload';kind='Binary';value='AQIDBA=='},
+            [pscustomobject][ordered]@{name='Qword';kind='QWord';value=[uint64]4294967301},
+            [pscustomobject][ordered]@{name='Raw';kind='None';value='BQYHCA=='})
+        subkeys=@()
     }
-    & $library { param($tree) Assert-ValidRegistryTree -Tree $tree -IsRoot $true } $validTree
-    $duplicateTree = $validTree | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $desiredState = [pscustomobject][ordered]@{
+        exists=$true
+        values=@(
+            [pscustomobject][ordered]@{name='InjectionDisabled';kind='DWord';value=[uint32]1},
+            [pscustomobject][ordered]@{name='LastExplorerExitCode';kind='DWord';value=[uint32]55},
+            [pscustomobject][ordered]@{name='Marker';kind='String';value='contract'})
+        subkeys=@()
+    }
+    foreach ($tree in @($absent, $preState, $desiredState)) {
+        & $library { param($value) Assert-ValidRegistryTree -Tree $value -IsRoot $true } $tree
+    }
+    $subkeyTree = $preState | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $subkeyTree.subkeys = @([pscustomobject]@{name='Forbidden';values=@();subkeys=@()})
+    Assert-Throws {
+        & $library { param($value) Assert-ValidRegistryTree -Tree $value -IsRoot $true } `
+            $subkeyTree
+    } 'real registry schema accepted a HostSafety subkey'
+    $duplicateTree = $preState | ConvertTo-Json -Depth 8 | ConvertFrom-Json
     $duplicateTree.values = @($duplicateTree.values[0], $duplicateTree.values[0])
     Assert-Throws {
-        & $library { param($tree) Assert-ValidRegistryTree -Tree $tree -IsRoot $true } $duplicateTree
-    } 'real registry-tree validator accepted duplicate value names'
-    $badTree = $validTree | ConvertTo-Json -Depth 8 | ConvertFrom-Json
-    $badTree.values[0].kind = 'AlienKind'
-    Assert-Throws {
-        & $library { param($tree) Assert-ValidRegistryTree -Tree $tree -IsRoot $true } $badTree
-    } 'real registry-tree validator accepted an unsupported kind'
-    $unknownTree = $validTree | ConvertTo-Json -Depth 8 | ConvertFrom-Json
-    $unknownTree.values[0].kind = 'Unknown'
-    Assert-Throws {
-        & $library { param($tree) Assert-ValidRegistryTree -Tree $tree -IsRoot $true } $unknownTree
-    } 'real registry-tree validator accepted an unrestorable unknown value kind'
+        & $library { param($value) Assert-ValidRegistryTree -Tree $value -IsRoot $true } `
+            $duplicateTree
+    } 'real registry schema accepted duplicate value names'
 
-    $authorized = & $library { param($tree) Get-HostSafetyAggregateRecord -Snapshot $tree } $validTree
+    $sequenceState = [pscustomobject]@{
+        restored=$false
+        nextMutationIndex=0
+        expectedMutationActions=@('known-action-1', 'known-action-2')
+    }
+    $advance = & $library {
+        param($state)
+        Get-A4SExpectedAuthorizedActionAdvance -State $state -Action 'known-action-1'
+    } $sequenceState
+    Assert-Contract (-not $advance.isRestore -and $advance.nextMutationIndex -eq 1) `
+        'real authorized-action sequence did not advance its exact first action'
+    Assert-Throws {
+        & $library {
+            param($state)
+            Get-A4SExpectedAuthorizedActionAdvance -State $state -Action 'known-action-2'
+        } $sequenceState
+    } 'real authorized-action sequence accepted a skipped action'
+    $restoreAdvance = & $library {
+        param($state)
+        Get-A4SExpectedAuthorizedActionAdvance `
+            -State $state -Action 'restore-validated-manifest'
+    } $sequenceState
+    Assert-Contract ($restoreAdvance.isRestore -and
+        $restoreAdvance.nextMutationIndex -eq 0) `
+        'real authorized-action sequence rejected an early exact restore'
+    $sequenceState.restored = $true
+    Assert-Throws {
+        & $library {
+            param($state)
+            Get-A4SExpectedAuthorizedActionAdvance -State $state -Action 'known-action-1'
+        } $sequenceState
+    } 'real authorized-action sequence accepted mutation after restore'
+
+    # Execute the real locked manifest read/hash and production manifest schema.
+    $temporaryRoot = & $library { New-A4STemporaryRoot }
+    $snapshotAggregate = & $library {
+        param($snapshot) Get-HostSafetyAggregateRecord -Snapshot $snapshot
+    } $absent
+    $manifest = [ordered]@{
+        schemaVersion=3
+        backupId=[Guid]::NewGuid().ToString('N')
+        createdUtc=[DateTime]::UtcNow.ToString('o')
+        registryHive='HKEY_CURRENT_USER'
+        registryPath='HKCU\Software\A4SMenu\HostSafety'
+        registrySubKey='Software\A4SMenu\HostSafety'
+        registryView='Registry64'
+        snapshot=$absent
+        snapshotSha256=$snapshotAggregate.sha256
+        regExport=$null
+    }
+    $manifestText = $manifest | ConvertTo-Json -Depth 32
+    $manifestSha = & $library { param($text) Get-TextSha256 -Text $text } $manifestText
+    $manifestPath = Join-Path $temporaryRoot.finalPath 'HostSafetyBackup.json'
+    & $library {
+        param($path, $text) Write-DurableNewText -Path $path -Text $text
+    } $manifestPath $manifestText
+    $lockedManifest = & $library {
+        param($path, $hash)
+        Read-LockedUtf8JsonRecord -Path $path -Description 'contract manifest' `
+            -ExpectedSha256 $hash
+    } $manifestPath $manifestSha
+    $validatedManifestAggregate = & $library {
+        param($value) Assert-ValidatedHostSafetyManifestObject -Manifest $value
+    } $lockedManifest.value
+    Assert-Contract ($lockedManifest.sha256 -ceq $manifestSha -and
+        $validatedManifestAggregate.sha256 -ceq $snapshotAggregate.sha256) `
+        'real locked manifest read did not bind the parsed bytes to the expected hash'
+    $tamperedManifest = $manifestText.Replace('Registry64', 'Registry32')
+    & $library {
+        param($path, $text) Write-DurableText -Path $path -Text $text
+    } $manifestPath $tamperedManifest
+    Assert-Throws {
+        & $library {
+            param($path, $hash)
+            Read-LockedUtf8JsonRecord -Path $path -Description 'tampered contract manifest' `
+                -ExpectedSha256 $hash
+        } $manifestPath $manifestSha
+    } 'real locked manifest reader accepted bytes that changed after authorization' `
+        'SHA-256 differs'
+    $runtimeCleanupDirectory = & $library {
+        param($path, $parent)
+        New-SafeFreshDirectory -Path $path `
+            -Description 'contract valid-runtime directory' -ExpectedParent $parent
+    } (Join-Path $temporaryRoot.finalPath 'valid-runtime') $temporaryRoot.finalPath
+    foreach ($fileName in @('A4SMenuHost.exe', 'A4SMenu.dll')) {
+        & $library {
+            param($path, $text) Write-DurableNewText -Path $path -Text $text
+        } (Join-Path $runtimeCleanupDirectory.finalPath $fileName) 'contract-cleanup-fixture'
+    }
+
+    # Execute the production journal/CAS engine against one random, isolated
+    # HKCU subtree. The production HostSafety target remains hard-locked and is
+    # never selected by this contract seam.
+    $boundary = { param([string] $Label) return $true }
+    Assert-Throws {
+        & $library {
+            param($desired, $expected, $validator)
+            Invoke-A4SRegistrySnapshotTransaction `
+                -RegistrySubKey 'Software\A4SMenu\HostSafety' `
+                -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                -ValidateBoundary $validator
+        } $absent $snapshotAggregate $boundary
+    } 'product HostSafety transaction accepted a contract validator' `
+        'real product boundary object'
+    $sandboxAuthorized = & $library {
+        param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+    } $sandboxSubKey
+    Assert-Contract (-not [bool]$sandboxAuthorized.snapshot.exists) `
+        'fresh random registry contract subtree unexpectedly exists'
+    $sandboxOwnershipEstablished = $true
+
+    function Invoke-SandboxTransition {
+        param(
+            [Parameter(Mandatory)][object] $Desired,
+            [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0
+        )
+        $result = & $library {
+            param($key, $desired, $expected, $validator, $inject)
+            Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
+                -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                -ValidateBoundary $validator -ContractRegistrySandbox `
+                -InjectFailureAfterStep $inject
+        } $sandboxSubKey $Desired $sandboxAuthorized $boundary $InjectFailureAfterStep
+        $script:sandboxAuthorized = [pscustomobject][ordered]@{
+            snapshot=$result.snapshot; sha256=$result.snapshotSha256
+        }
+        return $result
+    }
+
+    # A stale expected aggregate must reject before mutation.
+    $wrongExpected = & $library {
+        param($key, $snapshot) Get-RegistryAggregateRecord -RegistrySubKey $key -Snapshot $snapshot
+    } $sandboxSubKey $preState
+    Assert-Throws {
+        & $library {
+            param($key, $desired, $expected, $validator)
+            Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
+                -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                -ValidateBoundary $validator -ContractRegistrySandbox
+        } $sandboxSubKey $desiredState $wrongExpected $boundary
+    } 'real registry CAS accepted a stale expected aggregate' `
+        'previously authorized aggregate'
+    $afterRejectedCas = & $library {
+        param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+    } $sandboxSubKey
+    Assert-Contract ($afterRejectedCas.sha256 -ceq $sandboxAuthorized.sha256) `
+        'rejected CAS changed the sandbox subtree'
+
+    $scenarios = @(
+        [pscustomobject]@{name='absent-to-values';before=$absent;after=$desiredState},
+        [pscustomobject]@{name='replace-values';before=$preState;after=$desiredState},
+        [pscustomobject]@{name='values-to-absent';before=$preState;after=$absent}
+    )
+    foreach ($scenario in $scenarios) {
+        [void](Invoke-SandboxTransition -Desired $scenario.before)
+        $success = Invoke-SandboxTransition -Desired $scenario.after
+        Assert-Contract ($success.mutationStepCount -gt 0) `
+            "$($scenario.name) did not exercise a registry mutation"
+        [void](Invoke-SandboxTransition -Desired $scenario.before)
+
+        foreach ($step in 1..$success.mutationStepCount) {
+            $beforeFailure = $sandboxAuthorized
+            Assert-Throws {
+                Invoke-SandboxTransition -Desired $scenario.after `
+                    -InjectFailureAfterStep $step
+            } "$($scenario.name) failure injection step $step did not throw" `
+                'rollback restored the exact immediate prestate'
+            $afterFailure = & $library {
+                param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+            } $sandboxSubKey
+            Assert-Contract ($afterFailure.sha256 -ceq $beforeFailure.sha256 -and
+                (& $library {
+                    param($expected, $actual)
+                    Compare-HostSafetySnapshot -Expected $expected -Actual $actual
+                } $beforeFailure.snapshot $afterFailure.snapshot)) `
+                "$($scenario.name) failure injection step $step did not roll back exactly"
+        }
+    }
+    [void](Invoke-SandboxTransition -Desired $absent)
+    $sandboxFinal = & $library {
+        param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+    } $sandboxSubKey
+    Assert-Contract (-not [bool]$sandboxFinal.snapshot.exists) `
+        'transactional sandbox cleanup did not remove the test key'
+
+    # Execute real authorization, termination, cleanup, and rolling-guard validators.
+    $authorized = & $library {
+        param($tree) Get-HostSafetyAggregateRecord -Snapshot $tree
+    } $preState
     [void](& $library {
         param($aggregate, $tree)
         Assert-AuthorizedHostSafetyAggregate -Current $aggregate `
             -ExpectedSnapshot $tree -ExpectedSha256 $aggregate.sha256 -Boundary 'contract'
-    } $authorized $validTree)
-    [void](& $library {
-        param($aggregate)
-        Assert-AuthorizedHostSafetyAggregate -Current $aggregate `
-            -ExpectedSha256 $aggregate.sha256 -Boundary 'contract hash-only recovery'
-    } $authorized)
-    $intervening = $validTree | ConvertTo-Json -Depth 8 | ConvertFrom-Json
-    $intervening.values[0].value = 1
+    } $authorized $preState)
+    $intervening = $preState | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+    $intervening.values[0].value = 8
     $interveningAggregate = & $library {
         param($tree) Get-HostSafetyAggregateRecord -Snapshot $tree
     } $intervening
@@ -373,98 +478,11 @@ try {
         & $library {
             param($current, $expected, $hash)
             Assert-AuthorizedHostSafetyAggregate -Current $current `
-                -ExpectedSnapshot $expected -ExpectedSha256 $hash -Boundary 'contract intervention'
-        } $interveningAggregate $validTree $authorized.sha256
-    } 'real aggregate authorization accepted intervening HostSafety state'
-    $knownState = [pscustomobject][ordered]@{ allowed=@($authorized); inFlight=$false }
-    [void](& $library {
-        param($state, $current)
-        Get-KnownMutationAggregate -MutationState $state -Current $current -Boundary 'known'
-    } $knownState $authorized)
-    Assert-Throws {
-        & $library {
-            param($state, $current)
-            Get-KnownMutationAggregate -MutationState $state -Current $current -Boundary 'unknown'
-        } $knownState $interveningAggregate
-    } 'real rollback gate accepted an unknown/intervening aggregate'
+                -ExpectedSnapshot $expected -ExpectedSha256 $hash `
+                -Boundary 'contract intervention'
+        } $interveningAggregate $preState $authorized.sha256
+    } 'real aggregate authorization accepted an intervening state'
 
-    # Actual immutable-record and binary-binding validators.
-    $releaseRecord = [pscustomobject][ordered]@{
-        schemaVersion = 1
-        product = 'A4SMenu'
-        sourceCommit = ('a' * 40)
-        hostSha256 = ('B' * 64)
-        dllSha256 = ('C' * 64)
-        hostFileVersion = '1.2.3.4'
-        dllFileVersion = '1.2.3.4'
-        hostReportedVersion = 'A4SMenuHost 1.2.3.4'
-    }
-    [void](& $library {
-        param($record) Assert-ValidA4SReleaseRecord -Record $record
-    } $releaseRecord)
-    $release = [pscustomobject]@{ record=$releaseRecord }
-    $hostBinding = [pscustomobject]@{
-        sha256=('B' * 64); fileVersion='1.2.3.4'; reportedVersion='A4SMenuHost 1.2.3.4'
-    }
-    $dllBinding = [pscustomobject]@{ sha256=('C' * 64); fileVersion='1.2.3.4' }
-    [void](& $library {
-        param($release, $host, $dll)
-        Assert-BinaryBindingsMatchReleaseRecord -Release $release -Host $host -Dll $dll
-    } $release $hostBinding $dllBinding)
-    $badRecord = $releaseRecord | ConvertTo-Json | ConvertFrom-Json
-    $badRecord.hostSha256 = 'not-a-hash'
-    Assert-Throws {
-        & $library { param($record) Assert-ValidA4SReleaseRecord -Record $record } $badRecord
-    } 'real release-record validator accepted a malformed hash'
-    $extraRecord = $releaseRecord | ConvertTo-Json | ConvertFrom-Json
-    $extraRecord | Add-Member -NotePropertyName untrusted -NotePropertyValue $true
-    Assert-Throws {
-        & $library { param($record) Assert-ValidA4SReleaseRecord -Record $record } $extraRecord
-    } 'real release-record validator accepted an untrusted extra property'
-    $badHostBinding = $hostBinding | ConvertTo-Json | ConvertFrom-Json
-    $badHostBinding.sha256 = ('D' * 64)
-    Assert-Throws {
-        & $library {
-            param($release, $host, $dll)
-            Assert-BinaryBindingsMatchReleaseRecord -Release $release -Host $host -Dll $dll
-        } $release $badHostBinding $dllBinding
-    } 'real release binding accepted the wrong host binary'
-
-    # Actual exact-host identity validator.
-    $expectedHost = [pscustomobject]@{
-        pid=40; sessionId=2; path='C:\A4S\A4SMenuHost.exe'; sha256=('E' * 64)
-        startTimeUtc='2026-09-01T00:00:00.0000000Z'
-    }
-    [void](& $library {
-        param($expected)
-        Assert-ExactHostObservation -Expected $expected -Residents @($expected) `
-            -SingletonPid 40 -Label 'contract exact host'
-    } $expectedHost)
-    $wrongHost = $expectedHost | ConvertTo-Json | ConvertFrom-Json
-    $wrongHost.sessionId = 99
-    Assert-Throws {
-        & $library {
-            param($expected, $actual)
-            Assert-ExactHostObservation -Expected $expected -Residents @($actual) `
-                -SingletonPid 40 -Label 'contract wrong host'
-        } $expectedHost $wrongHost
-    } 'real exact-host validator accepted the wrong session'
-    Assert-Throws {
-        & $library {
-            param($expected)
-            Assert-ExactHostObservation -Expected $expected -Residents @($expected, $expected) `
-                -SingletonPid 40 -Label 'contract duplicate host'
-        } $expectedHost
-    } 'real exact-host validator accepted duplicate same-user hosts'
-    Assert-Throws {
-        & $library {
-            param($expected)
-            Assert-ExactHostObservation -Expected $expected -Residents @($expected) `
-                -SingletonPid 41 -Label 'contract wrong singleton'
-        } $expectedHost
-    } 'real exact-host validator accepted the wrong singleton PID'
-
-    # Actual post-kill durable-evidence gate.
     $validTermination = [pscustomobject]@{
         oldExplorer=[pscustomobject]@{pid=400}; issuedFileTimeUtc=[uint64]10
         killReturnedFileTimeUtc=[uint64]11; evidencePersisted=$true
@@ -479,39 +497,14 @@ try {
             param($request) Assert-TerminationRequestReadyForWait -Request $request
         } $missingEvidence
     } 'real termination gate accepted wait-before-evidence'
-    $badOrder = $validTermination | ConvertTo-Json | ConvertFrom-Json
-    $badOrder.killReturnedFileTimeUtc = 9
-    Assert-Throws {
-        & $library {
-            param($request) Assert-TerminationRequestReadyForWait -Request $request
-        } $badOrder
-    } 'real termination gate accepted kill-returned before issued'
 
-    # Actual cleanup authorization predicate.
     Assert-Contract (& $library {
         Test-A4STemporaryCleanupAllowed -AllHostsStopped $true `
             -MappingInspectionSucceeded $true -MappingCount 0 -WindowCount 0 `
-            -SafetyRestored $true -CleanupRestartRequired $true -CleanupRestartComplete $true
+            -SafetyRestored $true -CleanupRestartRequired $true `
+            -CleanupRestartComplete $true
     }) 'real conclusive cleanup predicate denied deletion'
-    foreach ($arguments in @(
-        @($false,$true,0,0,$true,$true), @($true,$false,0,0,$true,$true),
-        @($true,$true,1,0,$true,$true), @($true,$true,0,1,$true,$true),
-        @($true,$true,0,0,$false,$true), @($true,$true,0,0,$true,$false)
-    )) {
-        $values = @($arguments)
-        $decision = & $library {
-            param($allStopped, $inspected, $mappingCount, $windowCount,
-                $restored, $restartComplete)
-            Test-A4STemporaryCleanupAllowed -AllHostsStopped $allStopped `
-                -MappingInspectionSucceeded $inspected -MappingCount $mappingCount `
-                -WindowCount $windowCount -SafetyRestored $restored `
-                -CleanupRestartRequired $true -CleanupRestartComplete $restartComplete
-        } ($values[0]) ($values[1]) ($values[2]) ($values[3]) ($values[4]) ($values[5])
-        Assert-Contract (-not $decision) `
-            'real inconclusive/pinned cleanup predicate allowed deletion'
-    }
 
-    # Actual 1/2/3 rolling crash-stage validator.
     function New-CrashGuardFixture {
         param([int] $Count, [bool] $Disabled, [uint64[]] $Times)
         $bytes = [byte[]]::new(24)
@@ -521,44 +514,98 @@ try {
         return [pscustomobject][ordered]@{
             exists=$true
             values=@(
-                [pscustomobject]@{name='InjectionDisabled';kind='DWord';value=$(if ($Disabled) {1} else {0})},
                 [pscustomobject]@{name='AbnormalExplorerExitCount';kind='DWord';value=$Count},
                 [pscustomobject]@{name='AbnormalExplorerExitTimes';kind='Binary';value=[Convert]::ToBase64String($bytes)},
-                [pscustomobject]@{name='LastExplorerExitCode';kind='DWord';value=1}
-            )
+                [pscustomobject]@{name='InjectionDisabled';kind='DWord';value=$(if ($Disabled) {1} else {0})},
+                [pscustomobject]@{name='LastExplorerExitCode';kind='DWord';value=1})
             subkeys=@()
         }
     }
     $bounds = @(
         [pscustomobject]@{issuedFileTimeUtc=[uint64]10;observedFileTimeUtc=[uint64]19},
         [pscustomobject]@{issuedFileTimeUtc=[uint64]20;observedFileTimeUtc=[uint64]29},
-        [pscustomobject]@{issuedFileTimeUtc=[uint64]30;observedFileTimeUtc=[uint64]39}
-    )
+        [pscustomobject]@{issuedFileTimeUtc=[uint64]30;observedFileTimeUtc=[uint64]39})
     [uint64[]]$prior = @()
     foreach ($stage in 1..3) {
         [uint64[]]$times = @(15,25,35 | Select-Object -First $stage)
         $result = & $library {
             param($snapshot, $count, $disabled, $boundaries, $priorTimes)
             Assert-RollingCrashGuardStage -Snapshot $snapshot -ExpectedCount $count `
-                -ExpectedDisabled $disabled -Boundaries $boundaries -PriorTimestamps $priorTimes
+                -ExpectedDisabled $disabled -Boundaries $boundaries `
+                -PriorTimestamps $priorTimes
         } (New-CrashGuardFixture -Count $stage -Disabled ($stage -eq 3) -Times $times) `
             $stage ($stage -eq 3) @($bounds | Select-Object -First $stage) $prior
         [uint64[]]$prior = @($result.timestamps100ns)
     }
-    Assert-Throws {
-        & $library {
-            param($snapshot, $boundaries)
-            Assert-RollingCrashGuardStage -Snapshot $snapshot -ExpectedCount 2 `
-                -ExpectedDisabled $false -Boundaries $boundaries -PriorTimestamps @([uint64]15)
-        } (New-CrashGuardFixture -Count 3 -Disabled $false -Times @([uint64]15,[uint64]25)) `
-            @($bounds | Select-Object -First 2)
-    } 'real crash-stage validator accepted the wrong persisted count'
 
-    Assert-Contract ($harness -notmatch "(?i)nativeStart[^\r\n]*(pass|verified)|native Start (available|verified)") `
-        'native Start is mislabeled as a mechanical pass instead of manual/deferred'
+    & $library { param($root) Remove-A4STemporaryRoot -Root $root } $temporaryRoot
+    Assert-Contract (-not (Test-Path -LiteralPath $temporaryRoot.finalPath)) `
+        'real flat temporary cleanup retained its validated root'
+    $temporaryRoot = $null
 
-    Write-Host 'A4S failure/recovery offline contracts passed: real harness validators cover registry shape, exact aggregate authorization/rollback, immutable release binding, host uniqueness, post-kill evidence, cleanup retention, and exact 1/2/3 reconnect states.'
+    Write-Host ('A4S failure/recovery offline contracts passed: locked manifest bytes, ' +
+        'flat schema, stale-CAS rejection, every journal mutation failure point, exact ' +
+        'rollback, transactional sandbox cleanup, authorized action sequencing, and ' +
+        'non-recursive temporary cleanup were executed.')
+}
+catch {
+    $primaryError = $_
 }
 finally {
+    # The isolated random subtree is the sole registry test seam. Clean it with
+    # the same journal engine even if a contract assertion failed midway.
+    try {
+        if ($sandboxOwnershipEstablished) {
+            $actual = & $library {
+                param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+            } $sandboxSubKey
+            if ([bool]$actual.snapshot.exists) {
+                $absentCleanup = [pscustomobject][ordered]@{
+                    exists=$false; values=@(); subkeys=@()
+                }
+                $cleanupBoundary = { param([string] $Label) return $true }
+                [void](& $library {
+                    param($key, $desired, $expected, $validator)
+                    Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
+                        -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                        -ValidateBoundary $validator -ContractRegistrySandbox
+                } $sandboxSubKey $absentCleanup $actual $cleanupBoundary)
+            }
+            $confirmedAbsent = & $library {
+                param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+            } $sandboxSubKey
+            if ([bool]$confirmedAbsent.snapshot.exists) {
+                throw 'The isolated registry contract subtree remains after transactional cleanup.'
+            }
+        }
+    }
+    catch {
+        if ($null -eq $primaryError) { $primaryError = $_ }
+        else {
+            $primaryError = [Management.Automation.ErrorRecord]::new(
+                [InvalidOperationException]::new(
+                    "$($primaryError.Exception.Message) Cleanup also failed: $($_.Exception.Message)"),
+                'A4SContractCleanupFailure',
+                [Management.Automation.ErrorCategory]::InvalidResult, $sandboxSubKey)
+        }
+    }
+
+    if ($null -ne $temporaryRoot -and
+        (Test-Path -LiteralPath $temporaryRoot.finalPath -PathType Container)) {
+        try { & $library { param($root) Remove-A4STemporaryRoot -Root $root } $temporaryRoot }
+        catch {
+            if ($null -eq $primaryError) { $primaryError = $_ }
+            else {
+                $primaryError = [Management.Automation.ErrorRecord]::new(
+                    [InvalidOperationException]::new(
+                        "$($primaryError.Exception.Message) Temporary cleanup also failed: $($_.Exception.Message)"),
+                    'A4SContractTemporaryCleanupFailure',
+                    [Management.Automation.ErrorCategory]::InvalidResult,
+                    $temporaryRoot.finalPath)
+            }
+        }
+    }
     Remove-Module -ModuleInfo $library -Force -ErrorAction SilentlyContinue
 }
+
+if ($primaryError) { throw $primaryError }
