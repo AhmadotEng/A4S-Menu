@@ -14,6 +14,7 @@
 #include "LogManager.h"
 #include "StartMenuDLL.h"
 #include "A4SPerformance.h"
+#include "A4SCacheState.h"
 #include "resource.h"
 #include <propkey.h>
 #include <CommonControls.h>
@@ -531,8 +532,11 @@ CItemManager::CItemManager( void )
 	m_FolderContentGeneration=1;
 	m_IconCacheEpoch=1;
 	m_A4SFolderWatchReady=0;
+	m_A4SRequiredWatchMask=A4SCacheState::RequiredFolderWatchMask(false,false,false);
+	m_A4SArmedWatchMask=0;
 	m_A4SItemReadyEvent=NULL;
 	m_A4SFolderWatchReadyEvent=NULL;
+	m_A4SWatchRebuildEvent=NULL;
 #endif
 	m_LastCacheSave=0;
 	m_TransientHash=1;
@@ -650,13 +654,16 @@ bool CItemManager::Init( void )
 	m_DoneEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 #ifdef A4S_PRODUCT
 	InterlockedExchange(&m_A4SFolderWatchReady,0);
+	InterlockedExchange(&m_A4SArmedWatchMask,0);
 	m_A4SItemReadyEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
 	m_A4SFolderWatchReadyEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
+	m_A4SWatchRebuildEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
 #endif
 
 #ifdef A4S_PRODUCT
 	if (!m_StartEvent || !m_WorkEvent || !m_ExitEvent || !m_DoneEvent ||
-		!m_A4SItemReadyEvent || !m_A4SFolderWatchReadyEvent)
+		!m_A4SItemReadyEvent || !m_A4SFolderWatchReadyEvent ||
+		!m_A4SWatchRebuildEvent)
 	{
 		Close();
 		return false;
@@ -747,8 +754,10 @@ bool CItemManager::Close( void )
 #ifdef A4S_PRODUCT
 	if (m_A4SItemReadyEvent) CloseHandle(m_A4SItemReadyEvent);
 	if (m_A4SFolderWatchReadyEvent) CloseHandle(m_A4SFolderWatchReadyEvent);
+	if (m_A4SWatchRebuildEvent) CloseHandle(m_A4SWatchRebuildEvent);
 	m_A4SItemReadyEvent=NULL;
 	m_A4SFolderWatchReadyEvent=NULL;
+	m_A4SWatchRebuildEvent=NULL;
 #endif
 	m_LoadIconData[0].Close();
 	m_bInitialized=false;
@@ -2455,10 +2464,33 @@ ULONGLONG CItemManager::GetIconCacheEpoch( void ) const
 		const_cast<volatile LONGLONG*>(&m_IconCacheEpoch),0,0));
 }
 
+void CItemManager::ConfigureA4SFolderWatches( bool bNoCommonFolders,
+	bool bClassicPinnedRoot, bool bMetroAppsSurface )
+{
+	const LONG requiredMask=static_cast<LONG>(
+		A4SCacheState::RequiredFolderWatchMask(bNoCommonFolders,
+			bClassicPinnedRoot,bMetroAppsSurface));
+	const LONG previous=InterlockedExchange(&m_A4SRequiredWatchMask,requiredMask);
+	if (previous!=requiredMask)
+	{
+		RevokeA4SFolderWatchBaseline();
+		if (m_A4SWatchRebuildEvent)
+			SetEvent(m_A4SWatchRebuildEvent);
+	}
+}
+
 bool CItemManager::IsFolderWatchBaselineReady( void ) const
 {
-	return InterlockedCompareExchange(
-		const_cast<volatile LONG*>(&m_A4SFolderWatchReady),0,0)!=0;
+	if (InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_A4SFolderWatchReady),0,0)==0)
+		return false;
+	const DWORD requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_A4SRequiredWatchMask),0,0));
+	const DWORD armedMask=static_cast<DWORD>(InterlockedCompareExchange(
+		const_cast<volatile LONG*>(&m_A4SArmedWatchMask),0,0));
+	return A4SCacheState::RequiredFolderWatchesReady(requiredMask,armedMask,
+		true,true,false) && InterlockedCompareExchange(
+			const_cast<volatile LONG*>(&m_A4SFolderWatchReady),0,0)!=0;
 }
 
 bool CItemManager::WaitForFolderWatchBaseline( DWORD timeout ) const
@@ -2468,7 +2500,8 @@ bool CItemManager::WaitForFolderWatchBaseline( DWORD timeout ) const
 	if (!m_A4SFolderWatchReadyEvent || !m_ExitEvent)
 		return false;
 	HANDLE handles[2]={m_A4SFolderWatchReadyEvent,m_ExitEvent};
-	return WaitForMultipleObjects(_countof(handles),handles,FALSE,timeout)==WAIT_OBJECT_0;
+	const DWORD wait=WaitForMultipleObjects(_countof(handles),handles,FALSE,timeout);
+	return wait==WAIT_OBJECT_0 && IsFolderWatchBaselineReady();
 }
 
 void CItemManager::AdvanceFolderContentGeneration( void )
@@ -2479,7 +2512,8 @@ void CItemManager::AdvanceFolderContentGeneration( void )
 		// Zero is reserved for an uninitialized snapshot. Advance monotonically
 		// for the practical lifetime of Explorer and skip zero on counter wrap.
 		const ULONGLONG value=static_cast<ULONGLONG>(current);
-		const LONGLONG next=static_cast<LONGLONG>(value==~0ULL?1:value+1);
+		const LONGLONG next=static_cast<LONGLONG>(
+			A4SCacheState::NextNonzeroEpoch(value));
 		const LONGLONG observed=InterlockedCompareExchange64(&m_FolderContentGeneration,next,current);
 		if (observed==current)
 			return;
@@ -2493,12 +2527,24 @@ void CItemManager::AdvanceIconCacheEpoch( void )
 	while (1)
 	{
 		const ULONGLONG value=static_cast<ULONGLONG>(current);
-		const LONGLONG next=static_cast<LONGLONG>(value==~0ULL?1:value+1);
+		const LONGLONG next=static_cast<LONGLONG>(
+			A4SCacheState::NextNonzeroEpoch(value));
 		const LONGLONG observed=InterlockedCompareExchange64(&m_IconCacheEpoch,next,current);
 		if (observed==current)
 			return;
 		current=observed;
 	}
+}
+
+void CItemManager::RevokeA4SFolderWatchBaseline( void )
+{
+	InterlockedExchange(&m_A4SFolderWatchReady,0);
+	InterlockedExchange(&m_A4SArmedWatchMask,0);
+	if (m_A4SFolderWatchReadyEvent)
+		ResetEvent(m_A4SFolderWatchReadyEvent);
+	// Generation changes before callers can observe readiness again. Any cache
+	// that raced the old ready state therefore fails its final epoch check.
+	AdvanceFolderContentGeneration();
 }
 #endif
 
@@ -3230,11 +3276,6 @@ static struct
 };
 
 const int NUM_WATCHED_DIRS=7;
-#ifdef A4S_PRODUCT
-// Recursive notifications for both Start Menu roots, the classic pinned root,
-// and the packaged-app link root can change rows in the A4S popup.
-const DWORD A4S_MENU_CONTENT_DIR_MASK=(1U<<0)|(1U<<1)|(1U<<5)|(1U<<6);
-#endif
 
 void CItemManager::PreloadItemsThread( void )
 {
@@ -3242,38 +3283,385 @@ void CItemManager::PreloadItemsThread( void )
 	// Injection must become ready before background shell enumeration begins.
 	// A waitable delay keeps this dormant and immediately cancellable during
 	// unload; it also keeps cold Explorer startup I/O out of the hook path.
-	if (WaitForSingleObject(m_ExitEvent,2000)==WAIT_OBJECT_0)
+	const DWORD initialWait=WaitForSingleObject(m_ExitEvent,2000);
+	if (initialWait==WAIT_OBJECT_0 || initialWait==WAIT_FAILED)
 	{
 		SetEvent(m_DoneEvent);
+		if (initialWait==WAIT_FAILED)
+			RevokeA4SFolderWatchBaseline();
 		return;
 	}
-#endif
+
+	const DWORD WATCH_RETRY_MIN_MS=250;
+	const DWORD WATCH_RETRY_MAX_MS=30000;
+	const int WATCH_DRAIN_LIMIT=64;
+	HANDLE watchHandles[NUM_WATCHED_DIRS]={};
+	DWORD watchMasks[NUM_WATCHED_DIRS]={};
+	int watchCount=0;
+	DWORD armedMask=0;
+	DWORD setupRequiredMask=0;
+	DWORD dirMask=0xFFFFFFFF;
+	DWORD retryDelay=WATCH_RETRY_MIN_MS;
+	bool bBuildWatches=true;
+	bool bEstablishingBaseline=true;
+	bool bInitialPreload=true;
+	UINT64 preloadOperation=BeginA4SPerformanceOperation(A4S_PERF_PRELOAD);
+	UINT32 preloadedFolders=0;
+
+	auto CloseWatches=[&]()
+	{
+		for (int i=0;i<watchCount;i++)
+			FindCloseChangeNotification(watchHandles[i]);
+		watchCount=0;
+		armedMask=0;
+		memset(watchHandles,0,sizeof(watchHandles));
+		memset(watchMasks,0,sizeof(watchMasks));
+	};
+
+		auto WaitForWatchRetry=[&](DWORD timeout)->bool
+		{
+			HANDLE retryHandles[2]={m_ExitEvent,m_A4SWatchRebuildEvent};
+			DWORD wait=WaitForMultipleObjects(_countof(retryHandles),retryHandles,
+				FALSE,timeout);
+			return wait==WAIT_TIMEOUT || wait==WAIT_OBJECT_0+1;
+		};
+
+	while (1)
+	{
+		if (m_LoadingStage!=LOAD_LOADING)
+			break;
+		if (bBuildWatches)
+		{
+			CloseWatches();
+			ResetEvent(m_A4SWatchRebuildEvent);
+			setupRequiredMask=static_cast<DWORD>(InterlockedCompareExchange(
+				&m_A4SRequiredWatchMask,0,0));
+		}
+
+		bool bLoadedAny=false;
+		for (int i=0;i<_countof(g_CacheFolders);i++)
+		{
+			if (m_LoadingStage!=LOAD_LOADING) break;
+			if (!(dirMask&(1<<i))) continue;
+			if (!bInitialPreload && bBuildWatches && i>=NUM_WATCHED_DIRS)
+				continue;
+			if (g_CacheFolders[i].folder==FOLDERID_Favorites && !m_bPreloadFavorites) continue;
+			CAbsolutePidl pidl;
+			CComPtr<IShellItem> pFolder;
+			if (g_CacheFolders[i].folder==FOLDERID_TaskbarPinned)
+			{
+				wchar_t path[_MAX_PATH]=TASKBAR_PINNED_ROOT;
+				DoEnvironmentSubst(path,_countof(path));
+				if (FAILED(SHParseDisplayName(path,NULL,&pidl,0,NULL)) || !pidl) continue;
+				if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pFolder)) || !pFolder) continue;
+			}
+			else if (g_CacheFolders[i].folder==FOLDERID_ClassicPinned)
+			{
+				if (GetSettingInt(L"PinnedPrograms")!=PINNED_PROGRAMS_PINNED) continue;
+				wchar_t path[_MAX_PATH];
+				Strcpy(path,_countof(path),GetSettingString(L"PinnedItemsPath"));
+				DoEnvironmentSubst(path,_countof(path));
+				if (FAILED(SHParseDisplayName(path,NULL,&pidl,0,NULL)) || !pidl) continue;
+				if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pFolder)) || !pFolder) continue;
+			}
+			else if (g_CacheFolders[i].folder==FOLDERID_MetroApps)
+			{
+				if (GetWinVersion()<WIN_VER_WIN8) continue;
+				wchar_t path[_MAX_PATH]=METRO_APP_ROOT;
+				DoEnvironmentSubst(path,_countof(path));
+				pidl.Attach(ILCreateFromPath(path));
+				if (!pidl) continue;
+			}
+			else
+			{
+				if (FAILED(ShGetKnownFolderIDList(g_CacheFolders[i].folder,&pidl)) || !pidl) continue;
+				if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pFolder)) || !pFolder) continue;
+			}
+
+			wchar_t path[_MAX_PATH]={};
+			if (i<NUM_WATCHED_DIRS && bBuildWatches &&
+				SHGetPathFromIDList(pidl,path) && path[0])
+			{
+				HANDLE watch=FindFirstChangeNotification(path,TRUE,
+					FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_DIR_NAME|
+					FILE_NOTIFY_CHANGE_LAST_WRITE);
+				if (watch!=INVALID_HANDLE_VALUE)
+				{
+					watchHandles[watchCount]=watch;
+					watchMasks[watchCount]=1U<<i;
+					armedMask|=1U<<i;
+					watchCount++;
+				}
+			}
+			const bool bShouldLoad=bInitialPreload || !bBuildWatches ||
+				((setupRequiredMask&(1U<<i))!=0);
+			if (!bShouldLoad)
+				continue;
+			int refreshFlags=g_CacheFolders[i].refreshFlags;
+			if (!m_bPreloadIcons)
+				refreshFlags&=CItemManager::INFO_DATA;
+			if (refreshFlags)
+			{
+				if (g_CacheFolders[i].folder!=FOLDERID_MetroApps)
+				{
+					if (g_CacheFolders[i].location==CItemManager::LOCATION_DESKTOP)
+					{
+						int compat=GetSettingInt(L"CompatibilityFixes");
+						if (compat&COMPATIBILITY_SKIP_DESKTOP)
+							continue;
+					}
+					LoadFolderItems(pFolder,refreshFlags,g_CacheFolders[i].levels,g_CacheFolders[i].location);
+				}
+				else
+					LoadMetroItems(refreshFlags);
+			}
+			bLoadedAny=true;
+			preloadedFolders++;
+		}
+
+		if (bInitialPreload)
+		{
+			SetEvent(m_DoneEvent);
+			if (preloadOperation)
+			{
+				EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
+				preloadOperation=0;
+			}
+			bInitialPreload=false;
+		}
+		if (bLoadedAny)
+		{
+			// Persist refreshed metadata from the idle worker, never from menu close.
+			// SaveCacheFile supplies the existing five-minute debounce and atomic
+			// DataCache.tmp replacement.
+			SaveCacheFile();
+		}
+
+		if (bEstablishingBaseline)
+		{
+			const DWORD currentRequiredMask=static_cast<DWORD>(
+				InterlockedCompareExchange(&m_A4SRequiredWatchMask,0,0));
+			const bool bRequirementsStable=currentRequiredMask==setupRequiredMask;
+			bool bWaitApiHealthy=true;
+			bool bRearmApiHealthy=true;
+			bool bDrainComplete=true;
+			DWORD pendingMask=0;
+			int drainCount=0;
+			while (bRequirementsStable && bWaitApiHealthy &&
+				bRearmApiHealthy && drainCount<WATCH_DRAIN_LIMIT)
+			{
+				DWORD wait=WaitForMultipleObjects(watchCount,watchHandles,FALSE,0);
+				if (wait==WAIT_TIMEOUT)
+					break;
+				if (wait==WAIT_FAILED || wait<WAIT_OBJECT_0 ||
+					wait>=WAIT_OBJECT_0+static_cast<DWORD>(watchCount))
+				{
+					bWaitApiHealthy=false;
+					break;
+				}
+				const int watch=static_cast<int>(wait-WAIT_OBJECT_0);
+				pendingMask|=watchMasks[watch];
+				drainCount++;
+				if (!FindNextChangeNotification(watchHandles[watch]))
+					bRearmApiHealthy=false;
+			}
+			if (bRequirementsStable && bWaitApiHealthy &&
+				bRearmApiHealthy && drainCount==WATCH_DRAIN_LIMIT)
+			{
+				DWORD wait=WaitForMultipleObjects(watchCount,watchHandles,FALSE,0);
+				if (wait==WAIT_FAILED)
+					bWaitApiHealthy=false;
+				else if (wait!=WAIT_TIMEOUT)
+					bDrainComplete=false;
+			}
+			const bool bWatcherHealthy=bRequirementsStable && bDrainComplete &&
+				A4SCacheState::RequiredFolderWatchesReady(currentRequiredMask,
+					armedMask,bWaitApiHealthy,bRearmApiHealthy,pendingMask!=0);
+
+			if (!bRequirementsStable || !bWaitApiHealthy ||
+				!bRearmApiHealthy || !bDrainComplete ||
+				!A4SCacheState::RequiredFolderWatchesReady(currentRequiredMask,
+					armedMask,true,true,false))
+			{
+				// Missing required paths/handles, wait API failure, or a rearm failure
+				// makes every cache fail closed until a complete quiet baseline exists.
+				RevokeA4SFolderWatchBaseline();
+				CloseWatches();
+				bBuildWatches=true;
+				bEstablishingBaseline=true;
+				dirMask=0xFFFFFFFF;
+				if (!WaitForWatchRetry(retryDelay))
+					break;
+				retryDelay=retryDelay>WATCH_RETRY_MAX_MS/2?
+					WATCH_RETRY_MAX_MS:retryDelay*2;
+				continue;
+			}
+			if (pendingMask)
+			{
+				// Handles were armed before enumeration. Reload every folder that
+				// changed during that pass, then drain again before publishing ready.
+				dirMask=pendingMask;
+				bBuildWatches=false;
+				continue;
+			}
+			if (!bWatcherHealthy)
+			{
+				// The only remaining non-ready state would be an unprocessed signal;
+				// keep the explicit guard adjacent to the publication point.
+				RevokeA4SFolderWatchBaseline();
+				dirMask=0xFFFFFFFF;
+				bBuildWatches=true;
+				continue;
+			}
+
+			AdvanceFolderContentGeneration();
+			InterlockedExchange(&m_A4SArmedWatchMask,
+				static_cast<LONG>(armedMask));
+			InterlockedExchange(&m_A4SFolderWatchReady,1);
+			SetEvent(m_A4SFolderWatchReadyEvent);
+			bEstablishingBaseline=false;
+			bBuildWatches=false;
+			retryDelay=WATCH_RETRY_MIN_MS;
+		}
+
+		HANDLE waitHandles[NUM_WATCHED_DIRS+2];
+		for (int i=0;i<watchCount;i++)
+			waitHandles[i]=watchHandles[i];
+		waitHandles[watchCount]=m_A4SWatchRebuildEvent;
+		waitHandles[watchCount+1]=m_ExitEvent;
+		DWORD wait=WaitForMultipleObjects(watchCount+2,waitHandles,FALSE,INFINITE);
+		if (wait==WAIT_OBJECT_0+watchCount+1)
+			break;
+		if (wait==WAIT_OBJECT_0+watchCount)
+		{
+			if (IsFolderWatchBaselineReady())
+				RevokeA4SFolderWatchBaseline();
+			CloseWatches();
+			bBuildWatches=true;
+			bEstablishingBaseline=true;
+			dirMask=0xFFFFFFFF;
+			continue;
+		}
+		if (wait==WAIT_FAILED || wait<WAIT_OBJECT_0 ||
+			wait>=WAIT_OBJECT_0+static_cast<DWORD>(watchCount))
+		{
+			RevokeA4SFolderWatchBaseline();
+			CloseWatches();
+			bBuildWatches=true;
+			bEstablishingBaseline=true;
+			dirMask=0xFFFFFFFF;
+			if (!WaitForWatchRetry(retryDelay))
+				break;
+			retryDelay=retryDelay>WATCH_RETRY_MAX_MS/2?
+				WATCH_RETRY_MAX_MS:retryDelay*2;
+			continue;
+		}
+
+		const int watch=static_cast<int>(wait-WAIT_OBJECT_0);
+		dirMask=watchMasks[watch];
+		DWORD requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
+			&m_A4SRequiredWatchMask,0,0));
+		bool bRequiredChange=(dirMask&requiredMask)!=0;
+		if (bRequiredChange)
+			RevokeA4SFolderWatchBaseline();
+		bool bWatchFailure=!FindNextChangeNotification(watchHandles[watch]);
+		bool bRebuildRequested=false;
+		bool bExitRequested=false;
+
+		// Debounce while still servicing every watched handle. In particular, a
+		// required change that arrives behind an optional metadata notification
+		// revokes readiness immediately instead of remaining hidden by a sleep.
+		const ULONGLONG debounceDeadline=GetTickCount64()+1000;
+		while (!bWatchFailure && !bRebuildRequested && !bExitRequested)
+		{
+			const ULONGLONG now=GetTickCount64();
+			if (now>=debounceDeadline)
+				break;
+			const DWORD remaining=static_cast<DWORD>(debounceDeadline-now);
+			HANDLE debounceHandles[NUM_WATCHED_DIRS+2];
+			for (int i=0;i<watchCount;i++)
+				debounceHandles[i]=watchHandles[i];
+			debounceHandles[watchCount]=m_A4SWatchRebuildEvent;
+			debounceHandles[watchCount+1]=m_ExitEvent;
+			DWORD debounce=WaitForMultipleObjects(watchCount+2,
+				debounceHandles,FALSE,remaining);
+			if (debounce==WAIT_TIMEOUT)
+				break;
+			if (debounce==WAIT_OBJECT_0+watchCount+1)
+			{
+				bExitRequested=true;
+				break;
+			}
+			if (debounce==WAIT_OBJECT_0+watchCount)
+			{
+				bRebuildRequested=true;
+				break;
+			}
+			if (debounce==WAIT_FAILED || debounce<WAIT_OBJECT_0 ||
+				debounce>=WAIT_OBJECT_0+static_cast<DWORD>(watchCount))
+			{
+				bWatchFailure=true;
+				break;
+			}
+
+			const int changedWatch=static_cast<int>(debounce-WAIT_OBJECT_0);
+			dirMask|=watchMasks[changedWatch];
+			requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
+				&m_A4SRequiredWatchMask,0,0));
+			if (!bRequiredChange && (dirMask&requiredMask)!=0)
+			{
+				bRequiredChange=true;
+				RevokeA4SFolderWatchBaseline();
+			}
+			if (!FindNextChangeNotification(watchHandles[changedWatch]))
+				bWatchFailure=true;
+		}
+
+		if (bExitRequested)
+			break;
+		if (bRebuildRequested)
+		{
+			// ConfigureA4SFolderWatches revoked readiness before signaling us.
+			CloseWatches();
+			bBuildWatches=true;
+			bEstablishingBaseline=true;
+			dirMask=0xFFFFFFFF;
+			continue;
+		}
+		if (bWatchFailure)
+		{
+			// Either WaitForMultipleObjects or FindNextChangeNotification failed.
+			// Revoke even for an optional handle because the watch set is no longer
+			// known to be complete, then rebuild using capped event-driven backoff.
+			RevokeA4SFolderWatchBaseline();
+			CloseWatches();
+			bBuildWatches=true;
+			bEstablishingBaseline=true;
+			dirMask=0xFFFFFFFF;
+			if (!WaitForWatchRetry(retryDelay))
+				break;
+			retryDelay=retryDelay>WATCH_RETRY_MAX_MS/2?
+				WATCH_RETRY_MAX_MS:retryDelay*2;
+			continue;
+		}
+		bBuildWatches=false;
+		bEstablishingBaseline=bRequiredChange;
+	}
+	CloseWatches();
+	if (preloadOperation)
+		EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
+#else
 	int dirCount=0;
 	HANDLE handles[NUM_WATCHED_DIRS+1];
 	DWORD dirMasks[NUM_WATCHED_DIRS]={0};
 	DWORD dirMask=0xFFFFFFFF;
-#ifdef A4S_PRODUCT
-	UINT64 preloadOperation=BeginA4SPerformanceOperation(A4S_PERF_PRELOAD);
-	UINT32 preloadedFolders=0;
-#endif
 	while (1)
 	{
 		for (int i=0;i<_countof(g_CacheFolders);i++)
 		{
 			if (m_LoadingStage!=LOAD_LOADING) break;
 			if (i==NUM_WATCHED_DIRS && dirMask==0xFFFFFFFF)
-			{
-#ifdef A4S_PRODUCT
-				// The first menu may open during the intentional two-second preload
-				// delay. Once every watched path has been armed (or attempted), advance
-				// the content generation before publishing readiness. Any snapshot
-				// captured in that blind window is therefore permanently stale.
-				AdvanceFolderContentGeneration();
-				InterlockedExchange(&m_A4SFolderWatchReady,1);
-				SetEvent(m_A4SFolderWatchReadyEvent);
-#endif
 				SetEvent(m_DoneEvent);
-			}
 			if (!(dirMask&(1<<i))) continue;
 			if (g_CacheFolders[i].folder==FOLDERID_Favorites && !m_bPreloadFavorites) continue;
 			CAbsolutePidl pidl;
@@ -3335,27 +3723,9 @@ void CItemManager::PreloadItemsThread( void )
 				else
 					LoadMetroItems(refreshFlags);
 			}
-#ifdef A4S_PRODUCT
-			preloadedFolders++;
-#endif
 		}
 		if (dirMask==0xFFFFFFFF)
-		{
 			SetEvent(m_DoneEvent);
-#ifdef A4S_PRODUCT
-			if (preloadOperation)
-			{
-				EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
-				preloadOperation=0;
-			}
-#endif
-		}
-#ifdef A4S_PRODUCT
-		// Persist refreshed metadata from the idle worker, never from menu close.
-		// SaveCacheFile supplies the existing five-minute debounce and atomic
-		// DataCache.tmp replacement.
-		SaveCacheFile();
-#endif
 		if (dirCount==0)
 			break;
 		handles[dirCount]=m_ExitEvent;
@@ -3365,20 +3735,12 @@ void CItemManager::PreloadItemsThread( void )
 
 		int dir=wait-WAIT_OBJECT_0;
 		dirMask=dirMasks[dir];
-#ifdef A4S_PRODUCT
-		if (dirMask&A4S_MENU_CONTENT_DIR_MASK)
-			AdvanceFolderContentGeneration();
-#endif
-
 		if (!FindNextChangeNotification(handles[dir]))
-			ResetEvent(handles[dir]); // so we don't wake on this event again
-		Sleep(1000); // hopefully whatever file operation is in progress will finish in a second
+			ResetEvent(handles[dir]);
+		Sleep(1000);
 	}
 	for (int i=0;i<dirCount;i++)
 		FindCloseChangeNotification(handles[i]);
-#ifdef A4S_PRODUCT
-	if (preloadOperation)
-		EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
 #endif
 }
 

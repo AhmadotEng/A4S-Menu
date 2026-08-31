@@ -197,6 +197,8 @@ public:
 #ifdef A4S_PRODUCT
 	ULONGLONG GetFolderContentGeneration( void ) const;
 	ULONGLONG GetIconCacheEpoch( void ) const;
+	void ConfigureA4SFolderWatches( bool bNoCommonFolders,
+		bool bClassicPinnedRoot, bool bMetroAppsSurface );
 	bool IsFolderWatchBaselineReady( void ) const;
 	bool WaitForFolderWatchBaseline( DWORD timeout ) const;
 #endif
@@ -298,6 +300,7 @@ private:
 #ifdef A4S_PRODUCT
 	HANDLE m_A4SItemReadyEvent; // an icon reached ready or terminal fallback state
 	HANDLE m_A4SFolderWatchReadyEvent; // initial watched-directory baseline is armed
+	HANDLE m_A4SWatchRebuildEvent; // required watch set changed or must be rebuilt
 #endif
 	HANDLE m_PreloadItemsThread;
 	HANDLE m_RefreshInfoThread;
@@ -412,8 +415,11 @@ private:
 	volatile LONGLONG m_FolderContentGeneration;
 	volatile LONGLONG m_IconCacheEpoch;
 	volatile LONG m_A4SFolderWatchReady;
+	volatile LONG m_A4SRequiredWatchMask;
+	volatile LONG m_A4SArmedWatchMask;
 	void AdvanceFolderContentGeneration( void );
 	void AdvanceIconCacheEpoch( void );
+	void RevokeA4SFolderWatchBaseline( void );
 #endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;

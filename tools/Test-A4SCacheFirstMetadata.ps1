@@ -7,8 +7,10 @@ Set-StrictMode -Version 3.0
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $headerPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\ItemManager.h'
 $sourcePath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\ItemManager.cpp'
+$stateHeaderPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\A4SCacheState.h'
+$nativeGatePath = Join-Path $PSScriptRoot 'Test-A4SCacheStateNative.ps1'
 
-foreach ($path in @($headerPath, $sourcePath)) {
+foreach ($path in @($headerPath, $sourcePath, $stateHeaderPath, $nativeGatePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Missing cache-first metadata source input: $path"
     }
@@ -16,6 +18,7 @@ foreach ($path in @($headerPath, $sourcePath)) {
 
 $header = Get-Content -LiteralPath $headerPath -Raw
 $source = Get-Content -LiteralPath $sourcePath -Raw
+$stateHeader = Get-Content -LiteralPath $stateHeaderPath -Raw
 
 function Assert-Contract {
     param(
@@ -113,18 +116,38 @@ $constructor = Get-CppFunctionBody -Text $source -Signature 'CItemManager::CItem
 $generationGetter = Get-CppFunctionBody -Text $source -Signature 'ULONGLONG CItemManager::GetFolderContentGeneration( void ) const'
 $generationAdvance = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::AdvanceFolderContentGeneration( void )'
 $preload = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::PreloadItemsThread( void )'
+$upstreamBranchIndex = $preload.IndexOf('#else', [StringComparison]::Ordinal)
+Assert-Contract ($upstreamBranchIndex -gt 0) 'product/upstream preload split is missing'
+$productPreload = $preload.Substring(0, $upstreamBranchIndex)
 Assert-Contract ($constructor -match 'm_FolderContentGeneration\s*=\s*1\s*;') `
     'folder-content generation is not initialized to a nonzero value'
 Assert-Contract ($generationGetter -match 'InterlockedCompareExchange64\(') `
     'folder-content generation reads are not atomic'
 Assert-Contract ($generationAdvance -match 'InterlockedCompareExchange64\(') `
     'folder-content generation updates are not atomic'
-Assert-Contract ($generationAdvance -match 'value\s*==\s*~0ULL\s*\?\s*1\s*:\s*value\s*\+\s*1') `
+Assert-Contract ($generationAdvance -match 'A4SCacheState::NextNonzeroEpoch\(value\)' -and
+    $stateHeader -match 'return\s+value==UINT64_MAX\?1:value\+1') `
     'folder-content generation can wrap through the reserved zero value'
-Assert-Contract ($source -match 'A4S_MENU_CONTENT_DIR_MASK\s*=\s*\(1U<<0\)\|\(1U<<1\)\|\(1U<<5\)\|\(1U<<6\)') `
-    'the content generation mask no longer covers both Start roots, classic pins, and packaged app links'
-Assert-Contract ($preload -match 'dirMask\s*&\s*A4S_MENU_CONTENT_DIR_MASK[\s\S]*AdvanceFolderContentGeneration\(\)') `
-    'watched menu-content notifications do not advance the generation'
+
+# Watch requirements are conditional. The per-user Start root is mandatory;
+# common groups, classic pins, and Apps become mandatory only when exposed.
+# Desktop/public desktop/taskbar pins remain best-effort metadata preloads.
+$requiredMask = Get-CppFunctionBody -Text $stateHeader -Signature 'inline uint32_t RequiredFolderWatchMask( bool noCommonFolders,'
+Assert-Contract ($stateHeader -match 'WATCH_START_MENU\s*=1U<<0' -and
+    $stateHeader -match 'WATCH_COMMON_START_MENU=1U<<1' -and
+    $stateHeader -match 'WATCH_CLASSIC_PINNED\s*=1U<<5' -and
+    $stateHeader -match 'WATCH_METRO_APPS\s*=1U<<6') `
+    'the exact Start/Common/classic/Apps watch-bit mapping changed'
+Assert-Contract ($requiredMask -match 'uint32_t\s+mask=WATCH_START_MENU' -and
+    $requiredMask -match '!noCommonFolders[\s\S]*WATCH_COMMON_START_MENU' -and
+    $requiredMask -match 'classicPinnedRoot[\s\S]*WATCH_CLASSIC_PINNED' -and
+    $requiredMask -match 'metroAppsSurface[\s\S]*WATCH_METRO_APPS' -and
+    $requiredMask -notmatch 'WATCH_DESKTOP|WATCH_PUBLIC_DESKTOP|WATCH_TASKBAR_PINNED') `
+    'the conditionally required watch set is incomplete or includes optional roots'
+Assert-Contract ($header -match 'ConfigureA4SFolderWatches' -and
+    $header -match 'm_A4SRequiredWatchMask' -and
+    $header -match 'm_A4SArmedWatchMask') `
+    'ItemManager does not track required and successfully armed watch sets explicitly'
 
 # Icon/metadata invalidation has an independent epoch. ResetTempIcons executes
 # on every menu toggle, so a true no-op must preserve warm snapshot identity.
@@ -137,7 +160,7 @@ Assert-Contract ($constructor -match 'm_IconCacheEpoch\s*=\s*1\s*;') `
     'icon/cache epoch is not initialized to a nonzero value'
 Assert-Contract ($iconGetter -match 'InterlockedCompareExchange64\(' -and
     $iconAdvance -match 'InterlockedCompareExchange64\(' -and
-    $iconAdvance -match 'value\s*==\s*~0ULL\s*\?\s*1\s*:\s*value\s*\+\s*1') `
+    $iconAdvance -match 'A4SCacheState::NextNonzeroEpoch\(value\)') `
     'icon/cache epoch is not atomically monotonic with zero-skipping wrap'
 $resetEpochCalls = [Regex]::Matches($resetTempIcons, 'AdvanceIconCacheEpoch\(\)').Count
 Assert-Contract ($resetTempIcons -match 'bool\s+bCacheInvalidated=false' -and
@@ -161,11 +184,43 @@ Assert-Contract ($source -match 'm_A4SFolderWatchReadyEvent=CreateEvent\(NULL,TR
 $waitBaseline = Get-CppFunctionBody -Text $source -Signature 'bool CItemManager::WaitForFolderWatchBaseline( DWORD timeout ) const'
 Assert-Contract ($waitBaseline -match 'm_A4SFolderWatchReadyEvent' -and
     $waitBaseline -match 'm_ExitEvent' -and
-    $waitBaseline -match 'WaitForMultipleObjects') `
+    $waitBaseline -match 'WaitForMultipleObjects' -and
+    $waitBaseline -match 'wait==WAIT_OBJECT_0\s*&&\s*IsFolderWatchBaselineReady\(\)') `
     'waiting for the initial watcher baseline cannot be cancelled at shutdown'
-$baselineSequence = 'AdvanceFolderContentGeneration\(\);\s*InterlockedExchange\(&m_A4SFolderWatchReady,1\);\s*SetEvent\(m_A4SFolderWatchReadyEvent\);'
+$isReady = Get-CppFunctionBody -Text $source -Signature 'bool CItemManager::IsFolderWatchBaselineReady( void ) const'
+$revoke = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::RevokeA4SFolderWatchBaseline( void )'
+Assert-Contract ($isReady -match 'm_A4SRequiredWatchMask' -and
+    $isReady -match 'm_A4SArmedWatchMask' -and
+    $isReady -match 'RequiredFolderWatchesReady\(requiredMask,armedMask,[\s\S]*true,true,false\)') `
+    'readiness does not atomically revalidate the current required/armed set'
+$readyResetIndex = $revoke.IndexOf('InterlockedExchange(&m_A4SFolderWatchReady,0)', [StringComparison]::Ordinal)
+$armedResetIndex = $revoke.IndexOf('InterlockedExchange(&m_A4SArmedWatchMask,0)', [StringComparison]::Ordinal)
+$generationRevokeIndex = $revoke.IndexOf('AdvanceFolderContentGeneration()', [StringComparison]::Ordinal)
+Assert-Contract ($readyResetIndex -ge 0 -and $armedResetIndex -gt $readyResetIndex -and
+    $generationRevokeIndex -gt $armedResetIndex -and $revoke -match 'ResetEvent\(m_A4SFolderWatchReadyEvent\)') `
+    'watch failure does not revoke readiness, clear armed state, and advance generation'
+$baselineSequence = 'AdvanceFolderContentGeneration\(\);\s*InterlockedExchange\(&m_A4SArmedWatchMask,[\s\S]*?\);\s*InterlockedExchange\(&m_A4SFolderWatchReady,1\);\s*SetEvent\(m_A4SFolderWatchReadyEvent\);'
 Assert-Contract ($preload -match $baselineSequence) `
     'watcher readiness is signaled before pre-watch snapshots are invalidated'
+Assert-Contract ($preload -match 'setupRequiredMask' -and
+    $preload -match 'armedMask\|=1U<<i' -and
+    $preload -match 'currentRequiredMask==setupRequiredMask' -and
+    $preload -match 'pendingMask\|=watchMasks\[watch\]' -and
+    $preload -match 'if\s*\(pendingMask\)[\s\S]*dirMask=pendingMask[\s\S]*continue') `
+    'required handles are not tracked or already-signaled changes can publish before reload'
+Assert-Contract ($productPreload -match 'wchar_t\s+path\[_MAX_PATH\]=\{\}' -and
+    $productPreload -match 'SHGetPathFromIDList\(pidl,path\)\s*&&\s*path\[0\]' -and
+    $productPreload -notmatch 'SUCCEEDED\(SHGetPathFromIDList') `
+    'a failed or empty Win32 watch path can be mistaken for a successful HRESULT'
+Assert-Contract ($preload -match 'WATCH_RETRY_MIN_MS=250' -and
+    $preload -match 'WATCH_RETRY_MAX_MS=30000' -and
+    $preload -match 'WaitForWatchRetry\(retryDelay\)' -and
+    $preload -match 'm_A4SWatchRebuildEvent') `
+    'watch recovery is not bounded, event-driven, and reconfigurable'
+$waitFailureCount = [Regex]::Matches($preload, 'WAIT_FAILED[\s\S]{0,700}RevokeA4SFolderWatchBaseline\(\)').Count
+$rearmFailureCount = [Regex]::Matches($preload, '!FindNextChangeNotification[\s\S]{0,1400}RevokeA4SFolderWatchBaseline\(\)').Count
+Assert-Contract ($waitFailureCount -ge 2 -and $rearmFailureCount -ge 1) `
+    'WaitForMultipleObjects or FindNextChangeNotification failure can leave readiness published'
 
 # Deterministic fail-closed decision model for the exact conditions encoded by
 # TryGetCachedFileMetadata. This exercises every rejection edge without loading
@@ -244,5 +299,10 @@ $eligibleAfterBaseline = $blindWindow.BaselineReady -and
     $blindWindow.SnapshotGeneration -eq $blindWindow.LiveGeneration
 Assert-Contract (-not $eligibleBeforeBaseline -and -not $eligibleAfterBaseline) `
     'a pre-watch snapshot can survive baseline establishment'
+
+# The executable native gate compiles the same production decision header and
+# injects each missing-required-watch, wait failure, rearm failure, pending
+# signal, epoch wrap, and required environment-probe failure.
+& $nativeGatePath
 
 Write-Host 'A4S cache-first metadata gates passed.'

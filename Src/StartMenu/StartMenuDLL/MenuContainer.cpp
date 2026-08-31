@@ -21,6 +21,7 @@
 #include "SettingsUI.h"
 #include "A4SMenuProfile.h"
 #include "A4SPerformance.h"
+#include "A4SCacheState.h"
 #include "MetroLinkManager.h"
 #include "ProgramsTree.h"
 #include "dllmain.h"
@@ -8839,6 +8840,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #ifdef A4S_PRODUCT
 	A4SRootCache &a4sRootCache=GetA4SRootCache();
 	const bool bDiscoverA4SEnvironment=!a4sRootCache.bEnvironmentValid;
+	A4SCacheState::EnvironmentDiscoveryState a4sEnvironmentDiscovery={};
 	bool a4sNoCommonFolders=a4sRootCache.bNoCommonFolders;
 	bool a4sNoRun=a4sRootCache.bNoRun;
 	bool a4sNoClose=a4sRootCache.bNoClose;
@@ -8858,6 +8860,12 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_bNoRun=a4sNoRun;
 	s_bNoClose=a4sNoClose;
 	s_bHasTouch=a4sHasTouch;
+	const bool bA4SClassicPinnedRoot=
+		GetSettingInt(L"PinnedPrograms")==PINNED_PROGRAMS_PINNED;
+	const bool bA4SMetroAppsSurface=GetWinVersion()>=WIN_VER_WIN8 &&
+		(GetSettingBool(L"AllProgramsMetro") || GetSettingBool(L"ShowAppsMenu"));
+	g_ItemManager.ConfigureA4SFolderWatches(s_bNoCommonFolders,
+		bA4SClassicPinnedRoot,bA4SMetroAppsSurface);
 #else
 	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
 	s_bNoRun=(SHRestricted(REST_NORUN)!=0);
@@ -8961,19 +8969,33 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 
 	if (bHibernate || bSleep)
 	{
-		SYSTEM_POWER_CAPABILITIES powerCaps;
-		GetPwrCapabilities(&powerCaps);
-
-		// no sleep capabilities, turn off the sleep option
-		if (!(powerCaps.SystemS1 || powerCaps.SystemS2 || powerCaps.SystemS3 || powerCaps.AoAc))
+		SYSTEM_POWER_CAPABILITIES powerCaps={};
+#ifdef A4S_PRODUCT
+		a4sEnvironmentDiscovery.powerCapabilitiesRequired=true;
+#endif
+		const BOOL bPowerCapabilities=GetPwrCapabilities(&powerCaps);
+#ifdef A4S_PRODUCT
+		a4sEnvironmentDiscovery.powerCapabilitiesSucceeded=
+			bPowerCapabilities!=FALSE;
+#endif
+		if (!bPowerCapabilities)
 		{
-			bSleep = false;
+			// Keep the uncached synchronous UI usable and conservative. A failed
+			// probe cannot publish an environment cache that might expose unsafe
+			// power actions on every subsequent menu.
+			bSleep=false;
+			bHibernate=false;
 		}
-
-		// no hibernate capabilities, turn off hibernate option
-		if (!powerCaps.HiberFilePresent)
+		else
 		{
-			bHibernate = false;
+			// no sleep capabilities, turn off the sleep option
+			if (!(powerCaps.SystemS1 || powerCaps.SystemS2 ||
+				powerCaps.SystemS3 || powerCaps.AoAc))
+				bSleep=false;
+
+			// no hibernate capabilities, turn off hibernate option
+			if (!powerCaps.HiberFilePresent)
+				bHibernate=false;
 			/*	disabled for now, use group policy to hide Hibernate
 					// disable hibernate if hybrid sleep (fast s4) is enabled
 					SYSTEM_POWER_STATUS status;
@@ -9069,9 +9091,17 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 				break;
 			case MENU_UNDOCK:
 				{
-					HW_PROFILE_INFO info;
-					GetCurrentHwProfile(&info);
-					if ((info.dwDockInfo&(DOCKINFO_DOCKED|DOCKINFO_UNDOCKED))!=DOCKINFO_DOCKED)
+					HW_PROFILE_INFO info={};
+#ifdef A4S_PRODUCT
+					a4sEnvironmentDiscovery.hardwareProfileRequired=true;
+#endif
+					const BOOL bHardwareProfile=GetCurrentHwProfile(&info);
+#ifdef A4S_PRODUCT
+					a4sEnvironmentDiscovery.hardwareProfileSucceeded=
+						bHardwareProfile!=FALSE;
+#endif
+					if (!bHardwareProfile ||
+						(info.dwDockInfo&(DOCKINFO_DOCKED|DOCKINFO_UNDOCKED))!=DOCKINFO_DOCKED)
 						g_StdOptions[i].options=0;
 					else if (s_bWin7Style)
 						g_StdOptions[i].options=SHRestricted(REST_NOSMEJECTPC)?0:MENU_ENABLED|MENU_EXPANDED;
@@ -9209,6 +9239,27 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 				break;
 			case MENU_SWITCHUSER:
 				{
+#ifdef A4S_PRODUCT
+					a4sEnvironmentDiscovery.switchUserPolicyRequired=true;
+					// Failure is conservative for this uncached opening and prevents
+					// publication; a later toggle retries the policy probe.
+					g_StdOptions[i].options=0;
+					CComPtr<IShellDispatch2> pShellDisp;
+					HRESULT hr=CoCreateInstance(CLSID_Shell,NULL,CLSCTX_SERVER,
+						IID_IShellDispatch2,(void**)&pShellDisp);
+					if (SUCCEEDED(hr) && pShellDisp)
+					{
+						long val=1;
+						hr=pShellDisp->IsRestricted(CComBSTR(L"System"),
+							CComBSTR(L"HideFastUserSwitching"),&val);
+						if (SUCCEEDED(hr))
+						{
+							a4sEnvironmentDiscovery.switchUserPolicySucceeded=true;
+							if (!val)
+								g_StdOptions[i].options=MENU_ENABLED|MENU_EXPANDED;
+						}
+					}
+#else
 					g_StdOptions[i].options=MENU_ENABLED|MENU_EXPANDED;
 					CComPtr<IShellDispatch2> pShellDisp;
 					if (SUCCEEDED(CoCreateInstance(CLSID_Shell,NULL,CLSCTX_SERVER,IID_IShellDispatch2,(void**)&pShellDisp)))
@@ -9217,6 +9268,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 						if (SUCCEEDED(pShellDisp->IsRestricted(CComBSTR(L"System"),CComBSTR(L"HideFastUserSwitching"),&val)) && val)
 							g_StdOptions[i].options=0;
 					}
+#endif
 				}
 				break;
 			case MENU_APPS:
@@ -9257,14 +9309,20 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	if (bDiscoverA4SEnvironment)
 	{
 		s_PinFolder.Empty();
-		if (ResolveA4SRootEnvironment(bAllPrograms,s_bNoCommonFolders,
-			path1,path2,s_PinFolder))
+		a4sEnvironmentDiscovery.rootPathsSucceeded=
+			ResolveA4SRootEnvironment(bAllPrograms,s_bNoCommonFolders,
+				path1,path2,s_PinFolder);
+		if (a4sEnvironmentDiscovery.rootPathsSucceeded)
 		{
 			// Clone all fallible value state before touching the previous cache.
 			// Only a complete set is swapped into the shared environment record.
 			CAbsolutePidl cachedStart(path1);
 			CAbsolutePidl cachedCommon(path2);
-			if (cachedStart && (!path2 || cachedCommon))
+			a4sEnvironmentDiscovery.rootPathClonesSucceeded=
+				cachedStart && (!path2 || cachedCommon);
+			if (A4SCacheState::DecideEnvironmentPublication(
+				a4sEnvironmentDiscovery)==
+				A4SCacheState::PUBLISH_DISCOVERED_ENVIRONMENT)
 			{
 				a4sRootCache.startMenu.Swap(cachedStart);
 				a4sRootCache.commonStartMenu.Swap(cachedCommon);

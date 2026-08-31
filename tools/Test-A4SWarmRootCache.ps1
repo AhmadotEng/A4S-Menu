@@ -10,8 +10,10 @@ $containerPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\MenuContainer.c
 $commandsPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\MenuCommands.cpp'
 $dllPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\StartMenuDLL.cpp'
 $itemManagerPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\ItemManager.cpp'
+$stateHeaderPath = Join-Path $repoRoot 'Src\StartMenu\StartMenuDLL\A4SCacheState.h'
+$nativeGatePath = Join-Path $PSScriptRoot 'Test-A4SCacheStateNative.ps1'
 
-foreach ($path in @($headerPath, $containerPath, $commandsPath, $dllPath, $itemManagerPath)) {
+foreach ($path in @($headerPath, $containerPath, $commandsPath, $dllPath, $itemManagerPath, $stateHeaderPath, $nativeGatePath)) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
         throw "Missing A4S warm-root source input: $path"
     }
@@ -22,6 +24,7 @@ $container = Get-Content -LiteralPath $containerPath -Raw
 $commands = Get-Content -LiteralPath $commandsPath -Raw
 $dll = Get-Content -LiteralPath $dllPath -Raw
 $itemManager = Get-Content -LiteralPath $itemManagerPath -Raw
+$stateHeader = Get-Content -LiteralPath $stateHeaderPath -Raw
 
 function Assert-Contract {
     param(
@@ -195,6 +198,7 @@ foreach ($discovery in @(
     'SHRestricted\(REST_NOCOMMONGROUPS\)',
     'FlyoutMenuSettings',
     'GetPwrCapabilities',
+    'GetCurrentHwProfile',
     'CoCreateInstance\(CLSID_Shell'
 )) {
     Assert-Contract ($toggle -match $discovery) "expected cold discovery is missing: $discovery"
@@ -218,8 +222,31 @@ Assert-Contract ($toggle -match 'else\s*\{\s*s_bHasUpdates=a4sRootCache\.bHasUpd
     'the warm path does not restore cached power/policy standard options'
 $environmentCommitCount = [Regex]::Matches($toggle, 'a4sRootCache\.bEnvironmentValid=true').Count
 Assert-Contract ($environmentCommitCount -eq 1 -and
-    $toggle -match 'cachedStart\s*&&\s*\(!path2\s*\|\|\s*cachedCommon\)[\s\S]*a4sRootCache\.stdOptions\[i\]=g_StdOptions\[i\]\.options[\s\S]*a4sRootCache\.bEnvironmentValid=true') `
+    $toggle -match 'DecideEnvironmentPublication\([\s\S]*PUBLISH_DISCOVERED_ENVIRONMENT[\s\S]*a4sRootCache\.stdOptions\[i\]=g_StdOptions\[i\]\.options[\s\S]*a4sRootCache\.bEnvironmentValid=true') `
     'environment state is published partially or through more than one commit point'
+Assert-Contract ($toggle -match 'SYSTEM_POWER_CAPABILITIES\s+powerCaps=\{\}' -and
+    $toggle -match 'const BOOL bPowerCapabilities=GetPwrCapabilities\(&powerCaps\)' -and
+    $toggle -match 'powerCapabilitiesSucceeded=[\s\S]*bPowerCapabilities!=FALSE' -and
+    $toggle -match 'if\s*\(!bPowerCapabilities\)[\s\S]*bSleep=false;[\s\S]*bHibernate=false;') `
+    'power discovery is unchecked, uninitialized, or unsafe on synchronous failure'
+Assert-Contract ($toggle -match 'HW_PROFILE_INFO\s+info=\{\}' -and
+    $toggle -match 'const BOOL bHardwareProfile=GetCurrentHwProfile\(&info\)' -and
+    $toggle -match 'hardwareProfileSucceeded=[\s\S]*bHardwareProfile!=FALSE' -and
+    $toggle -match 'if\s*\(!bHardwareProfile\s*\|\|[\s\S]*g_StdOptions\[i\]\.options=0') `
+    'hardware-profile discovery is unchecked, uninitialized, or unsafe on synchronous failure'
+Assert-Contract ($toggle -match 'switchUserPolicyRequired=true' -and
+    $toggle -match 'g_StdOptions\[i\]\.options=0;[\s\S]*CoCreateInstance\(CLSID_Shell' -and
+    $toggle -match 'SUCCEEDED\(hr\)[\s\S]*IsRestricted[\s\S]*SUCCEEDED\(hr\)[\s\S]*switchUserPolicySucceeded=true') `
+    'switch-user policy discovery can publish failure-derived or permissive state'
+Assert-Contract ($stateHeader -match 'EnvironmentDiscoveryComplete' -and
+    $stateHeader -match 'powerCapabilitiesRequired[\s\S]*powerCapabilitiesSucceeded' -and
+    $stateHeader -match 'hardwareProfileRequired[\s\S]*hardwareProfileSucceeded' -and
+    $stateHeader -match 'switchUserPolicyRequired[\s\S]*switchUserPolicySucceeded' -and
+    $stateHeader -match 'rootPathsSucceeded\s*&&\s*state\.rootPathClonesSucceeded') `
+    'the shared native publication predicate omits a required discovery stage'
+Assert-Contract ($toggle -notmatch 'a4sRootCache\.startMenu\.Clear|a4sRootCache\.commonStartMenu\.Clear' -and
+    $toggle -match 'if\s*\(!a4sRootCache\.bEnvironmentValid\)[\s\S]*a4sRootCache\.bConfigurationValid=false') `
+    'failed environment discovery destroys the prior cache instead of retaining it fail-closed'
 
 $prepareIndex = $toggle.LastIndexOf('PrepareA4SRootConfiguration', [StringComparison]::Ordinal)
 $initIndex = $toggle.LastIndexOf('pStartMenu->InitItems()', [StringComparison]::Ordinal)
@@ -335,11 +362,11 @@ Assert-Contract (($published -join '|') -eq ($replacement -join '|')) `
     'a complete matching rebuild did not atomically replace the old snapshot'
 
 $environmentStages = [ordered]@{
-    Policy = $true
-    Power = $true
-    StartFolder = $true
-    CommonFolder = $true
-    PinPath = $true
+    PowerCapabilities = $true
+    HardwareProfile = $true
+    SwitchUserPolicy = $true
+    RootPaths = $true
+    RootPathClones = $true
 }
 foreach ($failedStage in $environmentStages.Keys) {
     $candidate = [ordered]@{}
@@ -348,5 +375,9 @@ foreach ($failedStage in $environmentStages.Keys) {
     $eligible = -not ($candidate.Values -contains $false)
     Assert-Contract (-not $eligible) "partial environment became eligible after $failedStage failure"
 }
+
+# Compile and execute the production predicate itself. This is the authoritative
+# fault-injection gate; the PowerShell model above is only a readable invariant.
+& $nativeGatePath
 
 Write-Host 'A4S warm-root cache gates passed.'
