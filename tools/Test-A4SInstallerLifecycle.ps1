@@ -89,6 +89,11 @@ $script:manifestPath = $null
 $script:manifestSha256 = $null
 $script:expectedCleanupHash = $null
 $script:fixturePaths = @()
+$script:lifecycleMutex = $null
+$script:lifecycleMutexHeld = $false
+$script:lastOwnedAggregate = $null
+$script:ownedAggregateLedger = [Collections.Generic.List[object]]::new()
+$script:knownPayloadBySlotName = [ordered]@{}
 
 function Normalize-Sha256 {
     param([Parameter(Mandatory)][string] $Value)
@@ -97,16 +102,40 @@ function Normalize-Sha256 {
     return $normalized
 }
 
-function Test-PathWithin {
-    param(
-        [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][string] $Parent
-    )
+function Acquire-LifecycleMutex {
+    if ($script:lifecycleMutexHeld) { throw 'The lifecycle mutex is already held by this harness.' }
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+    $bytes = [Text.Encoding]::UTF8.GetBytes($sid)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { $suffix = ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '').Substring(0, 32) }
+    finally { $algorithm.Dispose() }
+    $name = "Local\A4SMenuInstallerLifecycle-$suffix"
+    $script:lifecycleMutex = [Threading.Mutex]::new($false, $name)
+    try {
+        try { $acquired = $script:lifecycleMutex.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) {
+            throw 'Another A4S installer lifecycle harness owns the current-user qualification lock.'
+        }
+        $script:lifecycleMutexHeld = $true
+        return $name
+    }
+    catch {
+        $script:lifecycleMutex.Dispose()
+        $script:lifecycleMutex = $null
+        throw
+    }
+}
 
-    $childFull = [IO.Path]::GetFullPath($Path).TrimEnd('\')
-    $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd('\')
-    return $childFull.Equals($parentFull, [StringComparison]::OrdinalIgnoreCase) -or
-        $childFull.StartsWith($parentFull + '\', [StringComparison]::OrdinalIgnoreCase)
+function Release-LifecycleMutex {
+    if ($script:lifecycleMutexHeld -and $null -ne $script:lifecycleMutex) {
+        $script:lifecycleMutex.ReleaseMutex()
+        $script:lifecycleMutexHeld = $false
+    }
+    if ($null -ne $script:lifecycleMutex) {
+        $script:lifecycleMutex.Dispose()
+        $script:lifecycleMutex = $null
+    }
 }
 
 function Assert-LocalAbsolutePath {
@@ -141,6 +170,9 @@ function Assert-NoReparsePointInExistingChain {
             throw "No existing ancestor could be validated for $Path."
         }
         $cursor = $parent.FullName
+    }
+    if ($tail.Count -ne 0 -and -not (Test-Path -LiteralPath $cursor -PathType Container)) {
+        throw "The nearest existing ancestor for $full is not a directory: $cursor"
     }
     while ($cursor) {
         $item = Get-Item -LiteralPath $cursor -Force
@@ -365,6 +397,8 @@ function Get-InstallerRegistrationSnapshot {
 }
 
 function Get-UserStateProjection {
+    param([switch] $ExcludeHostSafety)
+
     $tree = Get-RegistryTreeSnapshot -SubKey $stateSubKey
     if (-not $tree.Exists) {
         return [ordered]@{ SubKey = $stateSubKey; Exists = $false; Nodes = @() }
@@ -375,6 +409,10 @@ function Get-UserStateProjection {
         $relative = [string]$node.RelativePath
         if ($relative -ieq 'Servicing' -or $relative.StartsWith('Servicing\',
                 [StringComparison]::OrdinalIgnoreCase)) {
+            continue
+        }
+        if ($ExcludeHostSafety -and ($relative -ieq 'HostSafety' -or
+                $relative.StartsWith('HostSafety\', [StringComparison]::OrdinalIgnoreCase))) {
             continue
         }
         $values = @($node.Values)
@@ -397,6 +435,40 @@ function Get-UserStateProjection {
     return [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @($nodes) }
 }
 
+function Get-LegacyUserStateProjection {
+    $full = Get-UserStateProjection
+    if (-not $full.Exists) { return $full }
+    $nodes = [Collections.Generic.List[object]]::new()
+    foreach ($node in @($full.Nodes)) {
+        $relative = [string]$node.RelativePath
+        $excluded = $false
+        foreach ($name in @('Config', 'Menu', 'HostSafety')) {
+            if ($relative -ieq $name -or
+                $relative.StartsWith($name + '\', [StringComparison]::OrdinalIgnoreCase)) {
+                $excluded = $true
+                break
+            }
+        }
+        if (-not $excluded) { $nodes.Add($node) }
+    }
+    $hasContent = @($nodes | Where-Object {
+        [string]$_.RelativePath -or @($_.Values).Count -ne 0
+    }).Count -ne 0
+    if (-not $hasContent) {
+        return [ordered]@{ SubKey = $stateSubKey; Exists = $false; Nodes = @() }
+    }
+    return [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @($nodes) }
+}
+
+function Get-UserStatePartitions {
+    return [ordered]@{
+        Config = Get-RegistryTreeSnapshot -SubKey ($stateSubKey + '\Config')
+        Menu = Get-RegistryTreeSnapshot -SubKey ($stateSubKey + '\Menu')
+        Legacy = Get-LegacyUserStateProjection
+        HostSafety = Get-RegistryTreeSnapshot -SubKey ($stateSubKey + '\HostSafety')
+    }
+}
+
 function Get-ObjectFingerprint {
     param([Parameter(Mandatory)] $Value)
 
@@ -409,6 +481,20 @@ function Get-ObjectFingerprint {
     finally {
         $algorithm.Dispose()
     }
+}
+
+function Get-NamedMemberValue {
+    param(
+        [Parameter(Mandatory)] $Value,
+        [Parameter(Mandatory)][string] $Name
+    )
+    if ($Value -is [Collections.IDictionary]) {
+        if (-not $Value.Contains($Name)) { throw "Required member '$Name' is absent." }
+        return $Value[$Name]
+    }
+    $property = $Value.PSObject.Properties[$Name]
+    if ($null -eq $property) { throw "Required member '$Name' is absent." }
+    return $property.Value
 }
 
 function Get-StableUserStateProjection {
@@ -671,9 +757,32 @@ if (-not ('A4SInstallerLifecycleNative' -as [type])) {
 using System;
 using System.ComponentModel;
 using System.Runtime.InteropServices;
+using System.Text;
+
+public sealed class A4SPhysicalPathRecord
+{
+    public string FinalPath { get; set; }
+    public uint VolumeSerialNumber { get; set; }
+    public ulong FileId { get; set; }
+}
 
 public static class A4SInstallerLifecycleNative
 {
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public System.Runtime.InteropServices.ComTypes.FILETIME CreationTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastAccessTime;
+        public System.Runtime.InteropServices.ComTypes.FILETIME LastWriteTime;
+        public uint VolumeSerialNumber;
+        public uint FileSizeHigh;
+        public uint FileSizeLow;
+        public uint NumberOfLinks;
+        public uint FileIndexHigh;
+        public uint FileIndexLow;
+    }
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindWindowW(string className, string windowName);
     [DllImport("user32.dll", SetLastError = true)]
@@ -690,6 +799,17 @@ public static class A4SInstallerLifecycleNative
     private static extern IntPtr LockResource(IntPtr resourceData);
     [DllImport("kernel32.dll")]
     private static extern bool FreeLibrary(IntPtr module);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern IntPtr CreateFileW(string path, uint access, uint share,
+        IntPtr security, uint creation, uint flags, IntPtr template);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetFinalPathNameByHandleW(IntPtr file, StringBuilder path,
+        uint characters, uint flags);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(IntPtr file,
+        out BY_HANDLE_FILE_INFORMATION information);
+    [DllImport("kernel32.dll")]
+    private static extern bool CloseHandle(IntPtr handle);
 
     public static uint GetShellExplorerProcessId()
     {
@@ -724,8 +844,111 @@ public static class A4SInstallerLifecycleNative
         }
         finally { FreeLibrary(module); }
     }
+
+    public static A4SPhysicalPathRecord ResolveExistingPath(string path)
+    {
+        const uint ReadAttributes = 0x80;
+        const uint ShareAll = 0x1 | 0x2 | 0x4;
+        const uint OpenExisting = 3;
+        const uint BackupSemantics = 0x02000000;
+        IntPtr handle = CreateFileW(path, ReadAttributes, ShareAll, IntPtr.Zero,
+            OpenExisting, BackupSemantics, IntPtr.Zero);
+        if (handle == new IntPtr(-1))
+            throw new Win32Exception(Marshal.GetLastWin32Error(), "CreateFileW failed for physical-path resolution");
+        try
+        {
+            uint needed = GetFinalPathNameByHandleW(handle, null, 0, 0);
+            if (needed == 0)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFinalPathNameByHandleW failed");
+            StringBuilder finalPath = new StringBuilder(checked((int)needed + 1));
+            uint written = GetFinalPathNameByHandleW(handle, finalPath,
+                checked((uint)finalPath.Capacity), 0);
+            if (written == 0 || written >= finalPath.Capacity)
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFinalPathNameByHandleW returned an invalid path");
+            BY_HANDLE_FILE_INFORMATION information;
+            if (!GetFileInformationByHandle(handle, out information))
+                throw new Win32Exception(Marshal.GetLastWin32Error(), "GetFileInformationByHandle failed");
+            return new A4SPhysicalPathRecord {
+                FinalPath = finalPath.ToString(),
+                VolumeSerialNumber = information.VolumeSerialNumber,
+                FileId = ((ulong)information.FileIndexHigh << 32) | information.FileIndexLow
+            };
+        }
+        finally { CloseHandle(handle); }
+    }
 }
 '@
+}
+
+function Get-PhysicalPathRecord {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $full = Assert-LocalAbsolutePath $Path
+    $cursor = $full
+    $tail = [Collections.Generic.List[string]]::new()
+    while (-not (Test-Path -LiteralPath $cursor)) {
+        $leaf = [IO.Path]::GetFileName($cursor.TrimEnd('\'))
+        if (-not $leaf) { throw "Could not resolve a nearest existing ancestor for $full." }
+        $tail.Insert(0, $leaf)
+        $parent = [IO.Directory]::GetParent($cursor)
+        if ($null -eq $parent) { throw "Could not resolve a nearest existing ancestor for $full." }
+        $cursor = $parent.FullName
+    }
+    $resolved = [A4SInstallerLifecycleNative]::ResolveExistingPath($cursor)
+    $canonical = [string]$resolved.FinalPath
+    foreach ($segment in $tail) { $canonical = $canonical.TrimEnd('\') + '\' + $segment }
+    return [ordered]@{
+        RequestedPath = $full
+        ExistingAncestor = $cursor
+        ExistingAncestorFinalPath = [string]$resolved.FinalPath
+        ExistingAncestorVolumeSerial = ('{0:X8}' -f [uint32]$resolved.VolumeSerialNumber)
+        ExistingAncestorFileId = ('{0:X16}' -f [uint64]$resolved.FileId)
+        NonExistingTail = @($tail)
+        CanonicalPath = $canonical.TrimEnd('\')
+    }
+}
+
+function Test-CanonicalPhysicalOverlap {
+    param(
+        [Parameter(Mandatory)] $Left,
+        [Parameter(Mandatory)] $Right
+    )
+    if ($Left.ExistingAncestorVolumeSerial -cne $Right.ExistingAncestorVolumeSerial) {
+        return $false
+    }
+    $leftTail = @($Left.NonExistingTail)
+    $rightTail = @($Right.NonExistingTail)
+    if ($Left.ExistingAncestorFileId -ceq $Right.ExistingAncestorFileId) {
+        $leftRelative = ($leftTail -join '\').TrimEnd('\')
+        $rightRelative = ($rightTail -join '\').TrimEnd('\')
+        $leftContainsRight = -not $leftRelative -or
+            $rightRelative.Equals($leftRelative, [StringComparison]::OrdinalIgnoreCase) -or
+            $rightRelative.StartsWith($leftRelative + '\',
+                [StringComparison]::OrdinalIgnoreCase)
+        $rightContainsLeft = -not $rightRelative -or
+            $leftRelative.Equals($rightRelative, [StringComparison]::OrdinalIgnoreCase) -or
+            $leftRelative.StartsWith($rightRelative + '\',
+                [StringComparison]::OrdinalIgnoreCase)
+        if ($leftContainsRight -or $rightContainsLeft) { return $true }
+    }
+    $leftPath = ([string]$Left.CanonicalPath).TrimEnd('\')
+    $rightPath = ([string]$Right.CanonicalPath).TrimEnd('\')
+    $leftContainsRight = $rightPath.Equals($leftPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $rightPath.StartsWith($leftPath + '\', [StringComparison]::OrdinalIgnoreCase)
+    $rightContainsLeft = $leftPath.Equals($rightPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $leftPath.StartsWith($rightPath + '\', [StringComparison]::OrdinalIgnoreCase)
+    return $leftContainsRight -or $rightContainsLeft
+}
+
+function Assert-NoPhysicalPathOverlap {
+    param(
+        [Parameter(Mandatory)] $Left,
+        [Parameter(Mandatory)] $Right,
+        [Parameter(Mandatory)][string] $Description
+    )
+    if (Test-CanonicalPhysicalOverlap -Left $Left -Right $Right) {
+        throw "$Description physically overlap after final-handle resolution: '$($Left.CanonicalPath)' and '$($Right.CanonicalPath)'."
+    }
 }
 
 function Get-BytesSha256 {
@@ -785,6 +1008,21 @@ function Get-ShellExplorerPid {
     return $processId
 }
 
+function Get-ExplorerA4SModuleRecords {
+    $explorerPid = Get-ShellExplorerPid
+    $records = [Collections.Generic.List[object]]::new()
+    $process = Get-Process -Id $explorerPid -ErrorAction Stop
+    foreach ($module in @($process.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' } |
+            Sort-Object FileName)) {
+        $path = [IO.Path]::GetFullPath($module.FileName)
+        $sha256 = if (Test-Path -LiteralPath $path -PathType Leaf) {
+            (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+        } else { $null }
+        $records.Add([ordered]@{ Path = $path; Sha256 = $sha256 })
+    }
+    return @($records)
+}
+
 function Get-A4SProcessRecords {
     $records = [Collections.Generic.List[object]]::new()
     $byId = [ordered]@{}
@@ -806,85 +1044,323 @@ function Get-A4SProcessRecords {
     $processes = @($byId.Values | Sort-Object Id)
     foreach ($process in $processes) {
         $path = $null
-        try { $path = $process.Path } catch {}
+        $sha256 = $null
+        $pathError = $null
+        try {
+            $path = [IO.Path]::GetFullPath($process.Path)
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+            }
+        }
+        catch { $pathError = $_.Exception.Message }
+        $started = $null
+        try { $started = $process.StartTime.ToUniversalTime().ToString('o') } catch {}
         $records.Add([ordered]@{
             Name = $process.ProcessName
             Id = $process.Id
             SessionId = $process.SessionId
             Path = $path
+            Sha256 = $sha256
+            StartTimeUtc = $started
+            PathError = $pathError
         })
     }
     return @($records)
 }
 
 function Get-CleanupProcessRecords {
-    param([Parameter(Mandatory)][string] $ExpectedSha256)
-
     $records = [Collections.Generic.List[object]]::new()
-    foreach ($process in @(Get-Process -Name 'A4SMenuCleanup' -ErrorAction SilentlyContinue | Sort-Object Id)) {
-        try { $path = [IO.Path]::GetFullPath($process.Path) }
-        catch { throw "Could not resolve cleanup helper process $($process.Id): $($_.Exception.Message)" }
-        if (-not $path.Equals($cleanupHelperPath, [StringComparison]::OrdinalIgnoreCase)) {
-            throw "Cleanup helper process $($process.Id) uses an unexpected path: $path"
+    foreach ($process in @(Get-Process -Name 'A4SMenuCleanup*' -ErrorAction SilentlyContinue | Sort-Object Id)) {
+        $path = $null
+        $sha256 = $null
+        $errorText = $null
+        try {
+            $path = [IO.Path]::GetFullPath($process.Path)
+            if (Test-Path -LiteralPath $path -PathType Leaf) {
+                $sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+            }
         }
-        if ($process.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId) {
-            throw "Cleanup helper process $($process.Id) is not in the current interactive session."
-        }
-        $identity = Get-BinaryIdentity -Path $path -Description 'active cleanup helper'
-        if ($identity.Sha256 -cne $ExpectedSha256) {
-            throw "Cleanup helper process $($process.Id) does not match the exact expected setup hash."
-        }
+        catch { $errorText = $_.Exception.Message }
         $started = $null
         try { $started = $process.StartTime.ToUniversalTime().ToString('o') } catch {}
         $records.Add([ordered]@{
             Id = $process.Id
             SessionId = $process.SessionId
             Path = $path
-            Sha256 = $identity.Sha256
+            Sha256 = $sha256
             StartTimeUtc = $started
+            Error = $errorText
         })
     }
     return @($records)
 }
 
-function Get-StableCleanupObservation {
-    param(
-        [Parameter(Mandatory)][string] $ExpectedSha256,
-        [ValidateRange(1, 30)][int] $TimeoutSeconds = 5
-    )
+function Get-CleanupStateOnce {
+    $helperFile = [ordered]@{ Present = $false; Path = $cleanupHelperPath }
+    if (Test-Path -LiteralPath $cleanupHelperPath) {
+        try {
+            $item = Get-Item -LiteralPath $cleanupHelperPath -Force
+            $helperFile = [ordered]@{
+                Present = $true
+                Path = $cleanupHelperPath
+                IsDirectory = $item.PSIsContainer
+                IsReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+                Length = if ($item.PSIsContainer) { $null } else { $item.Length }
+                Sha256 = if ($item.PSIsContainer) { $null } else {
+                    (Get-FileHash -Algorithm SHA256 -LiteralPath $cleanupHelperPath).Hash.ToUpperInvariant()
+                }
+                Error = $null
+            }
+        }
+        catch {
+            $helperFile = [ordered]@{ Present = $true; Path = $cleanupHelperPath; Error = $_.Exception.Message }
+        }
+    }
+    return [ordered]@{
+        HelperFile = $helperFile
+        Processes = @(Get-CleanupProcessRecords)
+    }
+}
 
+function Get-VersionsInventory {
+    $result = [ordered]@{ Present = $false; Path = $versionsRoot; Entries = @(); Error = $null }
+    if (-not (Test-Path -LiteralPath $versionsRoot)) { return $result }
+    try {
+        $root = Get-Item -LiteralPath $versionsRoot -Force
+        $entries = [Collections.Generic.List[object]]::new()
+        foreach ($entry in @(Get-ChildItem -LiteralPath $versionsRoot -Force | Sort-Object Name)) {
+            $children = [Collections.Generic.List[object]]::new()
+            if ($entry.PSIsContainer -and
+                ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                foreach ($child in @(Get-ChildItem -LiteralPath $entry.FullName -Force | Sort-Object Name)) {
+                    $hash = $null
+                    if (-not $child.PSIsContainer -and
+                        ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -eq 0) {
+                        $hash = (Get-FileHash -Algorithm SHA256 -LiteralPath $child.FullName).Hash.ToUpperInvariant()
+                    }
+                    $children.Add([ordered]@{
+                        Name = $child.Name
+                        IsDirectory = $child.PSIsContainer
+                        IsReparsePoint = ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+                        Length = if ($child.PSIsContainer) { $null } else { $child.Length }
+                        Sha256 = $hash
+                    })
+                }
+            }
+            $entries.Add([ordered]@{
+                Name = $entry.Name
+                IsDirectory = $entry.PSIsContainer
+                IsReparsePoint = ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+                Children = @($children)
+            })
+        }
+        return [ordered]@{
+            Present = $true
+            Path = $versionsRoot
+            IsDirectory = $root.PSIsContainer
+            IsReparsePoint = ($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            Entries = @($entries)
+            Error = $null
+        }
+    }
+    catch {
+        $result.Present = $true
+        $result.Error = $_.Exception.Message
+        return $result
+    }
+}
+
+function Get-KnownRootFileInventory {
+    $records = [Collections.Generic.List[object]]::new()
+    foreach ($name in @('DataCache.db', 'DataCache.tmp', 'DataCache.txt', 'StartupLog.txt')) {
+        $path = Join-Path $installRoot $name
+        if (-not (Test-Path -LiteralPath $path)) {
+            $records.Add([ordered]@{ Name = $name; Present = $false })
+            continue
+        }
+        $item = Get-Item -LiteralPath $path -Force
+        $records.Add([ordered]@{
+            Name = $name
+            Present = $true
+            IsDirectory = $item.PSIsContainer
+            IsReparsePoint = ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0
+            Length = if ($item.PSIsContainer) { $null } else { $item.Length }
+            Sha256 = if ($item.PSIsContainer -or
+                ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { $null } else {
+                (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+            }
+        })
+    }
+    return @($records)
+}
+
+function Get-LifecycleAggregateOnce {
+    return [ordered]@{
+        ExplorerPid = Get-ShellExplorerPid
+        InstallerRegistration = Get-InstallerRegistrationSnapshot
+        UserState = Get-UserStateProjection
+        UserStateWithoutHostSafety = Get-UserStateProjection -ExcludeHostSafety
+        UserStatePartitions = Get-UserStatePartitions
+        HostSafety = Get-RegistryTreeSnapshot -SubKey ($stateSubKey + '\HostSafety')
+        DataCache = Get-DataCacheRecord
+        Versions = Get-VersionsInventory
+        KnownRootFiles = @(Get-KnownRootFileInventory)
+        A4SProcesses = @(Get-A4SProcessRecords)
+        ExplorerA4SModules = @(Get-ExplorerA4SModuleRecords)
+        Cleanup = Get-CleanupStateOnce
+    }
+}
+
+function Get-StableLifecycleAggregate {
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [ValidateRange(2, 10)][int] $RequiredSamples = 2,
+        [ValidateRange(1, 10)][int] $TimeoutSeconds = 5
+    )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     $lastFingerprint = $null
     $stableSamples = 0
     do {
-        $records = @(Get-CleanupProcessRecords -ExpectedSha256 $ExpectedSha256)
-        if ($records.Count -gt 1) {
-            throw 'More than one exact cleanup helper is active.'
-        }
-        $helperFile = $null
-        if (Test-Path -LiteralPath $cleanupHelperPath) {
-            $helperFile = Get-BinaryIdentity -Path $cleanupHelperPath -Description 'cleanup helper file'
-            if ($helperFile.Sha256 -cne $ExpectedSha256) {
-                throw 'The cleanup helper file does not match the exact expected setup hash.'
-            }
-        }
-        $sample = [ordered]@{ Processes = @($records); HelperFile = $helperFile }
-        $fingerprint = Get-ObjectFingerprint $sample
+        $snapshot = Get-LifecycleAggregateOnce
+        $fingerprint = Get-ObjectFingerprint $snapshot
         if ($fingerprint -ceq $lastFingerprint) { ++$stableSamples }
         else { $lastFingerprint = $fingerprint; $stableSamples = 1 }
-        if ($stableSamples -ge 3) {
+        if ($stableSamples -ge $RequiredSamples) {
             return [ordered]@{
-                Stable = $true
-                Quiescent = $records.Count -eq 0
-                Processes = @($records)
-                HelperFile = $helperFile
-                Samples = $stableSamples
-                ObservedUtc = [DateTime]::UtcNow.ToString('o')
+                Label = $Label
+                Fingerprint = $fingerprint
+                StableSamples = $stableSamples
+                Snapshot = $snapshot
             }
         }
-        Start-Sleep -Milliseconds 200
+        Start-Sleep -Milliseconds 150
     } while ([DateTime]::UtcNow -lt $deadline)
-    throw 'The cleanup-helper process set did not become stable inside the bounded observation window.'
+    throw "$Label registration/cleanup aggregate did not stabilize inside the bounded interval."
+}
+
+function Register-OwnedAggregate {
+    param(
+        [Parameter(Mandatory)] $Aggregate,
+        [Parameter(Mandatory)][ValidateSet('Clean', 'InstalledV1', 'InstalledV2',
+            'UninstalledPending', 'UninstalledQuiescent', 'FinalInstalled')] [string] $Kind,
+        [Parameter(Mandatory)][string] $Label,
+        [AllowNull()] $Validation
+    )
+    $entry = [ordered]@{
+        Label = $Label
+        Kind = $Kind
+        Fingerprint = [string]$Aggregate.Fingerprint
+        Aggregate = $Aggregate
+        Validation = $Validation
+    }
+    $script:ownedAggregateLedger.Add($entry)
+    $script:lastOwnedAggregate = $entry
+    return $entry
+}
+
+function Find-OwnedAggregate {
+    param([Parameter(Mandatory)][string] $Fingerprint)
+    return @($script:ownedAggregateLedger | Where-Object {
+        $_.Fingerprint -ceq $Fingerprint
+    }) | Select-Object -Last 1
+}
+
+function Assert-AggregateFingerprintImmediatelyBeforeMutation {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedFingerprint,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $actual = Get-StableLifecycleAggregate -Label ($Label + '-pre-mutation-aggregate')
+    if ($actual.Fingerprint -cne $ExpectedFingerprint) {
+        throw "$Label detected unknown or concurrent state immediately before mutation."
+    }
+    return $actual
+}
+
+function Assert-LastOwnedAggregateImmediatelyBeforeSetup {
+    param([Parameter(Mandatory)][string] $Label)
+    if ($null -eq $script:lastOwnedAggregate) {
+        throw "$Label has no previously validated harness-owned state."
+    }
+    $actual = Assert-AggregateFingerprintImmediatelyBeforeMutation `
+        -ExpectedFingerprint $script:lastOwnedAggregate.Fingerprint -Label $Label
+    return [ordered]@{
+        ExpectedOwner = $script:lastOwnedAggregate.Label
+        ExpectedKind = $script:lastOwnedAggregate.Kind
+        ExpectedFingerprint = $script:lastOwnedAggregate.Fingerprint
+        ActualFingerprint = $actual.Fingerprint
+        Aggregate = $actual
+    }
+}
+
+function Test-InstallerOwnedCleanSnapshot {
+    param([Parameter(Mandatory)] $Snapshot)
+    $registration = $Snapshot.InstallerRegistration
+    if ($registration.ActiveSlot.Present -or $registration.PreviousSlot.Present -or
+        $registration.InstallVersion.Present -or $registration.Servicing.Exists -or
+        $registration.Uninstall.Exists -or $registration.Run.Present -or
+        $registration.CleanupRunOnce.Present -or $registration.RecoveryRunOnce.Present) {
+        return $false
+    }
+    if ($Snapshot.Versions.Present -or $Snapshot.Cleanup.HelperFile.Present -or
+        @($Snapshot.Cleanup.Processes).Count -ne 0 -or @($Snapshot.A4SProcesses).Count -ne 0 -or
+        @($Snapshot.ExplorerA4SModules).Count -ne 0) {
+        return $false
+    }
+    foreach ($file in @($Snapshot.KnownRootFiles | Where-Object { $_.Name -cne 'DataCache.db' })) {
+        if ($file.Present) { return $false }
+    }
+    return $true
+}
+
+function Test-ExactPendingCleanupSnapshot {
+    param(
+        [Parameter(Mandatory)] $Snapshot,
+        [Parameter(Mandatory)][string] $ExpectedSha256
+    )
+    $registration = $Snapshot.InstallerRegistration
+    if ($registration.ActiveSlot.Present -or $registration.PreviousSlot.Present -or
+        $registration.InstallVersion.Present -or $registration.Servicing.Exists -or
+        $registration.Uninstall.Exists -or $registration.Run.Present -or
+        $registration.RecoveryRunOnce.Present -or -not $registration.CleanupRunOnce.Present -or
+        $registration.CleanupRunOnce.Kind -cne 'String' -or
+        $registration.CleanupRunOnce.Data -cne $expectedCleanupRunOnce) {
+        return $false
+    }
+    $helper = $Snapshot.Cleanup.HelperFile
+    $processes = @($Snapshot.Cleanup.Processes)
+    if (-not $helper.Present -or $helper.Error -or $helper.IsDirectory -or $helper.IsReparsePoint -or
+        $helper.Sha256 -cne $ExpectedSha256 -or $processes.Count -ne 1) {
+        return $false
+    }
+    $process = $processes[0]
+    if ($process.Error -or $process.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
+        -not ([string]$process.Path).Equals($cleanupHelperPath, [StringComparison]::OrdinalIgnoreCase) -or
+        $process.Sha256 -cne $ExpectedSha256) {
+        return $false
+    }
+    if (@($Snapshot.A4SProcesses | Where-Object { $_.Id -ne $process.Id }).Count -ne 0) {
+        return $false
+    }
+    return $true
+}
+
+function Get-RecoveryDecision {
+    param(
+        [Parameter(Mandatory)][bool] $InstallerOwnedClean,
+        [Parameter(Mandatory)][bool] $ExactPendingCleanup,
+        [Parameter(Mandatory)][bool] $KnownOwnedRestorableClean,
+        [Parameter(Mandatory)][bool] $KnownOwnedInstalled,
+        [Parameter(Mandatory)][bool] $KnownOwnedUninstalled
+    )
+    if ($ExactPendingCleanup) { return 'WaitPendingNoUninstall' }
+    if ($InstallerOwnedClean) {
+        if ($KnownOwnedRestorableClean) { return 'RestoreCleanNoUninstall' }
+        return 'RetainCleanUnknownNoMutation'
+    }
+    if ($KnownOwnedInstalled) { return 'UninstallKnownOwned' }
+    if ($KnownOwnedUninstalled) { return 'ObserveUninstalledNoUninstall' }
+    return 'RetainUnknownNoMutation'
 }
 
 function Write-DurableNewText {
@@ -910,6 +1386,53 @@ function Write-ImmutableManifest {
     $sidecar = $Path + '.sha256'
     Write-DurableNewText -Path $sidecar -Text ($hash + ' *' + [IO.Path]::GetFileName($Path) + "`r`n")
     return [ordered]@{ Path = $Path; Sha256 = $hash; SidecarPath = $sidecar }
+}
+
+function Read-VerifiedImmutableManifest {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSessionId,
+        [Parameter(Mandatory)][string] $ExpectedUserStateSha256,
+        [Parameter(Mandatory)][string] $ExpectedLifecycleMutexName
+    )
+    $path = Assert-RegularFile -Path $script:manifestPath -Description 'immutable pre-mutation manifest'
+    $actualHash = (Get-FileHash -Algorithm SHA256 -LiteralPath $path).Hash.ToUpperInvariant()
+    if ($actualHash -cne $script:manifestSha256) {
+        throw 'The immutable pre-mutation manifest hash changed; recovery mutation is forbidden.'
+    }
+    $sidecarPath = $path + '.sha256'
+    Assert-RegularFile -Path $sidecarPath -Description 'immutable manifest SHA-256 sidecar' | Out-Null
+    $expectedSidecar = $actualHash + ' *' + [IO.Path]::GetFileName($path) + "`r`n"
+    $actualSidecar = [IO.File]::ReadAllText($sidecarPath, [Text.Encoding]::UTF8)
+    if ($actualSidecar -cne $expectedSidecar) {
+        throw 'The immutable manifest SHA-256 sidecar is not exact; recovery mutation is forbidden.'
+    }
+    $manifest = [IO.File]::ReadAllText($path, [Text.Encoding]::UTF8) | ConvertFrom-Json
+    if ([int]$manifest.SchemaVersion -ne 2 -or [string]$manifest.SessionId -cne $ExpectedSessionId -or
+        [int]$manifest.CurrentSessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
+        [string]$manifest.LifecycleMutexName -cne $ExpectedLifecycleMutexName -or
+        [string]$manifest.OriginalUserStateSha256 -cne $ExpectedUserStateSha256 -or
+        (Get-ObjectFingerprint $manifest.OriginalUserState) -cne $ExpectedUserStateSha256) {
+        throw 'The immutable manifest identity does not match this lifecycle session.'
+    }
+    $manifestCache = $manifest.OriginalDataCache
+    if ([string]$manifestCache.Path -cne $dataCachePath) {
+        throw 'The immutable manifest names an unexpected DataCache path.'
+    }
+    if ([bool]$manifestCache.Present) {
+        $expectedBackup = [IO.Path]::GetFullPath((Join-Path $script:sessionDirectory 'DataCache.db.original'))
+        if (-not ([string]$manifestCache.BackupPath).Equals($expectedBackup,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The immutable manifest names an unexpected DataCache recovery backup.'
+        }
+        $backup = Assert-RegularFile -Path ([string]$manifestCache.BackupPath) `
+            -Description 'immutable-manifest DataCache recovery backup'
+        if ((Get-FileHash -Algorithm SHA256 -LiteralPath $backup).Hash.ToUpperInvariant() -cne
+                [string]$manifestCache.Sha256 -or
+            (Get-Item -LiteralPath $backup -Force).Length -ne [int64]$manifestCache.Length) {
+            throw 'The DataCache recovery backup no longer matches the immutable manifest.'
+        }
+    }
+    return [ordered]@{ Path = $path; Sha256 = $actualHash; Manifest = $manifest }
 }
 
 function Write-Evidence {
@@ -943,7 +1466,8 @@ function Invoke-CapturedProcess {
         [Parameter(Mandatory)][string] $FilePath,
         [Parameter(Mandatory)][string[]] $Arguments,
         [Parameter(Mandatory)][string] $ExpectedSha256,
-        [Parameter(Mandatory)][int] $TimeoutSeconds
+        [Parameter(Mandatory)][int] $TimeoutSeconds,
+        [switch] $SetupLaunch
     )
 
     $full = Assert-RegularFile -Path $FilePath -Description "$Label executable"
@@ -963,6 +1487,11 @@ function Invoke-CapturedProcess {
     $watch = [Diagnostics.Stopwatch]::StartNew()
     $process = $null
     $startError = $null
+    # This is deliberately the final operation before process creation. A
+    # setup launch never crosses an unverified ownership gap in the harness.
+    $preLaunchOwnership = if ($SetupLaunch) {
+        Assert-LastOwnedAggregateImmediatelyBeforeSetup -Label $Label
+    } else { $null }
     try {
         $process = Start-Process -FilePath $full -ArgumentList $Arguments -WindowStyle Hidden -PassThru `
             -RedirectStandardOutput $stdoutPath -RedirectStandardError $stderrPath
@@ -1002,6 +1531,7 @@ function Invoke-CapturedProcess {
         ExplorerPidBefore = $beforeExplorer
         ExplorerPidAfter = $afterExplorer
         ExplorerPidUnchanged = $beforeExplorer -eq $afterExplorer
+        PreLaunchOwnership = $preLaunchOwnership
     }
 }
 
@@ -1134,22 +1664,88 @@ function Get-HostStatusRecord {
     }
 }
 
+function Get-SettledHostStatusRecord {
+    param(
+        [AllowNull()] $ActiveSlot,
+        [Parameter(Mandatory)][string] $Label
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds(10)
+    do {
+        $status = Get-HostStatusRecord -ActiveSlot $ActiveSlot -Label $Label
+        if ($status.State -in @('ready', 'stopped', 'failed-native-start-available',
+                'safety-disabled-native-start-available')) {
+            return $status
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw "$Label host state did not settle inside the bounded interval."
+}
+
+function Assert-ExpectedHostState {
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)][string[]] $KnownMenuSha256,
+        [switch] $AllowDeferredStopped,
+        [switch] $RequireQuiescentStopped
+    )
+    $processes = @($Checkpoint.HostProcesses)
+    $modules = @($Checkpoint.Aggregate.Snapshot.ExplorerA4SModules)
+    if ($RequireQuiescentStopped) {
+        if ($Checkpoint.HostStatus.State -cne 'stopped' -or $processes.Count -ne 0) {
+            throw "$($Checkpoint.Label) is not in the required host-quiescent stopped state."
+        }
+        return
+    }
+    if ($Checkpoint.HostStatus.State -ceq 'ready') {
+        if ($processes.Count -ne 1 -or $modules.Count -eq 0) {
+            throw "$($Checkpoint.Label) ready host state does not have one exact host and a loaded menu module."
+        }
+        foreach ($module in $modules) {
+            if (-not $module.Sha256 -or $KnownMenuSha256 -notcontains [string]$module.Sha256) {
+                throw "$($Checkpoint.Label) ready state has an unknown Explorer DLL mapping."
+            }
+        }
+        return
+    }
+    if ($AllowDeferredStopped -and $Checkpoint.HostStatus.State -ceq 'stopped' -and
+        $processes.Count -eq 0 -and $modules.Count -ne 0) {
+        foreach ($module in $modules) {
+            if (-not $module.Sha256 -or $KnownMenuSha256 -notcontains [string]$module.Sha256) {
+                throw "$($Checkpoint.Label) deferred stopped state has an unknown Explorer DLL mapping."
+            }
+        }
+        return
+    }
+    throw "$($Checkpoint.Label) has unexpected host/process state '$($Checkpoint.HostStatus.State)' with $($processes.Count) resident host process(es)."
+}
+
 function Get-ProductCheckpoint {
     param([Parameter(Mandatory)][string] $Label)
 
     Assert-SafeInstallBoundary
-    $activePath = Get-StringRegistryValue -SubKey $stateSubKey -Name 'ActiveSlot'
-    $previousPath = Get-StringRegistryValue -SubKey $stateSubKey -Name 'PreviousSlot'
+    $aggregate = Get-StableLifecycleAggregate -Label ($Label + '-aggregate')
+    $snapshot = $aggregate.Snapshot
+    $installerRegistration = $snapshot.InstallerRegistration
+    $activePath = if ($installerRegistration.ActiveSlot.Present) {
+        if ($installerRegistration.ActiveSlot.Kind -cne 'String') { throw "$Label ActiveSlot is not REG_SZ." }
+        [string]$installerRegistration.ActiveSlot.Data
+    } else { '' }
+    $previousPath = if ($installerRegistration.PreviousSlot.Present) {
+        if ($installerRegistration.PreviousSlot.Kind -cne 'String') { throw "$Label PreviousSlot is not REG_SZ." }
+        [string]$installerRegistration.PreviousSlot.Data
+    } else { '' }
     $active = Get-SlotRecord -SlotPath $activePath -Role 'active'
     $previous = Get-SlotRecord -SlotPath $previousPath -Role 'previous'
-    $installerRegistration = Get-InstallerRegistrationSnapshot
     $checkpoint = [ordered]@{
         Label = $Label
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
-        ExplorerPid = Get-ShellExplorerPid
+        ExplorerPid = $snapshot.ExplorerPid
+        Aggregate = $aggregate
         ActiveSlotPath = $activePath
         PreviousSlotPath = $previousPath
-        InstallVersion = Get-StringRegistryValue -SubKey $stateSubKey -Name 'InstallVersion'
+        InstallVersion = if ($installerRegistration.InstallVersion.Present) {
+            [string]$installerRegistration.InstallVersion.Data
+        } else { '' }
         ActiveSlot = $active
         PreviousSlot = $previous
         InstallerRegistration = $installerRegistration
@@ -1158,15 +1754,26 @@ function Get-ProductCheckpoint {
         RecoveryRunOnce = $installerRegistration.RecoveryRunOnce
         Servicing = $installerRegistration.Servicing
         UninstallEntry = $installerRegistration.Uninstall
-        DataCache = Get-DataCacheRecord
-        UserStateProjection = Get-UserStateProjection
+        DataCache = $snapshot.DataCache
+        UserStateProjection = $snapshot.UserState
+        UserStateWithoutHostSafety = $snapshot.UserStateWithoutHostSafety
+        UserStatePartitions = $snapshot.UserStatePartitions
+        HostSafety = $snapshot.HostSafety
+        VersionsInventory = $snapshot.Versions
+        KnownRootFiles = $snapshot.KnownRootFiles
+        CleanupObservation = [ordered]@{
+            Stable = $true
+            Quiescent = @($snapshot.Cleanup.Processes).Count -eq 0
+            Processes = @($snapshot.Cleanup.Processes)
+            HelperFile = $snapshot.Cleanup.HelperFile
+            Samples = $aggregate.StableSamples
+        }
     }
-    $checkpoint.HostStatus = Get-HostStatusRecord -ActiveSlot $active -Label $Label
+    $checkpoint.HostStatus = Get-SettledHostStatusRecord -ActiveSlot $active -Label $Label
     $checkpoint.HostProcesses = @(Get-HostProcessRecords -ActiveSlot $active)
-    $checkpoint.CleanupObservation = if ($script:expectedCleanupHash) {
-        Get-StableCleanupObservation -ExpectedSha256 $script:expectedCleanupHash
-    } else {
-        [ordered]@{ Stable = $true; Quiescent = $true; Processes = @(); Samples = 0 }
+    $after = Get-StableLifecycleAggregate -Label ($Label + '-post-status-aggregate')
+    if ($after.Fingerprint -cne $aggregate.Fingerprint) {
+        throw "$Label registration/cleanup aggregate changed while the checkpoint was captured."
     }
     return $checkpoint
 }
@@ -1183,6 +1790,82 @@ function Get-TreeValue {
     return @($node.Values | Where-Object { $_.Name -ceq $Name }) | Select-Object -First 1
 }
 
+function Assert-ExactUninstallMetadata {
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)][string] $ExpectedVersion
+    )
+    $tree = $Checkpoint.UninstallEntry
+    if (-not $tree.Exists -or @($tree.Nodes).Count -ne 1 -or
+        [string]$tree.Nodes[0].RelativePath) {
+        throw "$($Checkpoint.Label) uninstall key is absent or contains subkeys."
+    }
+    $setupPath = [string]$Checkpoint.ActiveSlot.Files.Setup.Path
+    $estimated = [Math]::Min([uint64]::MaxValue,
+        [uint64][Math]::Ceiling((
+            [uint64]$Checkpoint.ActiveSlot.Files.Host.Length +
+            [uint64]$Checkpoint.ActiveSlot.Files.Menu.Length +
+            [uint64]$Checkpoint.ActiveSlot.Files.Setup.Length) / 1024.0))
+    if ($estimated -gt [uint32]::MaxValue) { $estimated = [uint32]::MaxValue }
+    $expected = [ordered]@{
+        DisplayName = @('String', 'A4S Menu')
+        DisplayVersion = @('String', $ExpectedVersion)
+        Publisher = @('String', 'A4SMenu Project')
+        InstallLocation = @('String', $installRoot)
+        DisplayIcon = @('String', ('"' + $setupPath + '"'))
+        UninstallString = @('String', ('"' + $setupPath + '" --uninstall'))
+        QuietUninstallString = @('String', ('"' + $setupPath + '" --uninstall --silent'))
+        ModifyPath = @('String', ('"' + $setupPath + '" --repair'))
+        NoModify = @('DWord', '0')
+        NoRepair = @('DWord', '0')
+        EstimatedSize = @('DWord', ([string][uint32]$estimated))
+    }
+    $values = @($tree.Nodes[0].Values)
+    if ($values.Count -ne $expected.Count) {
+        throw "$($Checkpoint.Label) uninstall metadata value count is not exact."
+    }
+    foreach ($name in $expected.Keys) {
+        $actual = @($values | Where-Object { $_.Name -ceq $name }) | Select-Object -First 1
+        if ($null -eq $actual -or $actual.Kind -cne $expected[$name][0] -or
+            [string]$actual.Data -cne [string]$expected[$name][1]) {
+            throw "$($Checkpoint.Label) uninstall metadata '$name' has the wrong type or data."
+        }
+    }
+}
+
+function Assert-ExactVersionsInventory {
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)][string[]] $ExpectedSlotPaths
+    )
+    $inventory = $Checkpoint.VersionsInventory
+    if (-not $inventory.Present -or $inventory.Error -or -not $inventory.IsDirectory -or
+        $inventory.IsReparsePoint) {
+        throw "$($Checkpoint.Label) versions inventory is absent or unsafe."
+    }
+    $expectedNames = @($ExpectedSlotPaths | ForEach-Object { [IO.Path]::GetFileName($_) } |
+        Sort-Object -Unique)
+    $entries = @($inventory.Entries)
+    $actualNames = @($entries | ForEach-Object Name | Sort-Object -Unique)
+    if ($entries.Count -ne $expectedNames.Count -or (Compare-Object $expectedNames $actualNames)) {
+        throw "$($Checkpoint.Label) versions inventory contains a staging/orphan/unknown slot."
+    }
+    foreach ($entry in $entries) {
+        if (-not $entry.IsDirectory -or $entry.IsReparsePoint -or
+            $entry.Name.StartsWith('.stage-', [StringComparison]::OrdinalIgnoreCase) -or
+            $entry.Name.Contains('.repair-')) {
+            throw "$($Checkpoint.Label) versions inventory contains a staging, repair, file, or reparse entry."
+        }
+        $children = @($entry.Children)
+        $childNames = @($children | ForEach-Object Name | Sort-Object)
+        $expectedChildren = @('A4SMenu.dll', 'A4SMenuHost.exe', 'A4SMenuSetup.exe')
+        if ($children.Count -ne 3 -or (Compare-Object $expectedChildren $childNames) -or
+            @($children | Where-Object { $_.IsDirectory -or $_.IsReparsePoint -or -not $_.Sha256 }).Count) {
+            throw "$($Checkpoint.Label) slot '$($entry.Name)' is not an exact three-file payload."
+        }
+    }
+}
+
 function Assert-NoTransientServicingState {
     param(
         [Parameter(Mandatory)] $Checkpoint,
@@ -1195,8 +1878,9 @@ function Assert-NoTransientServicingState {
         throw "$($Checkpoint.Label) retained the servicing-recovery RunOnce value."
     }
     if (-not $AllowExactPendingCleanup) {
-        if ($Checkpoint.CleanupRunOnce.Present) {
-            throw "$($Checkpoint.Label) retained the cleanup RunOnce value outside explicit uninstall."
+        if ($Checkpoint.CleanupRunOnce.Present -or $Checkpoint.CleanupObservation.HelperFile.Present -or
+            @($Checkpoint.CleanupObservation.Processes).Count -ne 0) {
+            throw "$($Checkpoint.Label) retained cleanup RunOnce/process/file outside explicit uninstall."
         }
         return
     }
@@ -1206,13 +1890,13 @@ function Assert-NoTransientServicingState {
             $Checkpoint.CleanupRunOnce.Data -cne $expectedCleanupRunOnce) {
             throw "$($Checkpoint.Label) has a non-canonical pending cleanup command."
         }
-        if ($null -eq $Checkpoint.CleanupObservation.HelperFile -or
-            @($Checkpoint.CleanupObservation.Processes).Count -ne 1) {
+        if (-not (Test-ExactPendingCleanupSnapshot -Snapshot $Checkpoint.Aggregate.Snapshot `
+                -ExpectedSha256 $script:expectedCleanupHash)) {
             throw "$($Checkpoint.Label) pending cleanup is not backed by one exact, current-session helper."
         }
     }
     elseif (-not $Checkpoint.CleanupObservation.Quiescent -or
-        $null -ne $Checkpoint.CleanupObservation.HelperFile) {
+        $Checkpoint.CleanupObservation.HelperFile.Present) {
         throw "$($Checkpoint.Label) has cleanup artifacts without the exact pending RunOnce state."
     }
 }
@@ -1305,18 +1989,18 @@ function Assert-InstalledCheckpoint {
         $Checkpoint.RunStartup.Data -cne $expectedRun) {
         throw "$($Checkpoint.Label) Run startup command is not the exact active host path."
     }
-    $displayVersion = Get-TreeValue -Tree $Checkpoint.UninstallEntry -RelativePath '' -Name 'DisplayVersion'
-    $uninstallString = Get-TreeValue -Tree $Checkpoint.UninstallEntry -RelativePath '' -Name 'UninstallString'
-    $expectedUninstall = '"' + $Checkpoint.ActiveSlot.Files.Setup.Path + '" --uninstall'
-    if ($null -eq $displayVersion -or $displayVersion.Data -cne $versionText -or
-        $null -eq $uninstallString -or $uninstallString.Data -cne $expectedUninstall) {
-        throw "$($Checkpoint.Label) uninstall metadata does not match the active slot."
-    }
+    Assert-ExactUninstallMetadata -Checkpoint $Checkpoint -ExpectedVersion $versionText
+    $expectedSlots = @($ExpectedActiveSlot)
+    if ($ExpectedPreviousSlot) { $expectedSlots += $ExpectedPreviousSlot }
+    Assert-ExactVersionsInventory -Checkpoint $Checkpoint -ExpectedSlotPaths $expectedSlots
     Assert-NoTransientServicingState -Checkpoint $Checkpoint
 }
 
 function Assert-UninstalledCheckpoint {
-    param([Parameter(Mandatory)] $Checkpoint)
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)][string[]] $AllowedSlotPaths
+    )
     if ($Checkpoint.ActiveSlotPath -or $Checkpoint.PreviousSlotPath -or $Checkpoint.InstallVersion -or
         $Checkpoint.InstallerRegistration.ActiveSlot.Present -or
         $Checkpoint.InstallerRegistration.PreviousSlot.Present -or
@@ -1328,8 +2012,50 @@ function Assert-UninstalledCheckpoint {
         throw "$($Checkpoint.Label) retained the installer-owned uninstall key."
     }
     Assert-NoTransientServicingState -Checkpoint $Checkpoint -AllowExactPendingCleanup
-    if (-not $Checkpoint.CleanupRunOnce.Present -and (Test-Path -LiteralPath $versionsRoot)) {
-        throw "$($Checkpoint.Label) is quiescent but retained the installer-owned versions directory."
+    if ($Checkpoint.CleanupRunOnce.Present) {
+        $expectedNames = @($AllowedSlotPaths | ForEach-Object { [IO.Path]::GetFileName($_) } |
+            Sort-Object -Unique)
+        $inventory = $Checkpoint.VersionsInventory
+        if (-not $inventory.Present -or $inventory.Error -or
+            @($inventory.Entries).Count -ne $expectedNames.Count -or
+            (Compare-Object $expectedNames @($inventory.Entries | ForEach-Object Name | Sort-Object -Unique))) {
+            throw "$($Checkpoint.Label) pending cleanup retained an unexpected versions inventory."
+        }
+        foreach ($entry in @($inventory.Entries)) {
+            if (-not $entry.IsDirectory -or $entry.IsReparsePoint -or
+                $entry.Name.StartsWith('.stage-', [StringComparison]::OrdinalIgnoreCase) -or
+                $entry.Name.Contains('.repair-')) {
+                throw "$($Checkpoint.Label) pending cleanup contains staging/orphan/reparse content."
+            }
+            $payload = $script:knownPayloadBySlotName[[string]$entry.Name]
+            if ($null -eq $payload) {
+                throw "$($Checkpoint.Label) pending cleanup contains an unowned slot '$($entry.Name)'."
+            }
+            $expectedHashes = [ordered]@{
+                'A4SMenu.dll' = $payload.Menu.Sha256
+                'A4SMenuHost.exe' = $payload.Host.Sha256
+                'A4SMenuSetup.exe' = $payload.Setup.Sha256
+            }
+            $children = @($entry.Children)
+            if ($children.Count -ne 3) {
+                throw "$($Checkpoint.Label) pending slot '$($entry.Name)' is not an exact three-file payload."
+            }
+            foreach ($child in $children) {
+                if (-not $expectedHashes.Contains([string]$child.Name) -or
+                    $child.IsDirectory -or $child.IsReparsePoint -or
+                    $child.Sha256 -cne $expectedHashes[[string]$child.Name]) {
+                    throw "$($Checkpoint.Label) pending slot '$($entry.Name)' has unknown payload content."
+                }
+            }
+        }
+    }
+    else {
+        if ($Checkpoint.VersionsInventory.Present) {
+            throw "$($Checkpoint.Label) is quiescent but retained the installer-owned versions directory."
+        }
+        if (@($Checkpoint.KnownRootFiles | Where-Object Present).Count -ne 0) {
+            throw "$($Checkpoint.Label) quiescent uninstall retained a known product cache/log file."
+        }
     }
 }
 
@@ -1342,9 +2068,8 @@ function Invoke-RecordedSetupStep {
 
     $record = Invoke-CapturedProcess -Label $Label -FilePath $SetupIdentity.Path `
         -Arguments $Arguments -ExpectedSha256 $SetupIdentity.Sha256 `
-        -TimeoutSeconds $OperationTimeoutSeconds
+        -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
     $script:evidence.Steps.Add($record)
-    Write-Evidence
     Assert-ProcessSucceededWithoutExplorerRestart $record
     return $record
 }
@@ -1355,15 +2080,20 @@ function Add-CheckpointToStep {
         [Parameter(Mandatory)][string] $Label
     )
     $Step.Checkpoint = Get-ProductCheckpoint -Label $Label
-    Write-Evidence
     return $Step.Checkpoint
 }
 
 function Record-CacheRestoration {
     param(
         [Parameter(Mandatory)] $Original,
-        [Parameter(Mandatory)][string] $Reason
+        [Parameter(Mandatory)][string] $Reason,
+        [AllowNull()] $ExpectedAggregate
     )
+    if ($null -ne $ExpectedAggregate) {
+        Assert-AggregateFingerprintImmediatelyBeforeMutation `
+            -ExpectedFingerprint $ExpectedAggregate.Fingerprint `
+            -Label 'DataCache restoration' | Out-Null
+    }
     $restored = Restore-OriginalDataCache -Original $Original
     $record = [ordered]@{
         Reason = $Reason
@@ -1371,7 +2101,6 @@ function Record-CacheRestoration {
         Result = $restored
     }
     $script:evidence.CacheRestorations.Add($record)
-    Write-Evidence
     return $record
 }
 
@@ -1389,6 +2118,7 @@ function Get-InstallerCheckpointProjection {
         RecoveryRunOnce = $Checkpoint.RecoveryRunOnce
         Servicing = $Checkpoint.Servicing
         UninstallEntry = $Checkpoint.UninstallEntry
+        VersionsInventory = $Checkpoint.VersionsInventory
     }
 }
 
@@ -1405,46 +2135,121 @@ function Assert-DataCacheMatches {
     }
 }
 
-function Get-CleanStartRecord {
-    Assert-SafeInstallBoundary
-    $registration = Get-InstallerRegistrationSnapshot
-    foreach ($name in $installerOwnedRootValues) {
-        if ($registration[$name].Present) {
-            throw "Clean-start preflight requires installer-owned root value '$name' to be absent."
+function Assert-UserStateAndCacheInvariant {
+    param(
+        [Parameter(Mandatory)] $Checkpoint,
+        [Parameter(Mandatory)] $OriginalPartitions,
+        [Parameter(Mandatory)] $OriginalDataCache,
+        [switch] $AllowExplicitRepairHostSafetyReset
+    )
+    Assert-DataCacheMatches -Actual $Checkpoint.DataCache -Expected $OriginalDataCache `
+        -Label $Checkpoint.Label
+    foreach ($partitionName in @('Config', 'Menu', 'Legacy')) {
+        $expected = Get-ObjectFingerprint (Get-NamedMemberValue $OriginalPartitions $partitionName)
+        $actual = Get-ObjectFingerprint $Checkpoint.UserStatePartitions[$partitionName]
+        if ($actual -cne $expected) {
+            throw "$($Checkpoint.Label) changed the byte-exact $partitionName user-state partition."
         }
     }
-    if ($registration.Servicing.Exists) {
-        throw 'Clean-start preflight requires the servicing journal to be absent.'
+    $expectedSafety = Get-ObjectFingerprint (Get-NamedMemberValue $OriginalPartitions 'HostSafety')
+    $actualSafety = Get-ObjectFingerprint $Checkpoint.UserStatePartitions.HostSafety
+    if (-not $AllowExplicitRepairHostSafetyReset) {
+        if ($actualSafety -cne $expectedSafety) {
+            throw "$($Checkpoint.Label) changed HostSafety outside explicit --repair."
+        }
     }
-    if ($registration.Uninstall.Exists) {
-        throw 'Clean-start preflight requires the A4S uninstall key to be absent.'
+    elseif ($Checkpoint.UserStatePartitions.HostSafety.Exists) {
+        throw "$($Checkpoint.Label) explicit --repair did not narrowly clear only HostSafety."
     }
-    if ($registration.Run.Present) {
-        throw 'Clean-start preflight requires the A4S Run value to be absent.'
+    foreach ($file in @($Checkpoint.KnownRootFiles | Where-Object { $_.Name -cne 'DataCache.db' })) {
+        if ($file.Present) {
+            throw "$($Checkpoint.Label) created or retained unexpected known cache/log '$($file.Name)'."
+        }
     }
-    if ($registration.CleanupRunOnce.Present -or $registration.RecoveryRunOnce.Present) {
-        throw 'Clean-start preflight requires both A4S RunOnce values to be absent.'
-    }
-    if (Test-Path -LiteralPath $versionsRoot) {
-        throw 'Clean-start preflight requires the installer-owned versions directory to be absent.'
-    }
-    if (Test-Path -LiteralPath $cleanupHelperPath) {
-        throw "Clean-start preflight requires the cleanup helper file to be absent: $cleanupHelperPath"
-    }
-    $processes = @(Get-A4SProcessRecords)
-    if ($processes.Count -ne 0) {
-        throw ('Clean-start preflight found an A4S host/setup/helper process: ' +
-            (($processes | ForEach-Object { "$($_.Name) PID $($_.Id)" }) -join ', '))
+}
+
+function Get-CleanStartRecord {
+    Assert-SafeInstallBoundary
+    $aggregate = Get-StableLifecycleAggregate -Label 'clean-start-preflight'
+    if (-not (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot)) {
+        throw 'Clean-start preflight requires no installer registration, versions, A4S process/module, cleanup helper, or non-DataCache known runtime file.'
     }
     return [ordered]@{
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
-        ExplorerPid = Get-ShellExplorerPid
-        InstallerRegistration = $registration
+        ExplorerPid = $aggregate.Snapshot.ExplorerPid
+        InstallerRegistration = $aggregate.Snapshot.InstallerRegistration
         VersionsDirectoryPresent = $false
         CleanupHelperPath = $cleanupHelperPath
         CleanupHelperPresent = $false
         A4SProcesses = @()
+        ExplorerA4SModules = @()
+        Aggregate = $aggregate
     }
+}
+
+function Wait-ForInstalledCleanupCancellation {
+    param([ValidateRange(1, 30)][int] $TimeoutSeconds = 8)
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $aggregate = Get-StableLifecycleAggregate -Label 'installed-cleanup-cancellation' `
+            -RequiredSamples 2 -TimeoutSeconds 2
+        $registration = $aggregate.Snapshot.InstallerRegistration
+        if (-not $registration.CleanupRunOnce.Present -and
+            -not $aggregate.Snapshot.Cleanup.HelperFile.Present -and
+            @($aggregate.Snapshot.Cleanup.Processes).Count -eq 0) {
+            return $aggregate
+        }
+        Start-Sleep -Milliseconds 100
+    } while ([DateTime]::UtcNow -lt $deadline)
+    throw 'A successful reinstall did not cancel and self-delete the stale cleanup helper inside the bounded interval.'
+}
+
+function Wait-ForPendingCleanupResolution {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSha256,
+        [ValidateRange(1, 30)][int] $TimeoutSeconds = 8
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    do {
+        $aggregate = Get-StableLifecycleAggregate -Label 'recovery-pending-cleanup-observation' `
+            -RequiredSamples 2 -TimeoutSeconds 2
+        if (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot) {
+            return [ordered]@{ State = 'Clean'; Aggregate = $aggregate }
+        }
+        if (-not (Test-ExactPendingCleanupSnapshot -Snapshot $aggregate.Snapshot `
+                -ExpectedSha256 $ExpectedSha256)) {
+            return [ordered]@{ State = 'Unknown'; Aggregate = $aggregate }
+        }
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $deadline)
+    return [ordered]@{ State = 'Pending'; Aggregate = $aggregate }
+}
+
+function Restore-VerifiedCleanOriginalState {
+    param(
+        [Parameter(Mandatory)] $OriginalUserState,
+        [Parameter(Mandatory)] $OriginalPartitions,
+        [Parameter(Mandatory)] $OriginalDataCache,
+        [Parameter(Mandatory)] $ExpectedAggregate
+    )
+    Assert-AggregateFingerprintImmediatelyBeforeMutation `
+        -ExpectedFingerprint $ExpectedAggregate.Fingerprint `
+        -Label 'clean-state restoration' | Out-Null
+    Restore-CleanUserStateProjection -OriginalProjection $OriginalUserState | Out-Null
+    Restore-OriginalDataCache -Original $OriginalDataCache | Out-Null
+    $aggregate = Get-StableLifecycleAggregate -Label 'recovered-clean-original-state'
+    if (-not (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot)) {
+        throw 'Recovered state is not installer-owned clean.'
+    }
+    foreach ($name in @('Config', 'Menu', 'Legacy', 'HostSafety')) {
+        if ((Get-ObjectFingerprint $aggregate.Snapshot.UserStatePartitions[$name]) -cne
+            (Get-ObjectFingerprint (Get-NamedMemberValue $OriginalPartitions $name))) {
+            throw "Recovered $name user-state partition does not match the immutable original."
+        }
+    }
+    Assert-DataCacheMatches -Actual $aggregate.Snapshot.DataCache -Expected $OriginalDataCache `
+        -Label 'Recovered clean state'
+    return $aggregate
 }
 
 function Stop-FinalHostQuiescent {
@@ -1479,69 +2284,74 @@ function Stop-FinalHostQuiescent {
 }
 
 $failure = $null
-$mutationStarted = $false
+$setupExecutionStarted = $false
 $completedSuccessfully = $false
 $originalUserState = $null
+$originalPartitions = $null
 $originalDataCache = $null
 $v1Identity = $null
 $v2Identity = $null
 $v1Payload = $null
 $v2Payload = $null
+$v1Slot = $null
+$v2Slot = $null
+$finalPreviousSlot = $null
+$finalPreviousPayload = $null
+$sessionId = $null
+$lifecycleMutexName = $null
 
 try {
+    # This independent current-user lock is held continuously through preflight,
+    # all process launches, evidence writes, and any recovery decision.
+    $lifecycleMutexName = Acquire-LifecycleMutex
+
     $reviewedV1Hash = Normalize-Sha256 $ExpectedV1SetupSha256
     $reviewedV2Hash = Normalize-Sha256 $ExpectedV2SetupSha256
     if ($reviewedV1Hash -cne $frozenV1SetupSha256) {
         throw "ExpectedV1SetupSha256 must equal the frozen reviewed V1 identity $frozenV1SetupSha256."
     }
-
     $v1Identity = Get-BinaryIdentity -Path $V1SetupPath -Description 'frozen V1 setup fixture'
     $v2Identity = Get-BinaryIdentity -Path $V2SetupPath -Description 'current V2 setup fixture'
     $script:fixturePaths = @($v1Identity.Path, $v2Identity.Path)
-    if ($v1Identity.Sha256 -cne $reviewedV1Hash) {
-        throw 'The V1 setup fixture does not match ExpectedV1SetupSha256.'
-    }
-    if ($v2Identity.Sha256 -cne $reviewedV2Hash) {
-        throw 'The V2 setup fixture does not match ExpectedV2SetupSha256.'
+    if ($v1Identity.Sha256 -cne $reviewedV1Hash -or $v2Identity.Sha256 -cne $reviewedV2Hash) {
+        throw 'A setup fixture does not match its explicit reviewed SHA-256.'
     }
     foreach ($identity in @($v1Identity, $v2Identity)) {
         if ($identity.OriginalFilename -cne 'A4SMenuSetup.exe') {
             throw "Installer fixture has the wrong OriginalFilename metadata: $($identity.Path)"
         }
     }
-    if ([Version]([string]$v1Identity.ProductVersion) -ne $expectedV1) {
-        throw "V1SetupPath must be the frozen 1.0.0.0 setup; found $($v1Identity.ProductVersion)."
+    if ([Version]([string]$v1Identity.ProductVersion) -ne $expectedV1 -or
+        [Version]([string]$v2Identity.ProductVersion) -ne $expectedV2) {
+        throw 'Installer fixtures are not exact x64 1.0.0.0 and 1.1.0.0 products.'
     }
-    if ([Version]([string]$v2Identity.ProductVersion) -ne $expectedV2) {
-        throw "V2SetupPath must be the current 1.1.0.0 setup; found $($v2Identity.ProductVersion)."
-    }
-    if ($v1Identity.Sha256 -ceq $v2Identity.Sha256) {
-        throw 'V1 and V2 setup fixtures have the same hash.'
-    }
-    foreach ($fixture in @($v1Identity, $v2Identity)) {
-        if (Test-PathWithin -Path $fixture.Path -Parent $installRoot) {
-            throw "Setup fixtures must remain outside the mutable install root: $($fixture.Path)"
-        }
-    }
+    if ($v1Identity.Sha256 -ceq $v2Identity.Sha256) { throw 'V1 and V2 fixtures have the same hash.' }
     $v1Payload = Get-SetupPayloadIdentity -SetupIdentity $v1Identity `
         -ExpectedHostSha256 $frozenV1HostSha256 -ExpectedMenuSha256 $frozenV1MenuSha256
     $v2Payload = Get-SetupPayloadIdentity -SetupIdentity $v2Identity
     $script:expectedCleanupHash = $v2Identity.Sha256
 
     $evidenceRoot = Assert-LocalAbsolutePath $EvidenceDirectory
-    if (Test-PathWithin -Path $evidenceRoot -Parent $installRoot) {
-        throw 'Evidence and recovery data must remain outside the mutable A4S install root.'
-    }
+    $installPhysical = Get-PhysicalPathRecord $installRoot
+    $v1Physical = Get-PhysicalPathRecord $v1Identity.Path
+    $v2Physical = Get-PhysicalPathRecord $v2Identity.Path
+    $evidencePhysicalBeforeCreate = Get-PhysicalPathRecord $evidenceRoot
+    $helperPhysical = Get-PhysicalPathRecord $cleanupHelperPath
+    Assert-NoPhysicalPathOverlap $installPhysical $v1Physical 'Install root and V1 fixture'
+    Assert-NoPhysicalPathOverlap $installPhysical $v2Physical 'Install root and V2 fixture'
+    Assert-NoPhysicalPathOverlap $installPhysical $evidencePhysicalBeforeCreate 'Install root and evidence root'
+    Assert-NoPhysicalPathOverlap $installPhysical $helperPhysical 'Install root and cleanup helper'
+    Assert-NoPhysicalPathOverlap $evidencePhysicalBeforeCreate $helperPhysical 'Evidence root and cleanup helper'
+    Assert-NoPhysicalPathOverlap $v1Physical $helperPhysical 'V1 fixture and cleanup helper'
+    Assert-NoPhysicalPathOverlap $v2Physical $helperPhysical 'V2 fixture and cleanup helper'
     Assert-NoReparsePointInExistingChain $evidenceRoot
-    if (-not (Test-Path -LiteralPath $evidenceRoot)) {
-        [IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null
-    }
+    if (-not (Test-Path -LiteralPath $evidenceRoot)) { [IO.Directory]::CreateDirectory($evidenceRoot) | Out-Null }
     if (-not (Test-Path -LiteralPath $evidenceRoot -PathType Container)) {
         throw "EvidenceDirectory is not a directory: $evidenceRoot"
     }
     Assert-NoReparsePointInExistingChain $evidenceRoot
-    Assert-LocalAbsolutePath $cleanupHelperPath | Out-Null
-    Assert-NoReparsePointInExistingChain $cleanupHelperPath
+    $evidencePhysical = Get-PhysicalPathRecord $evidenceRoot
+    Assert-NoPhysicalPathOverlap $installPhysical $evidencePhysical 'Install root and created evidence root'
 
     $stamp = [DateTime]::UtcNow.ToString('yyyyMMddTHHmmssfffZ')
     $sessionId = [Guid]::NewGuid().ToString('N')
@@ -1553,16 +2363,28 @@ try {
     $script:manifestPath = Join-Path $script:sessionDirectory 'pre-mutation-manifest.json'
 
     $cleanStart = Get-CleanStartRecord
-    $originalUserState = Get-StableUserStateProjection
+    $originalUserState = $cleanStart.Aggregate.Snapshot.UserState
+    $originalPartitions = $cleanStart.Aggregate.Snapshot.UserStatePartitions
     $originalUserFingerprint = Get-ObjectFingerprint $originalUserState
     $cacheBackupPath = Join-Path $script:sessionDirectory 'DataCache.db.original'
     $originalDataCache = Backup-OriginalDataCache -BackupPath $cacheBackupPath
+    Assert-DataCacheMatches -Actual $cleanStart.Aggregate.Snapshot.DataCache `
+        -Expected $originalDataCache -Label 'Pre-mutation backup'
+
     $preMutationManifest = [ordered]@{
         SchemaVersion = 2
         Purpose = 'Immutable recovery manifest captured before any installer execution'
         CreatedUtc = [DateTime]::UtcNow.ToString('o')
         SessionId = $sessionId
         CurrentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+        LifecycleMutexName = $lifecycleMutexName
+        PhysicalPaths = [ordered]@{
+            InstallRoot = $installPhysical
+            V1Fixture = $v1Physical
+            V2Fixture = $v2Physical
+            EvidenceRoot = $evidencePhysical
+            CleanupHelper = $helperPhysical
+        }
         InstallRoot = $installRoot
         VersionsRoot = $versionsRoot
         CleanupHelperPath = $cleanupHelperPath
@@ -1570,6 +2392,7 @@ try {
         Inputs = [ordered]@{ V1 = $v1Payload; V2 = $v2Payload }
         CleanStart = $cleanStart
         OriginalUserState = $originalUserState
+        OriginalUserStatePartitions = $originalPartitions
         OriginalUserStateSha256 = $originalUserFingerprint
         OriginalDataCache = $originalDataCache
         ExplorerPid = $cleanStart.ExplorerPid
@@ -1583,18 +2406,15 @@ try {
         StartedUtc = [DateTime]::UtcNow.ToString('o')
         LastUpdatedUtc = [DateTime]::UtcNow.ToString('o')
         SessionId = $sessionId
+        LifecycleMutexName = $lifecycleMutexName
         EvidencePath = $script:evidencePath
         ImmutableManifest = $manifestRecord
         Warning = 'LIVE HKCU install mutation; no --restart-explorer command is permitted.'
-        CompatibilityNotes = @(
-            'Frozen V1 uses only its documented --verify and --install commands; --self-test is intentionally not required.',
-            'Rollback is invoked by the installed V2 setup; V1 is never run over an active V2 registration.',
-            'Final V2 is deliberately left registered but host-quiescent; this harness does not restart Explorer or relaunch the host.'
-        )
         Inputs = [ordered]@{ V1 = $v1Payload; V2 = $v2Payload }
         OriginalUserStateSha256 = $originalUserFingerprint
         OriginalDataCache = $originalDataCache
         CleanStart = $cleanStart
+        OwnedAggregates = $script:ownedAggregateLedger
         Steps = [Collections.Generic.List[object]]::new()
         CacheRestorations = [Collections.Generic.List[object]]::new()
         UserStateRestoration = $null
@@ -1606,110 +2426,204 @@ try {
         Failure = $null
     }
     Write-Evidence
+    Register-OwnedAggregate -Aggregate $cleanStart.Aggregate -Kind Clean `
+        -Label 'clean-start' -Validation $cleanStart | Out-Null
+    Write-Evidence
 
-    # Any external installer execution is treated as a mutation risk, including
-    # read-only verification. The immutable manifest already exists at this point.
-    $mutationStarted = $true
+    # Even verification is treated as external mutation risk. Recovery first
+    # classifies a stable aggregate; clean state can never select uninstall.
+    $setupExecutionStarted = $true
     $probeV1 = Invoke-RecordedSetupStep -Label 'preflight-v1-verify' -SetupIdentity $v1Identity `
         -Arguments @('--verify', '--silent')
     $afterV1Probe = Get-CleanStartRecord
-    $probeV1.CleanStartAfter = $afterV1Probe
-    if ((Get-ObjectFingerprint (Get-UserStateProjection)) -cne $originalUserFingerprint) {
-        throw 'The V1 verification probe changed user-owned A4S registry state.'
+    if ($afterV1Probe.Aggregate.Fingerprint -cne $cleanStart.Aggregate.Fingerprint) {
+        throw 'The V1 verification probe changed the clean lifecycle aggregate.'
     }
-    Assert-DataCacheMatches -Actual (Get-DataCacheRecord) -Expected $originalDataCache -Label 'V1 verification probe'
+    $probeV1.CleanStartAfter = $afterV1Probe
+    Register-OwnedAggregate -Aggregate $afterV1Probe.Aggregate -Kind Clean `
+        -Label 'after-v1-verify' -Validation $afterV1Probe | Out-Null
     Write-Evidence
 
     $probeV2 = Invoke-RecordedSetupStep -Label 'preflight-v2-verify' -SetupIdentity $v2Identity `
         -Arguments @('--verify', '--silent')
     $afterV2Probe = Get-CleanStartRecord
-    $probeV2.CleanStartAfter = $afterV2Probe
-    if ((Get-ObjectFingerprint (Get-UserStateProjection)) -cne $originalUserFingerprint) {
-        throw 'The V2 verification probe changed user-owned A4S registry state.'
+    if ($afterV2Probe.Aggregate.Fingerprint -cne $cleanStart.Aggregate.Fingerprint) {
+        throw 'The V2 verification probe changed the clean lifecycle aggregate.'
     }
-    Assert-DataCacheMatches -Actual (Get-DataCacheRecord) -Expected $originalDataCache -Label 'V2 verification probe'
+    $probeV2.CleanStartAfter = $afterV2Probe
+    Register-OwnedAggregate -Aggregate $afterV2Probe.Aggregate -Kind Clean `
+        -Label 'after-v2-verify' -Validation $afterV2Probe | Out-Null
     Write-Evidence
 
+    $knownMenuHashes = @($v1Payload.Menu.Sha256, $v2Payload.Menu.Sha256)
     $installV1 = Invoke-RecordedSetupStep -Label 'install-v1-silent' -SetupIdentity $v1Identity `
         -Arguments @('--install', '--silent')
     $v1Checkpoint = Add-CheckpointToStep -Step $installV1 -Label 'installed-v1'
     $v1Slot = $v1Checkpoint.ActiveSlotPath
+    $script:knownPayloadBySlotName[[IO.Path]::GetFileName($v1Slot)] = $v1Payload
     Assert-InstalledCheckpoint -Checkpoint $v1Checkpoint -ExpectedVersion $expectedV1 `
         -ExpectedPayload $v1Payload -ExpectedActiveSlot $v1Slot `
         -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
+    Assert-ExpectedHostState -Checkpoint $v1Checkpoint -KnownMenuSha256 $knownMenuHashes
+    Assert-UserStateAndCacheInvariant -Checkpoint $v1Checkpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+    Register-OwnedAggregate -Aggregate $v1Checkpoint.Aggregate -Kind InstalledV1 `
+        -Label 'installed-v1' -Validation $v1Checkpoint | Out-Null
+    Write-Evidence
 
     $upgradeV2 = Invoke-RecordedSetupStep -Label 'upgrade-v1-to-v2-silent' -SetupIdentity $v2Identity `
         -Arguments @('--update', '--silent')
     $v2Checkpoint = Add-CheckpointToStep -Step $upgradeV2 -Label 'upgraded-v2'
     $v2Slot = $v2Checkpoint.ActiveSlotPath
+    $script:knownPayloadBySlotName[[IO.Path]::GetFileName($v2Slot)] = $v2Payload
     Assert-InstalledCheckpoint -Checkpoint $v2Checkpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
         -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
+    Assert-ExpectedHostState -Checkpoint $v2Checkpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $v2Checkpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+    Register-OwnedAggregate -Aggregate $v2Checkpoint.Aggregate -Kind InstalledV2 `
+        -Label 'upgraded-v2' -Validation $v2Checkpoint | Out-Null
+    Write-Evidence
 
-    $installedV2Setup = $v2Checkpoint.ActiveSlot.Files.Setup
-    $rollback = Invoke-RecordedSetupStep -Label 'rollback-v2-to-v1-silent' -SetupIdentity $installedV2Setup `
-        -Arguments @('--rollback', '--silent')
+    $rollback = Invoke-RecordedSetupStep -Label 'rollback-v2-to-v1-silent' `
+        -SetupIdentity $v2Checkpoint.ActiveSlot.Files.Setup -Arguments @('--rollback', '--silent')
     $rollbackCheckpoint = Add-CheckpointToStep -Step $rollback -Label 'rolled-back-v1'
     Assert-InstalledCheckpoint -Checkpoint $rollbackCheckpoint -ExpectedVersion $expectedV1 `
         -ExpectedPayload $v1Payload -ExpectedActiveSlot $v1Slot `
         -ExpectedPreviousSlot $v2Slot -ExpectedPreviousPayload $v2Payload
+    Assert-ExpectedHostState -Checkpoint $rollbackCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $rollbackCheckpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+    Register-OwnedAggregate -Aggregate $rollbackCheckpoint.Aggregate -Kind InstalledV1 `
+        -Label 'rolled-back-v1' -Validation $rollbackCheckpoint | Out-Null
+    Write-Evidence
 
-    $upgradeAgain = Invoke-RecordedSetupStep -Label 'upgrade-v1-to-v2-again-silent' -SetupIdentity $v2Identity `
-        -Arguments @('--update', '--silent')
+    $upgradeAgain = Invoke-RecordedSetupStep -Label 'upgrade-v1-to-v2-again-silent' `
+        -SetupIdentity $v2Identity -Arguments @('--update', '--silent')
     $v2AgainCheckpoint = Add-CheckpointToStep -Step $upgradeAgain -Label 'upgraded-v2-again'
     Assert-InstalledCheckpoint -Checkpoint $v2AgainCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
         -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
+    Assert-ExpectedHostState -Checkpoint $v2AgainCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $v2AgainCheckpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
+    Register-OwnedAggregate -Aggregate $v2AgainCheckpoint.Aggregate -Kind InstalledV2 `
+        -Label 'upgraded-v2-again' -Validation $v2AgainCheckpoint | Out-Null
+    Write-Evidence
 
-    $beforeRepairProjection = Get-InstallerCheckpointProjection $v2AgainCheckpoint
-    $beforeRepairFingerprint = Get-ObjectFingerprint $beforeRepairProjection
-    $installedRepairSetup = $v2AgainCheckpoint.ActiveSlot.Files.Setup
-    $repair = Invoke-RecordedSetupStep -Label 'repair-v2-same-version-silent' -SetupIdentity $installedRepairSetup `
-        -Arguments @('--repair', '--silent')
+    $beforeRepairFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $v2AgainCheckpoint)
+    $repair = Invoke-RecordedSetupStep -Label 'repair-v2-same-version-silent' `
+        -SetupIdentity $v2AgainCheckpoint.ActiveSlot.Files.Setup -Arguments @('--repair', '--silent')
     $repairCheckpoint = Add-CheckpointToStep -Step $repair -Label 'repaired-v2-same-version'
     Assert-InstalledCheckpoint -Checkpoint $repairCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
         -ExpectedPreviousSlot $v1Slot -ExpectedPreviousPayload $v1Payload
+    Assert-ExpectedHostState -Checkpoint $repairCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $repairCheckpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache `
+        -AllowExplicitRepairHostSafetyReset
     $afterRepairFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $repairCheckpoint)
     if ($afterRepairFingerprint -cne $beforeRepairFingerprint) {
-        throw 'Same-version repair changed the canonical installer registration or slot identities.'
+        throw 'Same-version repair changed canonical installer registration, slot hashes, or inventory.'
     }
     $repair.RepairNoChangeSha256 = $afterRepairFingerprint
+    Register-OwnedAggregate -Aggregate $repairCheckpoint.Aggregate -Kind InstalledV2 `
+        -Label 'repaired-v2-same-version' -Validation $repairCheckpoint | Out-Null
     Write-Evidence
 
-    $installedUninstallSetup = $repairCheckpoint.ActiveSlot.Files.Setup
-    $uninstall = Invoke-RecordedSetupStep -Label 'uninstall-v2-silent' -SetupIdentity $installedUninstallSetup `
-        -Arguments @('--uninstall', '--silent')
+    $uninstall = Invoke-RecordedSetupStep -Label 'uninstall-v2-silent' `
+        -SetupIdentity $repairCheckpoint.ActiveSlot.Files.Setup -Arguments @('--uninstall', '--silent')
     $uninstallCheckpoint = Add-CheckpointToStep -Step $uninstall -Label 'uninstalled-v2'
-    Assert-UninstalledCheckpoint $uninstallCheckpoint
+    Assert-UninstalledCheckpoint -Checkpoint $uninstallCheckpoint -AllowedSlotPaths @($v1Slot, $v2Slot)
+    if ($uninstallCheckpoint.CleanupRunOnce.Present) {
+        Assert-DataCacheMatches -Actual $uninstallCheckpoint.DataCache -Expected $originalDataCache `
+            -Label 'Pending uninstall'
+        foreach ($name in @('Config', 'Menu', 'Legacy')) {
+            if ((Get-ObjectFingerprint $uninstallCheckpoint.UserStatePartitions[$name]) -cne
+                (Get-ObjectFingerprint $originalPartitions[$name])) {
+                throw "Pending uninstall changed $name before its Explorer blocker exited."
+            }
+        }
+        $knownMappedSlots = @(
+            [ordered]@{ Slot = $v1Slot; Payload = $v1Payload },
+            [ordered]@{ Slot = $v2Slot; Payload = $v2Payload }
+        )
+        $mappedKnown = [Collections.Generic.List[object]]::new()
+        foreach ($module in @($uninstallCheckpoint.Aggregate.Snapshot.ExplorerA4SModules)) {
+            foreach ($known in $knownMappedSlots) {
+                $expectedPath = [IO.Path]::GetFullPath(
+                    (Join-Path $known.Slot 'A4SMenu.dll'))
+                if ($module.Sha256 -ceq $known.Payload.Menu.Sha256 -and
+                    ([IO.Path]::GetFullPath([string]$module.Path)).Equals($expectedPath,
+                        [StringComparison]::OrdinalIgnoreCase)) {
+                    $mappedKnown.Add($known)
+                }
+            }
+        }
+        if ($mappedKnown.Count -ne 1) {
+            throw 'Pending uninstall cleanup is not explained by one exact mapped known menu DLL.'
+        }
+        if (-not ([IO.Path]::GetFullPath([string]$mappedKnown[0].Slot)).Equals(
+                ([IO.Path]::GetFullPath($v2Slot)), [StringComparison]::OrdinalIgnoreCase)) {
+            $finalPreviousSlot = $mappedKnown[0].Slot
+            $finalPreviousPayload = $mappedKnown[0].Payload
+        }
+        $uninstallKind = 'UninstalledPending'
+    }
+    else { $uninstallKind = 'UninstalledQuiescent' }
+    Register-OwnedAggregate -Aggregate $uninstallCheckpoint.Aggregate -Kind $uninstallKind `
+        -Label 'uninstalled-v2' -Validation $uninstallCheckpoint | Out-Null
+    Write-Evidence
 
-    $finalInstall = Invoke-RecordedSetupStep -Label 'final-install-v2-silent' -SetupIdentity $v2Identity `
-        -Arguments @('--install', '--silent')
+    $finalInstall = Invoke-RecordedSetupStep -Label 'final-install-v2-silent' `
+        -SetupIdentity $v2Identity -Arguments @('--install', '--silent')
+    $finalInstall.CleanupCancellation = Wait-ForInstalledCleanupCancellation
     $finalInstallCheckpoint = Add-CheckpointToStep -Step $finalInstall -Label 'final-v2-before-restoration'
     Assert-InstalledCheckpoint -Checkpoint $finalInstallCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
+        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+    Assert-ExpectedHostState -Checkpoint $finalInstallCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    Register-OwnedAggregate -Aggregate $finalInstallCheckpoint.Aggregate -Kind FinalInstalled `
+        -Label 'final-v2-before-restoration' -Validation $finalInstallCheckpoint | Out-Null
+    Write-Evidence
 
     $script:evidence.FinalHostQuiescence = Stop-FinalHostQuiescent -Checkpoint $finalInstallCheckpoint
+    $quiescentCheckpoint = Get-ProductCheckpoint -Label 'final-v2-host-quiescent-before-restoration'
+    Assert-InstalledCheckpoint -Checkpoint $quiescentCheckpoint -ExpectedVersion $expectedV2 `
+        -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
+        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+    Assert-ExpectedHostState -Checkpoint $quiescentCheckpoint -KnownMenuSha256 $knownMenuHashes `
+        -RequireQuiescentStopped
+    Register-OwnedAggregate -Aggregate $quiescentCheckpoint.Aggregate -Kind FinalInstalled `
+        -Label 'final-v2-host-quiescent' -Validation $quiescentCheckpoint | Out-Null
     Write-Evidence
-    $finalInstallerRegistration = Get-InstallerRegistrationSnapshot
+
+    $finalInstallerRegistration = $quiescentCheckpoint.InstallerRegistration
+    Assert-AggregateFingerprintImmediatelyBeforeMutation `
+        -ExpectedFingerprint $quiescentCheckpoint.Aggregate.Fingerprint `
+        -Label 'final user-state restoration' | Out-Null
     $script:evidence.UserStateRestoration = Restore-UserStateProjection `
         -OriginalProjection $originalUserState -FinalInstallerRegistration $finalInstallerRegistration
-    Record-CacheRestoration -Original $originalDataCache -Reason 'after final V2 host became quiescent' | Out-Null
-
+    $preCacheRestoration = Get-StableLifecycleAggregate -Label 'final-pre-cache-restoration'
+    Record-CacheRestoration -Original $originalDataCache `
+        -Reason 'after final V2 host became quiescent' `
+        -ExpectedAggregate $preCacheRestoration | Out-Null
     $restoredCheckpoint = Get-ProductCheckpoint -Label 'final-v2-restored-and-quiescent'
     Assert-InstalledCheckpoint -Checkpoint $restoredCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
-    if ($restoredCheckpoint.HostStatus.State -cne 'stopped' -or
-        @($restoredCheckpoint.HostProcesses).Count -ne 0) {
-        throw 'Final host was not quiescent at the restoration checkpoint.'
-    }
+        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+    Assert-ExpectedHostState -Checkpoint $restoredCheckpoint -KnownMenuSha256 $knownMenuHashes `
+        -RequireQuiescentStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $restoredCheckpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
     if ((Get-ObjectFingerprint $restoredCheckpoint.UserStateProjection) -cne $originalUserFingerprint) {
         throw 'Final user-owned registry fingerprint does not match the immutable manifest.'
     }
-    Assert-DataCacheMatches -Actual $restoredCheckpoint.DataCache -Expected $originalDataCache -Label 'Final restoration'
     $restoredInstallerFingerprint = Get-ObjectFingerprint (Get-InstallerCheckpointProjection $restoredCheckpoint)
+    Register-OwnedAggregate -Aggregate $restoredCheckpoint.Aggregate -Kind FinalInstalled `
+        -Label 'final-v2-restored-and-quiescent' -Validation $restoredCheckpoint | Out-Null
+    Write-Evidence
 
     if ($finalQuiescenceVerificationMilliseconds -le $preloadDebounceMilliseconds) {
         throw 'Final verification interval must be longer than the product preload debounce.'
@@ -1718,24 +2632,20 @@ try {
     $stableCheckpoint = Get-ProductCheckpoint -Label 'final-v2-after-quiescence-interval'
     Assert-InstalledCheckpoint -Checkpoint $stableCheckpoint -ExpectedVersion $expectedV2 `
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
-        -ExpectedPreviousSlot $null -ExpectedPreviousPayload $null
-    if ($stableCheckpoint.HostStatus.State -cne 'stopped' -or
-        @($stableCheckpoint.HostProcesses).Count -ne 0) {
-        throw 'The host restarted during the post-restoration quiescence interval.'
-    }
+        -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
+    Assert-ExpectedHostState -Checkpoint $stableCheckpoint -KnownMenuSha256 $knownMenuHashes `
+        -RequireQuiescentStopped
+    Assert-UserStateAndCacheInvariant -Checkpoint $stableCheckpoint `
+        -OriginalPartitions $originalPartitions -OriginalDataCache $originalDataCache
     if ((Get-ObjectFingerprint (Get-InstallerCheckpointProjection $stableCheckpoint)) -cne
         $restoredInstallerFingerprint) {
         throw 'Final installer-owned registration changed during the quiescence interval.'
     }
-    if ((Get-ObjectFingerprint $stableCheckpoint.UserStateProjection) -cne $originalUserFingerprint) {
-        throw 'Final user-owned registry state changed during the quiescence interval.'
-    }
-    Assert-DataCacheMatches -Actual $stableCheckpoint.DataCache -Expected $originalDataCache `
-        -Label 'Post-quiescence verification'
     if ((Get-ShellExplorerPid) -ne $cleanStart.ExplorerPid) {
         throw 'Explorer PID changed somewhere in the lifecycle matrix.'
     }
-
+    Register-OwnedAggregate -Aggregate $stableCheckpoint.Aggregate -Kind FinalInstalled `
+        -Label 'final-v2-after-quiescence-interval' -Validation $stableCheckpoint | Out-Null
     $script:evidence.FinalStability = [ordered]@{
         VerificationMilliseconds = $finalQuiescenceVerificationMilliseconds
         PreloadDebounceMilliseconds = $preloadDebounceMilliseconds
@@ -1758,80 +2668,153 @@ catch {
             ScriptStackTrace = $_.ScriptStackTrace
             CapturedUtc = [DateTime]::UtcNow.ToString('o')
         }
-        Write-Evidence
+        try { Write-Evidence } catch {}
     }
 }
 finally {
-    if (-not $completedSuccessfully -and $mutationStarted -and $null -ne $script:evidence) {
-        $recovery = [ordered]@{
-            StartedUtc = [DateTime]::UtcNow.ToString('o')
-            SetupUninstall = $null
-            UninstalledCheckpoint = $null
-            CleanupObservation = $null
-            UserStateRestored = $false
-            DataCacheRestored = $false
-            DurableBundleRetained = $true
-            Errors = [Collections.Generic.List[string]]::new()
-        }
-        $script:evidence.Recovery = $recovery
-        $canRecover = $true
-        if ($null -ne $script:outstandingProcess) {
-            try { $script:outstandingProcess.Refresh() } catch {}
-            if (-not $script:outstandingProcess.HasExited) {
-                $canRecover = $false
-                $recovery.Errors.Add('A setup process is still running; recovery did not race or force-kill it. The immutable manifest and cache backup were retained.')
+    try {
+        if (-not $completedSuccessfully -and $setupExecutionStarted -and $null -ne $script:evidence) {
+            $recovery = [ordered]@{
+                StartedUtc = [DateTime]::UtcNow.ToString('o')
+                ManifestVerification = $null
+                InitialAggregate = $null
+                OwnedMatch = $null
+                Decision = $null
+                SetupUninstall = $null
+                UninstalledCheckpoint = $null
+                CleanupResolution = $null
+                OriginalStateRestored = $false
+                MutationPerformed = $false
+                DurableBundleRetained = $true
+                Errors = [Collections.Generic.List[string]]::new()
             }
-        }
-        if ($canRecover) {
-            try {
-                $recovery.SetupUninstall = Invoke-CapturedProcess -Label 'failure-recovery-uninstall-v2' `
-                    -FilePath $v2Identity.Path -Arguments @('--uninstall', '--silent') `
-                    -ExpectedSha256 $v2Identity.Sha256 -TimeoutSeconds $OperationTimeoutSeconds
-                Assert-ProcessSucceededWithoutExplorerRestart $recovery.SetupUninstall
-                $recovery.UninstalledCheckpoint = Get-ProductCheckpoint -Label 'failure-recovery-uninstalled'
-                Assert-UninstalledCheckpoint $recovery.UninstalledCheckpoint
-                Assert-NoTransientServicingState -Checkpoint $recovery.UninstalledCheckpoint `
-                    -AllowExactPendingCleanup
-                $recovery.CleanupObservation = $recovery.UninstalledCheckpoint.CleanupObservation
+            $script:evidence.Recovery = $recovery
+            $canClassify = $true
+            if ($null -ne $script:outstandingProcess) {
+                try { $script:outstandingProcess.Refresh() } catch {}
+                if (-not $script:outstandingProcess.HasExited) {
+                    $canClassify = $false
+                    $recovery.Errors.Add('A setup process is still running; recovery performed no mutation and retained the immutable bundle.')
+                }
             }
-            catch {
-                $canRecover = $false
-                $recovery.Errors.Add("Recovery uninstall/journal verification: $($_.Exception.Message)")
-            }
-        }
-        if ($canRecover) {
-            $cleanupPending = $recovery.UninstalledCheckpoint.CleanupRunOnce.Present -or
-                -not $recovery.CleanupObservation.Quiescent -or
-                $null -ne $recovery.CleanupObservation.HelperFile
-            if ($cleanupPending) {
-                $recovery.Errors.Add('Exact deferred cleanup is still pending; user state and DataCache were not raced. Use the immutable recovery bundle after cleanup completes.')
-            }
-            else {
+            if ($canClassify) {
                 try {
-                    Get-CleanStartRecord | Out-Null
-                    Restore-CleanUserStateProjection -OriginalProjection $originalUserState | Out-Null
-                    $recovery.UserStateRestored = $true
-                    Restore-OriginalDataCache -Original $originalDataCache | Out-Null
-                    $recovery.DataCacheRestored = $true
-                    Get-CleanStartRecord | Out-Null
-                    if ((Get-ObjectFingerprint (Get-UserStateProjection)) -cne
-                            (Get-ObjectFingerprint $originalUserState)) {
-                        throw 'Recovery user-owned registry fingerprint mismatch.'
-                    }
-                    Assert-DataCacheMatches -Actual (Get-DataCacheRecord) -Expected $originalDataCache `
-                        -Label 'Failure recovery'
+                    $recovery.ManifestVerification = Read-VerifiedImmutableManifest `
+                        -ExpectedSessionId $sessionId -ExpectedUserStateSha256 $originalUserFingerprint `
+                        -ExpectedLifecycleMutexName $lifecycleMutexName
+                    $recoveryUserState = $recovery.ManifestVerification.Manifest.OriginalUserState
+                    $recoveryPartitions =
+                        $recovery.ManifestVerification.Manifest.OriginalUserStatePartitions
+                    $recoveryDataCache = $recovery.ManifestVerification.Manifest.OriginalDataCache
+                    $current = Get-StableLifecycleAggregate -Label 'failure-recovery-initial-aggregate'
+                    $recovery.InitialAggregate = $current
+                    $owned = Find-OwnedAggregate -Fingerprint $current.Fingerprint
+                    $recovery.OwnedMatch = $owned
+                    $installerClean = Test-InstallerOwnedCleanSnapshot -Snapshot $current.Snapshot
+                    $exactPending = Test-ExactPendingCleanupSnapshot -Snapshot $current.Snapshot `
+                        -ExpectedSha256 $script:expectedCleanupHash
+                    $knownInstalled = $null -ne $owned -and $owned.Kind -in @('InstalledV1', 'InstalledV2', 'FinalInstalled') -and
+                        $null -ne $owned.Validation
+                    $knownUninstalled = $null -ne $owned -and $owned.Kind -in @('UninstalledPending', 'UninstalledQuiescent')
+                    $knownRestorableClean = $null -ne $owned -and
+                        $owned.Kind -in @('Clean', 'UninstalledQuiescent')
+                    $recovery.Decision = Get-RecoveryDecision -InstallerOwnedClean $installerClean `
+                        -ExactPendingCleanup $exactPending `
+                        -KnownOwnedRestorableClean $knownRestorableClean `
+                        -KnownOwnedInstalled $knownInstalled `
+                        -KnownOwnedUninstalled $knownUninstalled
                 }
                 catch {
-                    $recovery.Errors.Add("Clean-state restoration: $($_.Exception.Message)")
+                    $canClassify = $false
+                    $recovery.Errors.Add("Manifest/aggregate classification: $($_.Exception.Message)")
                 }
             }
+            if ($canClassify) {
+                switch ($recovery.Decision) {
+                    'RestoreCleanNoUninstall' {
+                        try {
+                            Restore-VerifiedCleanOriginalState -OriginalUserState $recoveryUserState `
+                                -OriginalPartitions $recoveryPartitions -OriginalDataCache $recoveryDataCache `
+                                -ExpectedAggregate $current | Out-Null
+                            $recovery.OriginalStateRestored = $true
+                            $recovery.MutationPerformed = $true
+                        }
+                        catch { $recovery.Errors.Add("Clean-state restoration: $($_.Exception.Message)") }
+                    }
+                    'WaitPendingNoUninstall' {
+                        try {
+                            $resolution = Wait-ForPendingCleanupResolution `
+                                -ExpectedSha256 $script:expectedCleanupHash
+                            $recovery.CleanupResolution = $resolution
+                            if ($resolution.State -ceq 'Clean') {
+                                Restore-VerifiedCleanOriginalState -OriginalUserState $recoveryUserState `
+                                    -OriginalPartitions $recoveryPartitions -OriginalDataCache $recoveryDataCache `
+                                    -ExpectedAggregate $resolution.Aggregate | Out-Null
+                                $recovery.OriginalStateRestored = $true
+                                $recovery.MutationPerformed = $true
+                            }
+                            elseif ($resolution.State -ceq 'Pending') {
+                                $recovery.Errors.Add('Exact cleanup remains blocked; recovery retained the immutable bundle and did not race it.')
+                            }
+                            else {
+                                $recovery.Errors.Add('Pending cleanup changed to unknown/concurrent state; recovery performed no mutation.')
+                            }
+                        }
+                        catch { $recovery.Errors.Add("Pending-cleanup observation: $($_.Exception.Message)") }
+                    }
+                    'UninstallKnownOwned' {
+                        try {
+                            $script:lastOwnedAggregate = $owned
+                            $recovery.SetupUninstall = Invoke-CapturedProcess `
+                                -Label 'failure-recovery-uninstall-v2' -FilePath $v2Identity.Path `
+                                -Arguments @('--uninstall', '--silent') -ExpectedSha256 $v2Identity.Sha256 `
+                                -TimeoutSeconds $OperationTimeoutSeconds -SetupLaunch
+                            Assert-ProcessSucceededWithoutExplorerRestart $recovery.SetupUninstall
+                            $recovery.MutationPerformed = $true
+                            $recovery.UninstalledCheckpoint = Get-ProductCheckpoint `
+                                -Label 'failure-recovery-uninstalled'
+                            $allowedSlots = @($v1Slot, $v2Slot) | Where-Object { $_ }
+                            Assert-UninstalledCheckpoint -Checkpoint $recovery.UninstalledCheckpoint `
+                                -AllowedSlotPaths $allowedSlots
+                            $canRestoreOriginalState = $true
+                            $restoreAggregate = $recovery.UninstalledCheckpoint.Aggregate
+                            if ($recovery.UninstalledCheckpoint.CleanupRunOnce.Present) {
+                                $resolution = Wait-ForPendingCleanupResolution `
+                                    -ExpectedSha256 $script:expectedCleanupHash
+                                $recovery.CleanupResolution = $resolution
+                                if ($resolution.State -cne 'Clean') {
+                                    $recovery.Errors.Add('Recovery uninstall cleanup remains pending/unknown; the bundle was retained and original state was not raced.')
+                                    $canRestoreOriginalState = $false
+                                }
+                                else { $restoreAggregate = $resolution.Aggregate }
+                            }
+                            if ($canRestoreOriginalState) {
+                                Restore-VerifiedCleanOriginalState -OriginalUserState $recoveryUserState `
+                                    -OriginalPartitions $recoveryPartitions -OriginalDataCache $recoveryDataCache `
+                                    -ExpectedAggregate $restoreAggregate | Out-Null
+                                $recovery.OriginalStateRestored = $true
+                            }
+                        }
+                        catch { $recovery.Errors.Add("Owned-state recovery uninstall: $($_.Exception.Message)") }
+                    }
+                    'ObserveUninstalledNoUninstall' {
+                        $recovery.Errors.Add('Previously owned uninstalled state is no longer exact pending/clean; recovery performed no mutation.')
+                    }
+                    default {
+                        $recovery.Errors.Add('Unknown or concurrent lifecycle state; recovery performed no mutation and retained the immutable bundle.')
+                    }
+                }
+            }
+            $recovery.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            try { Write-Evidence } catch {}
         }
-        $recovery.CompletedUtc = [DateTime]::UtcNow.ToString('o')
-        Write-Evidence
+        # Recovery files are retained on every path. They are the only authority
+        # when cleanup remains blocked or any aggregate becomes unknown.
+        try { Write-Evidence } catch {}
     }
-    # Recovery files are intentionally retained. On any uncertainty they are the
-    # only durable authority; on success they preserve an auditable qualification.
-    Write-Evidence
+    finally {
+        Release-LifecycleMutex
+    }
 }
 
 if ($null -ne $failure) {

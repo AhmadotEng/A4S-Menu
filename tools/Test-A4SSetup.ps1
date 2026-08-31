@@ -249,6 +249,8 @@ if ($setupSource.IndexOf('RestoreRegistrationBestEffort', [StringComparison]::Or
 $installSource = Get-SourceSection -Source $setupSource -StartMarker 'int InstallOrRepair(' -EndMarker 'int Rollback('
 Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSource -Markers @(
     'DeploySlot(payloads, oldState.activeSlot)',
+    'InspectExplorerA4SModule(ExplorerProcessId())',
+    'previous = mapped.validatedSlot',
     'BeginJournal(',
     'QueueJournalRecovery(recoveryCommand)',
     'StopHost()',
@@ -256,9 +258,9 @@ Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSou
     'MarkJournalReady()',
     'CommitSlotStartup(newSlot)',
     'CompleteJournal(journal)')
-if ($installSource.IndexOf('resetSafety = options.operation == Operation::Repair',
+if ($installSource.IndexOf('resetSafety = options.resetSafety',
         [StringComparison]::Ordinal) -lt 0) {
-    throw 'Explicit repair no longer requests a post-commit HostSafety reset.'
+    throw 'Install/repair no longer uses the explicitly parsed HostSafety reset request.'
 }
 
 $uninstallSource = Get-SourceSection -Source $setupSource -StartMarker 'int Uninstall(' -EndMarker 'int Cleanup('
@@ -271,6 +273,42 @@ Assert-SourceOrder -Description 'Uninstall transaction' -Source $uninstallSource
     'CommitUnregisteredStartup()',
     'CompleteJournal(journal)',
     'StartPreparedCleanup(')
+
+$cleanupSource = Get-SourceSection -Source $setupSource -StartMarker 'int Cleanup(' -EndMarker 'bool IsSwitch('
+Assert-SourceOrder -Description 'Deferred cleanup cancellation' -Source $cleanupSource -Markers @(
+    'FullPath(CleanupHelperPath())',
+    'WaitForProcessId(options.waitProcessId)',
+    'WaitForProcessOrInstalledState(options.waitExplorerId)',
+    'AcquireSetupMutex()',
+    'ReconcilePendingJournal()',
+    'InstalledRegistrationPresent()',
+    'RegistrationMatchesCommittedSlot(',
+    'RemoveCanonicalCleanupStateForHelper()',
+    'RequestNativeSelfDelete()')
+if ($cleanupSource.IndexOf('WaitForProcessId(options.waitExplorerId)',
+        [StringComparison]::Ordinal) -ge 0 -or
+    $cleanupSource.IndexOf('DeleteValueChecked(kRunOnceKey, kCleanupRunOnceValue)',
+        [StringComparison]::Ordinal) -ge 0) {
+    throw 'Deferred cleanup can still wait forever or remove non-canonical cleanup registration.'
+}
+
+$installedRegistrationSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool InstalledRegistrationPresent()' -EndMarker 'enum class CleanupWaitResult'
+if ($installedRegistrationSource.IndexOf('ReadRawValue(spec).present',
+        [StringComparison]::Ordinal) -lt 0 -or
+    $installedRegistrationSource.IndexOf('ReadString(', [StringComparison]::Ordinal) -ge 0) {
+    throw 'Deferred cleanup no longer treats every raw installer registration type as authoritative.'
+}
+
+$parseSource = Get-SourceSection -Source $setupSource -StartMarker 'Options ParseOptions(' -EndMarker 'bool Confirm('
+Assert-SourceOrder -Description 'Explicit HostSafety reset parsing' -Source $parseSource -Markers @(
+    'IsSwitch(argument, L"--repair")',
+    'options.resetSafety = true',
+    'IsSwitch(argument, L"--update")')
+if ($parseSource.IndexOf('IsSwitch(argument, L"--update") && SelectOperation(options, Operation::Repair)) {}',
+        [StringComparison]::Ordinal) -lt 0) {
+    throw '--update no longer selects repair behavior without resetting HostSafety.'
+}
 
 $failureSource = Get-SourceSection -Source $setupSource -StartMarker '[[noreturn]] void RestoreFailedOperation(' -EndMarker 'int InstallOrRepair('
 Assert-SourceOrder -Description 'Failed-operation rollback' -Source $failureSource -Markers @(

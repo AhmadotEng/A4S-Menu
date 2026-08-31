@@ -202,6 +202,9 @@ namespace
         Operation operation = Operation::Automatic;
         bool silent = false;
         bool restartExplorer = false;
+        // Only an explicit --repair is allowed to clear HostSafety. --update,
+        // automatic install/repair, rollback, and install preserve user state.
+        bool resetSafety = false;
         std::wstring extractPath;
         DWORD waitProcessId = 0;
         DWORD waitExplorerId = 0;
@@ -1092,18 +1095,15 @@ namespace
         return RawValueEquals(spec, REG_DWORD, &expected, sizeof(expected));
     }
 
-    bool RegistrationMatchesSlot(const std::wstring &active, const std::wstring &previous,
-        const std::wstring &recoveryCommand)
+    bool RegistrationMatchesInstalledCore(const std::wstring &active,
+        const std::wstring &previous)
     {
         if (!ValidateSlotBasic(active))
             return false;
         const std::wstring host = Join(active, A4S_PRODUCT_HOST_FILENAME_W);
         const std::wstring setup = Join(active, kSetupFilename);
         const ProductVersion version = FileProductVersion(host);
-        const RegistryValueSpec cleanup = { kRunOnceKey, kCleanupRunOnceValue };
-        return !ReadRawValue(cleanup).present &&
-            StringValueEquals(kRunOnceKey, kRecoveryRunOnceValue, recoveryCommand) &&
-            StringValueEquals(kRunKey, kRunValue, Quote(host)) &&
+        return StringValueEquals(kRunKey, kRunValue, Quote(host)) &&
             StringValueEquals(kUninstallKey, L"DisplayName", L"A4S Menu") &&
             StringValueEquals(kUninstallKey, L"DisplayVersion", VersionText(version)) &&
             StringValueEquals(kUninstallKey, L"Publisher", L"A4SMenu Project") &&
@@ -1119,6 +1119,24 @@ namespace
             StringValueEquals(kStateKey, L"PreviousSlot", previous) &&
             StringValueEquals(kStateKey, L"InstallVersion", VersionText(version)) &&
             StringValueEquals(kStateKey, L"ActiveSlot", active);
+    }
+
+    bool RegistrationMatchesSlot(const std::wstring &active, const std::wstring &previous,
+        const std::wstring &recoveryCommand)
+    {
+        const RegistryValueSpec cleanup = { kRunOnceKey, kCleanupRunOnceValue };
+        return !ReadRawValue(cleanup).present &&
+            StringValueEquals(kRunOnceKey, kRecoveryRunOnceValue, recoveryCommand) &&
+            RegistrationMatchesInstalledCore(active, previous);
+    }
+
+    bool RegistrationMatchesCommittedSlot(const std::wstring &active,
+        const std::wstring &previous)
+    {
+        const RegistryValueSpec cleanup = { kRunOnceKey, kCleanupRunOnceValue };
+        const RegistryValueSpec recovery = { kRunOnceKey, kRecoveryRunOnceValue };
+        return !ReadRawValue(cleanup).present && !ReadRawValue(recovery).present &&
+            RegistrationMatchesInstalledCore(active, previous);
     }
 
     bool RegistrationMatchesUninstalled(const std::wstring &cleanupCommand)
@@ -1417,26 +1435,43 @@ namespace
         return processId;
     }
 
-    bool ExplorerHasA4SModule(DWORD processId)
+    struct ExplorerModuleObservation
+    {
+        bool mapped = false;
+        std::wstring validatedSlot;
+    };
+
+    ExplorerModuleObservation InspectExplorerA4SModule(DWORD processId)
     {
         if (!processId)
-            return false;
+            return {};
         UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId));
         if (!snapshot)
-            return true; // Fail closed: an unknown live mapping requires a restart boundary.
+            return { true, L"" }; // Fail closed: an unknown live mapping requires a restart boundary.
         MODULEENTRY32W entry = {};
         entry.dwSize = sizeof(entry);
         if (!Module32FirstW(snapshot.get(), &entry))
-            return true;
+            return { true, L"" };
         do
         {
             const wchar_t *filename = wcsrchr(entry.szExePath, L'\\');
             filename = filename ? filename + 1 : entry.szExePath;
             if (_wcsicmp(filename, A4S_PRODUCT_DLL_FILENAME_W) == 0)
-                return true;
+            {
+                const std::wstring modulePath = FullPath(entry.szExePath);
+                const size_t slash = modulePath.find_last_of(L"\\/");
+                const std::wstring slot = slash == std::wstring::npos ? L"" :
+                    modulePath.substr(0, slash);
+                return { true, ValidateSlotBasic(slot) ? slot : L"" };
+            }
         }
         while (Module32NextW(snapshot.get(), &entry));
-        return false;
+        return {};
+    }
+
+    bool ExplorerHasA4SModule(DWORD processId)
+    {
+        return InspectExplorerA4SModule(processId).mapped;
     }
 
     bool StartHost(const std::wstring &slot)
@@ -1546,6 +1581,48 @@ namespace
         UniqueHandle process(OpenProcess(SYNCHRONIZE, FALSE, processId));
         if (process)
             WaitForSingleObject(process.get(), INFINITE);
+    }
+
+    bool InstalledRegistrationPresent()
+    {
+        for (const auto &spec : kRegistrationValues)
+        {
+            if (_wcsicmp(spec.keyPath, kRunOnceKey) == 0 &&
+                (_wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0 ||
+                    _wcsicmp(spec.valueName, kRecoveryRunOnceValue) == 0))
+                continue;
+            if (ReadRawValue(spec).present)
+                return true;
+        }
+        return false;
+    }
+
+    enum class CleanupWaitResult
+    {
+        BlockerExited,
+        InstalledStateObserved,
+    };
+
+    CleanupWaitResult WaitForProcessOrInstalledState(DWORD processId)
+    {
+        if (!processId || processId == GetCurrentProcessId())
+            return CleanupWaitResult::BlockerExited;
+        UniqueHandle process(OpenProcess(SYNCHRONIZE, FALSE, processId));
+        if (!process)
+            return CleanupWaitResult::BlockerExited;
+        while (true)
+        {
+            const DWORD wait = WaitForSingleObject(process.get(), 100);
+            if (wait == WAIT_OBJECT_0)
+                return CleanupWaitResult::BlockerExited;
+            if (wait != WAIT_TIMEOUT)
+                return CleanupWaitResult::BlockerExited;
+            // A reinstall can commit while this old helper waits for Explorer's
+            // image mapping. Wake promptly; the setup mutex and a second check
+            // below distinguish a committed install from a transient write.
+            if (InstalledRegistrationPresent())
+                return CleanupWaitResult::InstalledStateObserved;
+        }
     }
 
     void RequestNativeSelfDelete()
@@ -1695,6 +1772,15 @@ namespace
         return command;
     }
 
+    void RemoveCanonicalCleanupStateForHelper()
+    {
+        const std::wstring expected = CleanupCommand(CleanupHelperPath(), 0, 0);
+        if (!StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, expected))
+            return;
+        DeleteValueChecked(kRunOnceKey, kCleanupRunOnceValue);
+        FlushKeyChecked(kRunOnceKey, true);
+    }
+
     std::wstring RecoveryCommand(const std::wstring &setup)
     {
         const std::wstring command = Quote(setup) + L" --reconcile --silent";
@@ -1798,10 +1884,22 @@ namespace
         const std::wstring newSlot = DeploySlot(payloads, oldState.activeSlot);
         if (!ValidateSlotBasic(newSlot))
             Fail(ERROR_FILE_CORRUPT, L"The deployed A4S Menu slot failed its final identity validation.");
-        const std::wstring previous = oldState.activeSlot != newSlot &&
+        std::wstring previous = oldState.activeSlot != newSlot &&
             ValidateSlotBasic(oldState.activeSlot) ? oldState.activeSlot :
             (ValidateSlotBasic(oldState.previousSlot) ? oldState.previousSlot : L"");
-        const bool resetSafety = options.operation == Operation::Repair;
+        if (previous.empty())
+        {
+            // A reinstall can race a deferred uninstall helper while Explorer
+            // still maps the old DLL. The helper must cancel promptly, so keep
+            // that exact validated slot as the registered rollback slot rather
+            // than pruning it into an unregistered, partially locked orphan.
+            const ExplorerModuleObservation mapped =
+                InspectExplorerA4SModule(ExplorerProcessId());
+            if (!mapped.validatedSlot.empty() &&
+                _wcsicmp(mapped.validatedSlot.c_str(), newSlot.c_str()) != 0)
+                previous = mapped.validatedSlot;
+        }
+        const bool resetSafety = options.resetSafety;
         const std::wstring recoveryCommand = RecoveryCommand(Join(newSlot, kSetupFilename));
         const ServicingJournal journal = BeginJournal(JournalTarget::Installed,
             newSlot, previous, L"", recoveryCommand, resetSafety);
@@ -1939,21 +2037,49 @@ namespace
 
     int Cleanup(const Options &options)
     {
+        if (_wcsicmp(FullPath(ModulePath()).c_str(),
+                FullPath(CleanupHelperPath()).c_str()) != 0)
+            Fail(ERROR_INVALID_NAME, L"Deferred cleanup may run only from the canonical per-user helper path.");
         WaitForProcessId(options.waitProcessId);
-        WaitForProcessId(options.waitExplorerId);
+        const CleanupWaitResult blocker = WaitForProcessOrInstalledState(options.waitExplorerId);
         const OwnedMutex setupMutex = AcquireSetupMutex();
+        // The wake-up registration may have been only a partially committed
+        // transaction when the setup process crashed. Reconcile it under the
+        // same servicing mutex before deciding whether reinstall really won.
         ReconcilePendingJournal();
+        if (blocker == CleanupWaitResult::InstalledStateObserved || InstalledRegistrationPresent())
+        {
+            const InstalledState installed = ReadInstalledState();
+            if (RegistrationMatchesCommittedSlot(installed.activeSlot, installed.previousSlot))
+            {
+                // Reinstall won the race. Never delete product state or files:
+                // remove only this helper's exact retry value, unlink this
+                // canonical helper image, and leave the committed install.
+                RemoveCanonicalCleanupStateForHelper();
+                RequestNativeSelfDelete();
+                return ERROR_SUCCESS;
+            }
+            if (InstalledRegistrationPresent())
+                return ERROR_INVALID_STATE;
+        }
         // --cleanup is an internal post-uninstall continuation, not an
         // alternate uninstall entry point. Refuse it while either authoritative
         // product registration still says the runtime is installed.
-        if (!ReadString(HKEY_CURRENT_USER, kStateKey, L"ActiveSlot").empty() ||
-            !ReadString(HKEY_CURRENT_USER, kRunKey, kRunValue).empty())
-            return ERROR_INSTALL_ALREADY_RUNNING;
+        if (InstalledRegistrationPresent())
+            return ERROR_INVALID_STATE;
+        const std::wstring expectedCleanup = CleanupCommand(CleanupHelperPath(), 0, 0);
+        if (!StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, expectedCleanup))
+        {
+            // This process no longer owns cleanup registration. Preserve unknown
+            // state and files, but remove this deterministic helper image.
+            RequestNativeSelfDelete();
+            return ERROR_INVALID_STATE;
+        }
         if (!CleanupKnownInstallTree())
             return ERROR_DIR_NOT_EMPTY;
         DeleteTreeChecked(kUninstallKey);
         DeleteTreeChecked(kStateKey);
-        DeleteValueChecked(kRunOnceKey, kCleanupRunOnceValue);
+        RemoveCanonicalCleanupStateForHelper();
         RequestNativeSelfDelete();
         return ERROR_SUCCESS;
     }
@@ -1994,8 +2120,9 @@ namespace
             else if (IsSwitch(argument, L"--restart-explorer"))
                 options.restartExplorer = true;
             else if (IsSwitch(argument, L"--install") && SelectOperation(options, Operation::Install)) {}
-            else if ((IsSwitch(argument, L"--repair") || IsSwitch(argument, L"--update")) &&
-                SelectOperation(options, Operation::Repair)) {}
+            else if (IsSwitch(argument, L"--repair") && SelectOperation(options, Operation::Repair))
+                options.resetSafety = true;
+            else if (IsSwitch(argument, L"--update") && SelectOperation(options, Operation::Repair)) {}
             else if (IsSwitch(argument, L"--uninstall") && SelectOperation(options, Operation::Uninstall)) {}
             else if (IsSwitch(argument, L"--rollback") && SelectOperation(options, Operation::Rollback)) {}
             else if (IsSwitch(argument, L"--verify") && SelectOperation(options, Operation::Verify)) {}
