@@ -666,9 +666,12 @@ namespace
             Fail(ERROR_FILE_CORRUPT, L"The selected A4S Menu version is incomplete.");
         const std::wstring host = Join(active, A4S_PRODUCT_HOST_FILENAME_W);
         const std::wstring setup = Join(active, kSetupFilename);
+        const std::wstring startupCommand = Quote(host);
+        if (startupCommand.size() >= 260U)
+            Fail(ERROR_FILENAME_EXCED_RANGE, L"The per-user startup command exceeds the Windows Run-key limit.");
 
         auto run = OpenOrCreateKey(kRunKey);
-        SetString(run.get(), kRunValue, Quote(host));
+        SetString(run.get(), kRunValue, startupCommand);
 
         auto uninstall = OpenOrCreateKey(kUninstallKey);
         SetString(uninstall.get(), L"DisplayName", L"A4S Menu");
@@ -814,13 +817,17 @@ namespace
         if (registration == ERROR_SUCCESS)
         {
             shutdown = RmShutdown(session, RmForceShutdown, nullptr);
-            if (shutdown == ERROR_SUCCESS)
-                restart = RmRestart(session, 0, nullptr);
+            // Restart Manager requires RmRestart even when RmShutdown reports
+            // that not every registered application stopped. Explorer may also
+            // restart itself, so the PID transition below is authoritative.
+            restart = RmRestart(session, 0, nullptr);
         }
         RmEndSession(session);
-        if (registration != ERROR_SUCCESS || shutdown != ERROR_SUCCESS || restart != ERROR_SUCCESS)
+        if (registration != ERROR_SUCCESS)
             return false;
-        WaitForSingleObject(explorer.get(), kRestartTimeoutMs);
+        const DWORD oldExit = WaitForSingleObject(explorer.get(), kRestartTimeoutMs);
+        if (oldExit != WAIT_OBJECT_0)
+            return false;
         const ULONGLONG deadline = GetTickCount64() + kRestartTimeoutMs;
         while (GetTickCount64() < deadline)
         {
@@ -829,6 +836,27 @@ namespace
                 return true;
             Sleep(50);
         }
+        // A Restart Manager participant is restartable only if it registered
+        // for application restart. Explorer normally recreates its shell on
+        // exit, but explicitly launch it after the consented shutdown if that
+        // did not happen. No launch occurs unless the old PID really exited.
+        SHELLEXECUTEINFOW execute = {};
+        execute.cbSize = sizeof(execute);
+        execute.fMask = SEE_MASK_NOASYNC;
+        execute.lpFile = L"explorer.exe";
+        execute.nShow = SW_SHOWNORMAL;
+        if (!ShellExecuteExW(&execute))
+            return false;
+        const ULONGLONG fallbackDeadline = GetTickCount64() + kRestartTimeoutMs;
+        while (GetTickCount64() < fallbackDeadline)
+        {
+            const DWORD replacement = ExplorerProcessId();
+            if (replacement && replacement != processId)
+                return true;
+            Sleep(50);
+        }
+        (void)shutdown;
+        (void)restart;
         return false;
     }
 
@@ -859,7 +887,7 @@ namespace
         // copy while its image section is still mapped. Failure is harmless:
         // there is only one deterministic helper path and a future uninstall
         // reuses or replaces that exact file.
-        UniqueHandle file(CreateFileW(ModulePath().c_str(), DELETE | FILE_READ_ATTRIBUTES,
+        UniqueHandle file(CreateFileW(ModulePath().c_str(), DELETE | FILE_READ_ATTRIBUTES | FILE_WRITE_ATTRIBUTES,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
             FILE_ATTRIBUTE_NORMAL, nullptr));
         if (!file)
@@ -946,6 +974,8 @@ namespace
 
         auto runOnce = OpenOrCreateKey(kRunOnceKey);
         const std::wstring retry = CleanupCommand(helper, 0, 0);
+        if (retry.size() >= 260U)
+            Fail(ERROR_FILENAME_EXCED_RANGE, L"The deferred-cleanup command exceeds the Windows RunOnce limit.");
         SetString(runOnce.get(), kCleanupRunOnceValue, retry);
 
         std::wstring immediate = CleanupCommand(helper, GetCurrentProcessId(), explorerPid);
