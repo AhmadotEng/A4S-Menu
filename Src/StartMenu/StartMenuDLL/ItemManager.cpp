@@ -13,6 +13,7 @@
 #include "MenuContainer.h"
 #include "LogManager.h"
 #include "StartMenuDLL.h"
+#include "A4SPerformance.h"
 #include "resource.h"
 #include <propkey.h>
 #include <CommonControls.h>
@@ -891,6 +892,9 @@ static bool ComparePidls( PIDLIST_ABSOLUTE pidl1, PIDLIST_ABSOLUTE pidl2 )
 const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDLIST_ABSOLUTE pidl, int refreshFlags, TLocation location )
 {
 	Assert(!RWLock::ThreadHasReadLock(RWLOCK_ITEMS));
+#ifdef A4S_PRODUCT
+	const UINT32 requestedIconFlags=static_cast<UINT32>(refreshFlags&INFO_ICON);
+#endif
 	if ((refreshFlags&INFO_METRO) && GetWinVersion()<WIN_VER_WIN8)
 		refreshFlags&=~INFO_METRO;
 	CComString pName;
@@ -971,6 +975,13 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 		}
 		refreshFlags&=~pInfo->validFlags;
 	}
+#ifdef A4S_PRODUCT
+	if (requestedIconFlags && !(refreshFlags&INFO_ICON))
+	{
+		A4SPerformanceScope iconCacheScope(A4S_PERF_ICON_LOAD,requestedIconFlags);
+		iconCacheScope.SetResult(requestedIconFlags,TRUE);
+	}
+#endif
 
 	if (refreshFlags)
 	{
@@ -992,6 +1003,9 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 {
 	Assert(!RWLock::ThreadHasReadLock(RWLOCK_ITEMS));
 	Assert(!path.IsEmpty());
+#ifdef A4S_PRODUCT
+	const UINT32 requestedIconFlags=static_cast<UINT32>(refreshFlags&INFO_ICON);
+#endif
 	if ((refreshFlags&INFO_METRO) && GetWinVersion()<WIN_VER_WIN8)
 		refreshFlags&=~INFO_METRO;
 	CString PATH=path;
@@ -1058,6 +1072,13 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 		}
 		refreshFlags&=~pInfo->validFlags;
 	}
+#ifdef A4S_PRODUCT
+	if (requestedIconFlags && !(refreshFlags&INFO_ICON))
+	{
+		A4SPerformanceScope iconCacheScope(A4S_PERF_ICON_LOAD,requestedIconFlags);
+		iconCacheScope.SetResult(requestedIconFlags,TRUE);
+	}
+#endif
 
 	if (refreshFlags)
 	{
@@ -1859,6 +1880,11 @@ CString GetPropertyStoreString( IPropertyStore *pStore, REFPROPERTYKEY key )
 // doesn't require the lock to be held
 void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellItem *pItem0, bool bHasWriteLock )
 {
+#ifdef A4S_PRODUCT
+	const UINT32 requestedIconFlags=static_cast<UINT32>(refreshFlags&INFO_ICON);
+	A4SPerformanceScope iconScope(A4S_PERF_ICON_LOAD,requestedIconFlags!=0,
+		requestedIconFlags);
+#endif
 	ItemInfo newInfo;
 
 	{
@@ -2149,6 +2175,9 @@ void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellIte
 			pInfo->validFlags|=refreshFlags&INFO_DATA;
 		pInfo->refreshFlags&=~refreshFlags;
 	}
+#ifdef A4S_PRODUCT
+	iconScope.SetResult(requestedIconFlags,FALSE);
+#endif
 }
 
 void CItemManager::RefreshInfos( void )
@@ -2901,6 +2930,10 @@ void CItemManager::PreloadItemsThread( void )
 	HANDLE handles[NUM_WATCHED_DIRS+1];
 	DWORD dirMasks[NUM_WATCHED_DIRS]={0};
 	DWORD dirMask=0xFFFFFFFF;
+#ifdef A4S_PRODUCT
+	UINT64 preloadOperation=BeginA4SPerformanceOperation(A4S_PERF_PRELOAD);
+	UINT32 preloadedFolders=0;
+#endif
 	while (1)
 	{
 		for (int i=0;i<_countof(g_CacheFolders);i++)
@@ -2969,9 +3002,21 @@ void CItemManager::PreloadItemsThread( void )
 				else
 					LoadMetroItems(refreshFlags);
 			}
+#ifdef A4S_PRODUCT
+			preloadedFolders++;
+#endif
 		}
 		if (dirMask==0xFFFFFFFF)
+		{
 			SetEvent(m_DoneEvent);
+#ifdef A4S_PRODUCT
+			if (preloadOperation)
+			{
+				EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
+				preloadOperation=0;
+			}
+#endif
+		}
 		if (dirCount==0)
 			break;
 		handles[dirCount]=m_ExitEvent;
@@ -2988,6 +3033,10 @@ void CItemManager::PreloadItemsThread( void )
 	}
 	for (int i=0;i<dirCount;i++)
 		FindCloseChangeNotification(handles[i]);
+#ifdef A4S_PRODUCT
+	if (preloadOperation)
+		EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
+#endif
 }
 
 DWORD CALLBACK CItemManager::StaticPreloadItemsThread( void *param )

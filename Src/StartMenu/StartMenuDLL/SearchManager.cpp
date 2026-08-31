@@ -15,6 +15,7 @@
 #include "ResourceHelper.h"
 #include "LogManager.h"
 #include "Translations.h"
+#include "A4SPerformance.h"
 #include <propkey.h>
 #include <searchapi.h>
 #include <ntquery.h>
@@ -55,6 +56,9 @@ CSearchManager::~CSearchManager( void )
 
 bool CSearchManager::Init( void )
 {
+#ifdef A4S_PRODUCT
+	A4SPerformanceScope searchScope(A4S_PERF_SEARCH_INITIALIZATION);
+#endif
 	m_bInitialized=true;
 	for (int i=0;i<LOCK_COUNT;i++)
 		InitializeCriticalSection(&m_CriticalSections[i]);
@@ -80,6 +84,9 @@ bool CSearchManager::Init( void )
 	}
 	m_MainThreadId=GetCurrentThreadId();
 	LoadItemRanks();
+#ifdef A4S_PRODUCT
+	searchScope.SetResult(static_cast<UINT32>(m_SearchThreadCount));
+#endif
 	return true;
 }
 
