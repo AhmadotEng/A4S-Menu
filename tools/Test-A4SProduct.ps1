@@ -107,6 +107,13 @@ function Assert-ExactDependencies {
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$identityPath = Join-Path $repoRoot 'Src\A4SMenu\Shared\A4SProductIdentity.h'
+$identityText = Get-Content -LiteralPath $identityPath -Raw
+$versionMatch = [Regex]::Match($identityText, '(?m)^#define\s+A4S_PRODUCT_VERSION_STR_A\s+"([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)"\s*$')
+if (-not $versionMatch.Success) {
+    throw "Could not derive the product version from $identityPath."
+}
+$expectedProductVersion = $versionMatch.Groups[1].Value
 $stageDir = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build\stage\A4SProduct'))
 $hostExePath = Join-Path $stageDir 'A4SMenuHost.exe'
 $menuDllPath = Join-Path $stageDir 'A4SMenu.dll'
@@ -184,7 +191,7 @@ if ($dllInfo.OriginalFilename -ne 'A4SMenu.dll') {
     throw "Unexpected DLL OriginalFilename: $($dllInfo.OriginalFilename)"
 }
 foreach ($binaryInfo in @($hostInfo, $dllInfo)) {
-    if ($binaryInfo.FileVersion -ne '1.0.0.0' -or $binaryInfo.ProductVersion -ne '1.0.0.0') {
+    if ($binaryInfo.FileVersion -ne $expectedProductVersion -or $binaryInfo.ProductVersion -ne $expectedProductVersion) {
         throw "Product version drift in $($binaryInfo.OriginalFilename): file=$($binaryInfo.FileVersion), product=$($binaryInfo.ProductVersion)"
     }
 }

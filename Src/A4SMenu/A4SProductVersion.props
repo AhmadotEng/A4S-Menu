@@ -3,7 +3,7 @@
   <!-- Import this before Common.props so its resource macros expand to the
        product version even in direct IDE/MSBuild builds. -->
   <PropertyGroup>
-    <CS_VERSION>1.0.0</CS_VERSION>
-    <CS_VERSION_ORIG>1.0.0.0</CS_VERSION_ORIG>
+    <CS_VERSION>1.1.0</CS_VERSION>
+    <CS_VERSION_ORIG>1.1.0.0</CS_VERSION_ORIG>
   </PropertyGroup>
 </Project>

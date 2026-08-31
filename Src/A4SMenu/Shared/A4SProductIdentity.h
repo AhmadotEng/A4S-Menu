@@ -24,8 +24,8 @@
 #define A4S_DLL_HOOK_INJECT_EXPORT_A          "A4SMenu_HookInject"
 
 #define A4S_PRODUCT_VERSION_MAJOR             1
-#define A4S_PRODUCT_VERSION_MINOR             0
+#define A4S_PRODUCT_VERSION_MINOR             1
 #define A4S_PRODUCT_VERSION_PATCH             0
 #define A4S_PRODUCT_VERSION_BUILD             0
-#define A4S_PRODUCT_VERSION_STR_A             "1.0.0.0"
-#define A4S_PRODUCT_VERSION_STR_W             L"1.0.0.0"
+#define A4S_PRODUCT_VERSION_STR_A             "1.1.0.0"
+#define A4S_PRODUCT_VERSION_STR_W             L"1.1.0.0"
