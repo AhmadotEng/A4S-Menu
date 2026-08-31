@@ -72,6 +72,86 @@ static bool g_bA4SStartLeftCapture;
 static bool g_bA4SQueuedStartLeftCapture;
 static const LPARAM A4S_MOUSE_TOGGLE=0x4134534D; // "A4SM"
 #ifdef A4S_PRODUCT
+static HHOOK g_A4SKeyboardHook;
+
+struct A4SWinKeyState
+{
+	bool leftDown;
+	bool rightDown;
+	bool leftChorded;
+	bool rightChorded;
+};
+
+struct A4SWinKeyRoute
+{
+	A4SWinKeyState state;
+	bool claimLoneRelease;
+};
+
+// This state machine is deliberately independent of shell implementation
+// details. A Windows-key down is observed but never swallowed. Any other key
+// pressed while it is held permanently marks that gesture as a chord. Only an
+// unmatched Windows-key release can be claimed by A4S; therefore Win+R/E/L/X,
+// Win+Tab, accessibility chords, and future Windows shortcuts remain native.
+constexpr A4SWinKeyRoute RouteA4SWinKey(A4SWinKeyState state, UINT virtualKey,
+	bool keyDown, bool modifierAlreadyDown)
+{
+	A4SWinKeyRoute result={state,false};
+	const bool left=virtualKey==VK_LWIN;
+	const bool right=virtualKey==VK_RWIN;
+	if (left || right)
+	{
+		bool &down=left?result.state.leftDown:result.state.rightDown;
+		bool &chorded=left?result.state.leftChorded:result.state.rightChorded;
+		bool &otherDown=left?result.state.rightDown:result.state.leftDown;
+		bool &otherChorded=left?result.state.rightChorded:result.state.leftChorded;
+		if (keyDown)
+		{
+			if (!down)
+			{
+				down=true;
+				chorded=modifierAlreadyDown || otherDown;
+				if (otherDown)
+					otherChorded=true;
+			}
+		}
+		else
+		{
+			result.claimLoneRelease=down && !chorded && !otherDown;
+			down=false;
+			chorded=false;
+		}
+	}
+	else if (keyDown)
+	{
+		if (result.state.leftDown)
+			result.state.leftChorded=true;
+		if (result.state.rightDown)
+			result.state.rightChorded=true;
+	}
+	return result;
+}
+
+constexpr A4SWinKeyState A4S_EMPTY_WIN_KEY_STATE={false,false,false,false};
+constexpr A4SWinKeyRoute A4S_TEST_LONE_DOWN=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_LWIN,true,false);
+constexpr A4SWinKeyRoute A4S_TEST_LONE_UP=RouteA4SWinKey(A4S_TEST_LONE_DOWN.state,VK_LWIN,false,false);
+static_assert(A4S_TEST_LONE_UP.claimLoneRelease,"a lone Windows key must toggle A4S");
+constexpr bool PreservesA4SWinChord(UINT virtualKey)
+{
+	const A4SWinKeyRoute winDown=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_LWIN,true,false);
+	const A4SWinKeyRoute chordDown=RouteA4SWinKey(winDown.state,virtualKey,true,false);
+	return !RouteA4SWinKey(chordDown.state,VK_LWIN,false,false).claimLoneRelease;
+}
+static_assert(PreservesA4SWinChord('R'),"Win+R must remain native");
+static_assert(PreservesA4SWinChord('E'),"Win+E must remain native");
+static_assert(PreservesA4SWinChord('L'),"Win+L must remain native");
+static_assert(PreservesA4SWinChord('X'),"Win+X must remain native");
+static_assert(PreservesA4SWinChord(VK_TAB),"Win+Tab must remain native");
+constexpr A4SWinKeyRoute A4S_TEST_MODIFIED_DOWN=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_RWIN,true,true);
+constexpr A4SWinKeyRoute A4S_TEST_MODIFIED_UP=RouteA4SWinKey(A4S_TEST_MODIFIED_DOWN.state,VK_RWIN,false,false);
+static_assert(!A4S_TEST_MODIFIED_UP.claimLoneRelease,"pre-held modifiers must remain native");
+
+static A4SWinKeyState g_A4SWinKeyState=A4S_EMPTY_WIN_KEY_STATE;
 static const WPARAM A4S_COMMAND_TOGGLE=A4S_MENU_COMMAND_TOGGLE;
 static const WPARAM A4S_COMMAND_EXIT=A4S_MENU_COMMAND_EXIT;
 #else
@@ -506,6 +586,9 @@ static TaskbarInfo *FindTaskBarInfoBar( HWND bar )
 static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lParam );
 static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lParam );
 static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM lParam);
+#ifdef A4S_PRODUCT
+static LRESULT CALLBACK HookA4SKeyboard(int code, WPARAM wParam, LPARAM lParam);
+#endif
 
 static BOOL CALLBACK FindTooltipEnum( HWND hwnd, LPARAM lParam )
 {
@@ -3072,12 +3155,67 @@ HMODULE GetModuleHandleByPrefix(const WCHAR* prefix)
 	return result;
 }
 
+static void ResetA4SWinKeyState( void )
+{
+#ifdef A4S_PRODUCT
+	g_A4SWinKeyState=A4S_EMPTY_WIN_KEY_STATE;
+#endif
+}
+
+#ifdef A4S_PRODUCT
+static bool InstallA4SKeyboardHook( void )
+{
+	ResetA4SWinKeyState();
+	g_A4SKeyboardHook=SetWindowsHookEx(WH_KEYBOARD_LL,HookA4SKeyboard,g_Instance,0);
+	return g_A4SKeyboardHook!=NULL;
+}
+
+static bool RefreshA4SKeyboardHook( void )
+{
+	ResetA4SWinKeyState();
+	if (g_A4SKeyboardHook)
+	{
+		SetLastError(ERROR_SUCCESS);
+		if (!UnhookWindowsHookEx(g_A4SKeyboardHook))
+		{
+			const DWORD error=GetLastError();
+			// A low-level hook that exceeded LowLevelHooksTimeout is removed
+			// silently by Windows. ERROR_INVALID_HOOK_HANDLE is the expected
+			// indication when unlock/resume probes such a stale handle.
+			if (error!=ERROR_INVALID_HOOK_HANDLE)
+				return false;
+		}
+		g_A4SKeyboardHook=NULL;
+	}
+	return InstallA4SKeyboardHook();
+}
+#endif
+
 // The A4S product owns only popup activation. Keep the hook set deliberately
-// small and reversible: one taskbar-thread message hook and (on Windows 11)
-// one mouse hook used only for the native Start button's left-click gesture.
+// small and reversible: one taskbar-thread message hook, one low-level
+// keyboard decision hook, and (on Windows 11) one native Start mouse hook.
 static bool ClearA4SActivationHooks( void )
 {
 	bool cleared=true;
+#ifdef A4S_PRODUCT
+	ResetA4SWinKeyState();
+	if (g_A4SKeyboardHook)
+	{
+		if (UnhookWindowsHookEx(g_A4SKeyboardHook))
+			g_A4SKeyboardHook=NULL;
+		else
+		{
+			const DWORD error=GetLastError();
+			if (error==ERROR_INVALID_HOOK_HANDLE)
+				g_A4SKeyboardHook=NULL;
+			else
+			{
+				cleared=false;
+				LogToFile(STARTUP_LOG,L"A4S keyboard hook removal failed: %u",error);
+			}
+		}
+	}
+#endif
 	if (g_StartMouseHook)
 	{
 		if (UnhookWindowsHookEx(g_StartMouseHook))
@@ -3128,6 +3266,10 @@ static bool InstallA4SActivationHooks( void )
 		if (!g_StartMouseHook)
 			goto failed;
 	}
+#ifdef A4S_PRODUCT
+	if (!InstallA4SKeyboardHook())
+		goto failed;
+#endif
 	return true;
 
 failed:
@@ -3596,7 +3738,7 @@ static void RecreateStartButton( size_t taskbarId )
 static DWORD WINAPI ExitThreadProc( void *param )
 {
 #ifdef A4S_PRODUCT
-	// Product hot-unload is deliberately unsupported in the first-half host.
+	// Product hot-unload is deliberately unsupported for the pinned mapping.
 	// The accepted code can create detached workers outside the activation hooks,
 	// so callback-only rundown cannot prove that every DLL stack has returned.
 	// Disarm all behavior and keep the owned mapping until Explorer exits.
@@ -3984,6 +4126,52 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 	return CallNextHookEx(NULL,code,wParam,lParam);
 }
 
+static bool QueueA4SToggle( TaskbarInfo *taskBar, bool mouseGesture )
+{
+	return taskBar && PostMessage(taskBar->taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,
+		mouseGesture?A4S_MOUSE_TOGGLE:0)!=FALSE;
+}
+
+#ifdef A4S_PRODUCT
+// Global low-level hooks execute back on the installing taskbar thread. Keep
+// this callback allocation-free and bounded: update four booleans, queue at
+// most one taskbar message, and return. Windows silently removes a timed-out
+// low-level hook; unlock/resume explicitly refreshes it and native Start is the
+// automatic fallback whenever this callback is absent or cannot queue A4S.
+static LRESULT CALLBACK HookA4SKeyboard(int code, WPARAM wParam, LPARAM lParam)
+{
+	if (code!=HC_ACTION || !IsA4SRuntimeReady())
+		return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
+
+	const KBDLLHOOKSTRUCT *input=reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+	const bool keyDown=wParam==WM_KEYDOWN || wParam==WM_SYSKEYDOWN;
+	const bool keyUp=wParam==WM_KEYUP || wParam==WM_SYSKEYUP;
+	if (!input || (!keyDown && !keyUp))
+		return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
+
+	bool modifierAlreadyDown=false;
+	if (keyDown && (input->vkCode==VK_LWIN || input->vkCode==VK_RWIN))
+	{
+		// LowLevelKeyboardProc runs before the current event updates async key
+		// state, so these queries describe only modifiers that were already held.
+		modifierAlreadyDown=(GetAsyncKeyState(VK_SHIFT)&0x8000)!=0 ||
+			(GetAsyncKeyState(VK_CONTROL)&0x8000)!=0 ||
+			(GetAsyncKeyState(VK_MENU)&0x8000)!=0;
+	}
+
+	const A4SWinKeyRoute route=RouteA4SWinKey(g_A4SWinKeyState,input->vkCode,
+		keyDown,modifierAlreadyDown);
+	g_A4SWinKeyState=route.state;
+	if (route.claimLoneRelease)
+	{
+		TaskbarInfo *taskBar=FindTaskBarInfoBar(g_TaskBar);
+		if (QueueA4SToggle(taskBar,false))
+			return 1; // Claim only after A4S owns a queued toggle transaction.
+	}
+	return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
+}
+#endif
+
 // WH_MOUSE hook for taskbar thread (Win11+)
 static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM lParam)
 {
@@ -4016,7 +4204,7 @@ static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM l
 			{
 				if (wParam==WM_LBUTTONDOWN || wParam==WM_NCLBUTTONDOWN)
 				{
-					if (PostMessage(taskBar->taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,A4S_MOUSE_TOGGLE))
+					if (QueueA4SToggle(taskBar,true))
 					{
 						g_bA4SStartLeftCapture=true;
 						return 1;
@@ -4095,6 +4283,25 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 					CleanStartMenuDLL();
 					return res;
 				}
+#ifdef A4S_PRODUCT
+				else if (command==A4S_MENU_COMMAND_SUSPEND_INPUT)
+				{
+					ResetA4SWinKeyState();
+					CMenuContainer::CloseStartMenu();
+				}
+				else if (command==A4S_MENU_COMMAND_REFRESH_INPUT)
+				{
+					CMenuContainer::CloseStartMenu();
+					if (!RefreshA4SKeyboardHook())
+					{
+						// Do not leave a partially operational product intercepting the
+						// Start button when native keyboard routing cannot be restored.
+						LRESULT res=CallNextHookEx(NULL,code,wParam,lParam);
+						CleanStartMenuDLL();
+						return res;
+					}
+				}
+#endif
 				return CallNextHookEx(NULL,code,wParam,lParam);
 			}
 
@@ -4135,10 +4342,18 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 				}
 				if (taskBar)
 				{
-					g_bA4SQueuedStartLeftCapture=true;
-					msg->message=WM_NULL;
 					if (leftDown)
-						ToggleStartMenu(taskBar->taskbarId,false);
+					{
+						// Queue the same command consumed by the Windows-key and host
+						// paths. If queuing fails, leave the native click untouched.
+						if (QueueA4SToggle(taskBar,true))
+						{
+							g_bA4SQueuedStartLeftCapture=true;
+							msg->message=WM_NULL;
+						}
+					}
+					else if (leftDouble && g_bA4SQueuedStartLeftCapture)
+						msg->message=WM_NULL;
 				}
 			}
 			return CallNextHookEx(NULL,code,wParam,lParam);

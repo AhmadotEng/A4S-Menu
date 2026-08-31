@@ -7,7 +7,7 @@
 
 // Increment the major word for an incompatible table or message change. A
 // host intentionally requires an exact product version as well as this ABI.
-#define A4S_MENU_ABI_VERSION       UINT32_C(0x00030000)
+#define A4S_MENU_ABI_VERSION       UINT32_C(0x00040000)
 #define A4S_MENU_PRODUCT_VERSION   UINT32_C(0x00010000)
 
 enum A4SMenuDllStatus : UINT32
@@ -37,6 +37,11 @@ enum A4SMenuCommand : UINT32
 {
 	A4S_MENU_COMMAND_TOGGLE = 1,
 	A4S_MENU_COMMAND_EXIT = 2,
+	// Close transient UI before the interactive desktop is suspended or locked.
+	A4S_MENU_COMMAND_SUSPEND_INPUT = 3,
+	// Re-establish the low-level Windows-key route after the interactive desktop
+	// returns. Failure disarms the product so native Start remains available.
+	A4S_MENU_COMMAND_REFRESH_INPUT = 4,
 };
 
 // A4S_MENU_COMMAND_MESSAGE_W payload:
@@ -49,6 +54,7 @@ enum A4SMenuHostControl : UINT32
 	A4S_MENU_HOST_CONTROL_EXIT = 2,
 	A4S_MENU_HOST_CONTROL_REHOOK = 3,
 	A4S_MENU_HOST_CONTROL_STATUS = 4,
+	A4S_MENU_HOST_CONTROL_RESET_SAFETY = 5,
 };
 
 enum A4SMenuHostStatus : UINT32
@@ -58,6 +64,7 @@ enum A4SMenuHostStatus : UINT32
 	A4S_MENU_HOST_STATUS_READY = 3,
 	A4S_MENU_HOST_STATUS_FAILED = 4,
 	A4S_MENU_HOST_STATUS_STOPPING = 5,
+	A4S_MENU_HOST_STATUS_SAFETY_DISABLED = 6,
 };
 
 // This function is called in the host's mapping of A4SMenu.dll. It must only

@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include <shellapi.h>
+#include <wtsapi32.h>
 
 #include <algorithm>
 #include <cstdint>
@@ -20,6 +21,58 @@ namespace
 	constexpr DWORD kBootstrapUnhookRetryMs = 250;
 	constexpr size_t kBootstrapReplayLimit = 3;
 	constexpr DWORD kRetryDelayMs[] = { 100, 250, 500, 1000, 2000, 4000, 4000 };
+	constexpr DWORD kCrashLoopThreshold = 3;
+	constexpr ULONGLONG kCrashLoopWindow100ns = UINT64_C(180) * UINT64_C(10000000);
+	constexpr wchar_t kSafetyDisabledValue[] = L"InjectionDisabled";
+	constexpr wchar_t kCrashCountValue[] = L"AbnormalExplorerExitCount";
+	constexpr wchar_t kCrashWindowValue[] = L"AbnormalExplorerWindowStart";
+	constexpr wchar_t kLastExitCodeValue[] = L"LastExplorerExitCode";
+
+	using WTSRegisterSessionNotificationFn = BOOL (WINAPI *)(HWND,DWORD);
+	using WTSUnregisterSessionNotificationFn = BOOL (WINAPI *)(HWND);
+
+	struct CrashGuardState
+	{
+		DWORD abnormalExitCount;
+		ULONGLONG windowStart;
+		bool disabled;
+	};
+
+	constexpr CrashGuardState AdvanceCrashGuard(CrashGuardState state,
+		bool attemptedActivation, DWORD exitCode, ULONGLONG now)
+	{
+		if (!attemptedActivation || state.disabled)
+			return state;
+		if (exitCode==ERROR_SUCCESS)
+		{
+			state.abnormalExitCount=0;
+			state.windowStart=0;
+			return state;
+		}
+		const bool sameWindow=state.windowStart && now>=state.windowStart &&
+			now-state.windowStart<=kCrashLoopWindow100ns;
+		if (!sameWindow)
+		{
+			state.windowStart=now;
+			state.abnormalExitCount=1;
+		}
+		else if (state.abnormalExitCount<MAXDWORD)
+			state.abnormalExitCount++;
+		if (state.abnormalExitCount>=kCrashLoopThreshold)
+			state.disabled=true;
+		return state;
+	}
+
+	constexpr CrashGuardState A4S_EMPTY_CRASH_GUARD={0,0,false};
+	constexpr CrashGuardState A4S_CRASH_ONE=AdvanceCrashGuard(A4S_EMPTY_CRASH_GUARD,true,1,100);
+	constexpr CrashGuardState A4S_CRASH_TWO=AdvanceCrashGuard(A4S_CRASH_ONE,true,2,101);
+	constexpr CrashGuardState A4S_CRASH_THREE=AdvanceCrashGuard(A4S_CRASH_TWO,true,3,102);
+	static_assert(!A4S_CRASH_TWO.disabled && A4S_CRASH_THREE.disabled,
+		"three abnormal Explorer exits inside the guard window must disable injection");
+	constexpr CrashGuardState A4S_CRASH_EXPIRED=AdvanceCrashGuard(A4S_CRASH_TWO,true,3,
+		101+kCrashLoopWindow100ns+1);
+	static_assert(!A4S_CRASH_EXPIRED.disabled && A4S_CRASH_EXPIRED.abnormalExitCount==1,
+		"an expired Explorer failure window must restart at one");
 
 	class UniqueHandle
 	{
@@ -94,6 +147,13 @@ namespace
 		bool initializationPending = false;
 		bool replacementPending = false;
 		bool targetInvalidated = false;
+		bool safetyDisabled = false;
+		DWORD abnormalExplorerExitCount = 0;
+		ULONGLONG abnormalExplorerWindowStart = 0;
+		HMODULE wtsApi = nullptr;
+		WTSRegisterSessionNotificationFn registerSessionNotification = nullptr;
+		WTSUnregisterSessionNotificationFn unregisterSessionNotification = nullptr;
+		bool sessionNotificationRegistered = false;
 		UINT_PTR attemptCookie = 0;
 	};
 
@@ -105,6 +165,133 @@ namespace
 		line += text;
 		line += L"\r\n";
 		OutputDebugStringW(line.c_str());
+	}
+
+	ULONGLONG CurrentUtcFileTime()
+	{
+		FILETIME time = {};
+		GetSystemTimeAsFileTime(&time);
+		ULARGE_INTEGER value = {};
+		value.LowPart = time.dwLowDateTime;
+		value.HighPart = time.dwHighDateTime;
+		return value.QuadPart;
+	}
+
+	void LoadSafetyState()
+	{
+		g_runtime.safetyDisabled = false;
+		g_runtime.abnormalExplorerExitCount = 0;
+		g_runtime.abnormalExplorerWindowStart = 0;
+		HKEY key = nullptr;
+		if (RegOpenKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)
+			return;
+
+		DWORD value = 0;
+		DWORD type = 0;
+		DWORD size = sizeof(value);
+		if (RegQueryValueExW(key,kSafetyDisabledValue,nullptr,&type,
+			reinterpret_cast<BYTE*>(&value),&size)==ERROR_SUCCESS && type==REG_DWORD && size==sizeof(value))
+			g_runtime.safetyDisabled=value!=0;
+		type=0;
+		size=sizeof(value);
+		if (RegQueryValueExW(key,kCrashCountValue,nullptr,&type,
+			reinterpret_cast<BYTE*>(&value),&size)==ERROR_SUCCESS && type==REG_DWORD && size==sizeof(value))
+			g_runtime.abnormalExplorerExitCount=value;
+		ULONGLONG windowStart = 0;
+		type=0;
+		size=sizeof(windowStart);
+		if (RegQueryValueExW(key,kCrashWindowValue,nullptr,&type,
+			reinterpret_cast<BYTE*>(&windowStart),&size)==ERROR_SUCCESS && type==REG_QWORD && size==sizeof(windowStart))
+			g_runtime.abnormalExplorerWindowStart=windowStart;
+		RegCloseKey(key);
+	}
+
+	bool PersistSafetyState(DWORD lastExitCode)
+	{
+		HKEY key = nullptr;
+		DWORD disposition = 0;
+		if (RegCreateKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,nullptr,0,
+			KEY_SET_VALUE,nullptr,&key,&disposition)!=ERROR_SUCCESS)
+			return false;
+		const DWORD disabled=g_runtime.safetyDisabled?1u:0u;
+		const LONG result1=RegSetValueExW(key,kSafetyDisabledValue,0,REG_DWORD,
+			reinterpret_cast<const BYTE*>(&disabled),sizeof(disabled));
+		const LONG result2=RegSetValueExW(key,kCrashCountValue,0,REG_DWORD,
+			reinterpret_cast<const BYTE*>(&g_runtime.abnormalExplorerExitCount),
+			sizeof(g_runtime.abnormalExplorerExitCount));
+		const LONG result3=RegSetValueExW(key,kCrashWindowValue,0,REG_QWORD,
+			reinterpret_cast<const BYTE*>(&g_runtime.abnormalExplorerWindowStart),
+			sizeof(g_runtime.abnormalExplorerWindowStart));
+		const LONG result4=RegSetValueExW(key,kLastExitCodeValue,0,REG_DWORD,
+			reinterpret_cast<const BYTE*>(&lastExitCode),sizeof(lastExitCode));
+		RegCloseKey(key);
+		return result1==ERROR_SUCCESS && result2==ERROR_SUCCESS &&
+			result3==ERROR_SUCCESS && result4==ERROR_SUCCESS;
+	}
+
+	bool ResetSafetyState()
+	{
+		const LONG result=RegDeleteTreeW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W);
+		if (result!=ERROR_SUCCESS && result!=ERROR_FILE_NOT_FOUND && result!=ERROR_PATH_NOT_FOUND)
+			return false;
+		g_runtime.safetyDisabled=false;
+		g_runtime.abnormalExplorerExitCount=0;
+		g_runtime.abnormalExplorerWindowStart=0;
+		return true;
+	}
+
+	bool RecordExplorerExitForCrashGuard(bool attemptedActivation, DWORD exitCode)
+	{
+		const ULONGLONG now=CurrentUtcFileTime();
+		CrashGuardState state={g_runtime.abnormalExplorerExitCount,
+			g_runtime.abnormalExplorerWindowStart,g_runtime.safetyDisabled};
+		state=AdvanceCrashGuard(state,attemptedActivation,exitCode,now);
+		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
+		g_runtime.abnormalExplorerWindowStart=state.windowStart;
+		const bool newlyDisabled=!g_runtime.safetyDisabled && state.disabled;
+		g_runtime.safetyDisabled=state.disabled;
+		if (newlyDisabled)
+		{
+			DebugLog(L"Explorer crash-loop guard disabled injection; native Start remains available");
+		}
+		if (attemptedActivation && !PersistSafetyState(exitCode))
+			DebugLog(L"could not persist Explorer crash-loop safety state");
+		return g_runtime.safetyDisabled;
+	}
+
+	bool RegisterSessionNotifications()
+	{
+		g_runtime.wtsApi=LoadLibraryExW(L"wtsapi32.dll",nullptr,LOAD_LIBRARY_SEARCH_SYSTEM32);
+		if (!g_runtime.wtsApi)
+			return false;
+		g_runtime.registerSessionNotification=reinterpret_cast<WTSRegisterSessionNotificationFn>(
+			GetProcAddress(g_runtime.wtsApi,"WTSRegisterSessionNotification"));
+		g_runtime.unregisterSessionNotification=reinterpret_cast<WTSUnregisterSessionNotificationFn>(
+			GetProcAddress(g_runtime.wtsApi,"WTSUnRegisterSessionNotification"));
+		if (!g_runtime.registerSessionNotification || !g_runtime.unregisterSessionNotification ||
+			!g_runtime.registerSessionNotification(g_runtime.window,NOTIFY_FOR_THIS_SESSION))
+		{
+			FreeLibrary(g_runtime.wtsApi);
+			g_runtime.wtsApi=nullptr;
+			g_runtime.registerSessionNotification=nullptr;
+			g_runtime.unregisterSessionNotification=nullptr;
+			return false;
+		}
+		g_runtime.sessionNotificationRegistered=true;
+		return true;
+	}
+
+	void UnregisterSessionNotifications()
+	{
+		if (g_runtime.sessionNotificationRegistered && g_runtime.unregisterSessionNotification &&
+			g_runtime.window)
+			g_runtime.unregisterSessionNotification(g_runtime.window);
+		g_runtime.sessionNotificationRegistered=false;
+		g_runtime.registerSessionNotification=nullptr;
+		g_runtime.unregisterSessionNotification=nullptr;
+		if (g_runtime.wtsApi)
+			FreeLibrary(g_runtime.wtsApi);
+		g_runtime.wtsApi=nullptr;
 	}
 
 	bool GenerateAttemptCookie(UINT_PTR &cookie)
@@ -459,6 +646,12 @@ namespace
 
 	void ScheduleRetry()
 	{
+		if (g_runtime.safetyDisabled)
+		{
+			ResetConnection();
+			g_runtime.status=A4S_MENU_HOST_STATUS_SAFETY_DISABLED;
+			return;
+		}
 		if (!ResetConnection())
 		{
 			g_runtime.status = A4S_MENU_HOST_STATUS_FAILED;
@@ -489,6 +682,11 @@ namespace
 
 	bool TryInject()
 	{
+		if (g_runtime.safetyDisabled)
+		{
+			g_runtime.status=A4S_MENU_HOST_STATUS_SAFETY_DISABLED;
+			return false;
+		}
 		if (!LoadProductDll())
 		{
 			g_runtime.status = A4S_MENU_HOST_STATUS_FAILED;
@@ -547,6 +745,12 @@ namespace
 		g_runtime.targetInvalidated = false;
 		g_runtime.retryIndex = 0;
 		g_runtime.bootstrapReplayCount = 0;
+		if (g_runtime.safetyDisabled)
+		{
+			ResetConnection();
+			g_runtime.status=A4S_MENU_HOST_STATUS_SAFETY_DISABLED;
+			return;
+		}
 		if (!ResetConnection())
 		{
 			g_runtime.status = A4S_MENU_HOST_STATUS_FAILED;
@@ -755,8 +959,8 @@ namespace
 			if (g_runtime.initializationPending && !g_runtime.activationCommitted)
 			{
 				// A new host can encounter a product mapping that an earlier host
-				// already disarmed. That mapping is intentionally non-restartable in
-				// the first half, so finish this attempt instead of waiting forever.
+				// already disarmed. That pinned mapping is intentionally non-restartable,
+				// so finish this attempt instead of waiting forever.
 				const bool exitPending = g_runtime.exitPending;
 				const bool reconnectReplacement = g_runtime.replacementPending;
 				const bool preserveReplacement = reconnectReplacement && !exitPending;
@@ -802,6 +1006,7 @@ namespace
 		case A4S_MENU_HOST_STATUS_READY: return L"ready";
 		case A4S_MENU_HOST_STATUS_FAILED: return L"failed (native Start available)";
 		case A4S_MENU_HOST_STATUS_STOPPING: return L"stopping";
+		case A4S_MENU_HOST_STATUS_SAFETY_DISABLED: return L"disabled after Explorer crash loop (native Start available)";
 		default: return L"unknown";
 		}
 	}
@@ -813,6 +1018,10 @@ namespace
 			return;
 
 		DebugLog(L"validated Explorer process exited");
+		DWORD exitCode=ERROR_GEN_FAILURE;
+		GetExitCodeProcess(g_runtime.explorer.process.get(),&exitCode);
+		const bool attemptedActivation=g_runtime.initializationPending || g_runtime.activationCommitted;
+		const bool safetyTripped=RecordExplorerExitForCrashGuard(attemptedActivation,exitCode);
 		g_runtime.initializationPending = false;
 		g_runtime.activationCommitted = false;
 		g_runtime.replacementPending = false;
@@ -822,6 +1031,11 @@ namespace
 			ResetConnection();
 			if (g_runtime.window && IsWindow(g_runtime.window))
 				DestroyWindow(g_runtime.window);
+		}
+		else if (safetyTripped)
+		{
+			ResetConnection();
+			g_runtime.status=A4S_MENU_HOST_STATUS_SAFETY_DISABLED;
 		}
 		else
 			BeginConnection(true);
@@ -864,13 +1078,19 @@ namespace
 			case A4S_MENU_HOST_CONTROL_REHOOK:
 				if (g_runtime.exitPending || TargetStillMatches() || ExplorerProcessStillAlive())
 				{
-					DebugLog(L"same-process rehook is intentionally unsupported in the first-half host");
+					DebugLog(L"same-process rehook is intentionally unsupported for a pinned Explorer mapping");
 					return FALSE;
 				}
 				BeginConnection(true);
 				return TRUE;
 			case A4S_MENU_HOST_CONTROL_STATUS:
 				return static_cast<LRESULT>(g_runtime.status);
+			case A4S_MENU_HOST_CONTROL_RESET_SAFETY:
+				if (!ResetSafetyState())
+					return FALSE;
+				if (g_runtime.status==A4S_MENU_HOST_STATUS_SAFETY_DISABLED)
+					BeginConnection(true);
+				return TRUE;
 			default:
 				return FALSE;
 			}
@@ -959,6 +1179,27 @@ namespace
 
 		switch (message)
 		{
+		case WM_WTSSESSION_CHANGE:
+			if (g_runtime.status==A4S_MENU_HOST_STATUS_READY)
+			{
+				if (wParam==WTS_SESSION_LOCK || wParam==WTS_SESSION_LOGOFF ||
+					wParam==WTS_REMOTE_DISCONNECT)
+					SendMenuCommand(A4S_MENU_COMMAND_SUSPEND_INPUT);
+				else if (wParam==WTS_SESSION_UNLOCK || wParam==WTS_SESSION_LOGON ||
+					wParam==WTS_REMOTE_CONNECT)
+					SendMenuCommand(A4S_MENU_COMMAND_REFRESH_INPUT);
+			}
+			return 0;
+		case WM_POWERBROADCAST:
+			if (g_runtime.status==A4S_MENU_HOST_STATUS_READY)
+			{
+				if (wParam==PBT_APMSUSPEND)
+					SendMenuCommand(A4S_MENU_COMMAND_SUSPEND_INPUT);
+				else if (wParam==PBT_APMRESUMEAUTOMATIC ||
+					wParam==PBT_APMRESUMESUSPEND || wParam==PBT_APMRESUMECRITICAL)
+					SendMenuCommand(A4S_MENU_COMMAND_REFRESH_INPUT);
+			}
+			return TRUE;
 		case WM_TIMER:
 			if (wParam == kRetryTimer)
 			{
@@ -1030,6 +1271,7 @@ namespace
 				DestroyWindow(window);
 			return 0;
 		case WM_DESTROY:
+			UnregisterSessionNotifications();
 			PostQuitMessage(0);
 			return 0;
 		default:
@@ -1138,6 +1380,7 @@ namespace
 		Exit,
 		Rehook,
 		Status,
+		ResetSafety,
 		Version,
 		RunAs,
 		Invalid,
@@ -1155,6 +1398,7 @@ namespace
 		if (_wcsicmp(argv[1], L"--exit") == 0) return LaunchCommand::Exit;
 		if (_wcsicmp(argv[1], L"--rehook") == 0) return LaunchCommand::Rehook;
 		if (_wcsicmp(argv[1], L"--status") == 0) return LaunchCommand::Status;
+		if (_wcsicmp(argv[1], L"--reset-safety") == 0) return LaunchCommand::ResetSafety;
 		if (_wcsicmp(argv[1], L"--version") == 0) return LaunchCommand::Version;
 		return LaunchCommand::Invalid;
 	}
@@ -1167,6 +1411,7 @@ namespace
 		case LaunchCommand::Exit: return A4S_MENU_HOST_CONTROL_EXIT;
 		case LaunchCommand::Rehook: return A4S_MENU_HOST_CONTROL_REHOOK;
 		case LaunchCommand::Status: return A4S_MENU_HOST_CONTROL_STATUS;
+		case LaunchCommand::ResetSafety: return A4S_MENU_HOST_CONTROL_RESET_SAFETY;
 		default: return static_cast<A4SMenuHostControl>(0);
 		}
 	}
@@ -1292,6 +1537,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int)
 		ReleaseMutex(instanceMutex.get());
 		return static_cast<int>(GetLastError());
 	}
+	LoadSafetyState();
+	if (command==LaunchCommand::ResetSafety && !ResetSafetyState())
+	{
+		DestroyWindow(g_runtime.window);
+		ReleaseMutex(instanceMutex.get());
+		return ERROR_WRITE_FAULT;
+	}
+	if (!RegisterSessionNotifications())
+		DebugLog(L"session notification registration unavailable; Explorer reconnect remains active");
 	if (command == LaunchCommand::Toggle)
 		g_runtime.pendingToggle = true;
 	BeginConnection(true);

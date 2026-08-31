@@ -231,11 +231,13 @@ public static class A4SBinaryProbe
             if (address == IntPtr.Zero)
                 throw new System.ComponentModel.Win32Exception(Marshal.GetLastWin32Error(), "GetProcAddress failed");
             GetApiDelegate getApi = (GetApiDelegate)Marshal.GetDelegateForFunctionPointer(address, typeof(GetApiDelegate));
-            IntPtr apiAddress = getApi(0x00030000);
+            if (getApi(0x00030000) != IntPtr.Zero)
+                throw new InvalidOperationException("A4SMenu_GetApi accepted the obsolete ABI3 contract.");
+            IntPtr apiAddress = getApi(0x00040000);
             if (apiAddress == IntPtr.Zero)
                 throw new InvalidOperationException("A4SMenu_GetApi rejected the expected ABI.");
             Api api = (Api)Marshal.PtrToStructure(apiAddress, typeof(Api));
-            if (api.Size < (uint)Marshal.SizeOf(typeof(Api)) || api.AbiVersion != 0x00030000 || api.ProductVersion != 0x00010000 || api.RequestShutdown == IntPtr.Zero)
+            if (api.Size < (uint)Marshal.SizeOf(typeof(Api)) || api.AbiVersion != 0x00040000 || api.ProductVersion != 0x00010000 || api.RequestShutdown == IntPtr.Zero)
                 throw new InvalidOperationException("A4SMenu_GetApi returned an invalid API table.");
             return String.Format("ABI=0x{0:X8}; Product=0x{1:X8}; Size={2}", api.AbiVersion, api.ProductVersion, api.Size);
         }
