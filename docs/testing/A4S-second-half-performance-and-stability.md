@@ -54,6 +54,24 @@ The snapshot also records:
 - taskbar edge and the Windows 11 alignment registry hint;
 - foreground-window geometry and session/process identity.
 
+## Start the staged host for manual qualification
+
+Keep the staged product path stable between builds so the same manual entry
+point can be reused throughout qualification. After taking the clean baseline,
+start the host and confirm its injected state with:
+
+```powershell
+$menuHost = 'C:\Users\Admin\Downloads\StartAllBack-analysis-handoff\Open-Shell-Menu\build\stage\A4SProduct\A4SMenuHost.exe'
+
+Start-Process -FilePath $menuHost
+Start-Sleep -Seconds 2
+& $menuHost --status
+```
+
+The expected healthy result is `READY`. Do not move or rename the staged
+`A4SProduct` directory during a qualification sequence because the exact host
+and DLL paths and hashes are part of the evidence checks.
+
 ## Measure the current build
 
 Close the menu and run the performance probe only after the host reports
