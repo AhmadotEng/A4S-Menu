@@ -50,6 +50,15 @@ if (-not $SkipValidation) {
     & (Join-Path $PSScriptRoot 'Test-A4SPerformanceTools.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SFailureRecoveryContracts.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SInstallerLifecycleContracts.ps1')
+    $windowsPowerShell = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
+    if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+        throw "Windows PowerShell 5.1 was not found: $windowsPowerShell"
+    }
+    & $windowsPowerShell -NoProfile -NonInteractive -ExecutionPolicy Bypass `
+        -File (Join-Path $PSScriptRoot 'Test-A4SLegacySandboxLifecycleContracts.ps1')
+    if ($LASTEXITCODE -ne 0) {
+        throw "A4S legacy Sandbox offline contracts failed with exit code $LASTEXITCODE."
+    }
     & (Join-Path $PSScriptRoot 'Test-A4SProduct.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SSetup.ps1')
 }
