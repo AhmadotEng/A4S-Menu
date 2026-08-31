@@ -1,0 +1,662 @@
+<#
+.SYNOPSIS
+Launches the legacy A4S installer lifecycle matrix in a disposable Windows Sandbox.
+
+.DESCRIPTION
+The host side is deliberately fail-closed. It maps this repository read-only,
+maps one newly-created evidence session read/write, launches Windows Sandbox only
+with -AllowSandboxLaunch, and verifies that the host A4S product state and
+Explorer PID did not change while the guest ran. It never executes either
+installer on the host and never restarts Explorer.
+
+.EXAMPLE
+.\tools\Invoke-A4SLegacySandboxLifecycle.ps1 `
+    -V2SetupPath .\build\A4SProduct\bin\x64\A4SMenuSetup.exe `
+    -ExpectedV2SetupSha256 <sha256> `
+    -ExpectedV2HostSha256 <sha256> `
+    -ExpectedV2MenuSha256 <sha256> `
+    -AllowSandboxLaunch
+#>
+[CmdletBinding()]
+param(
+    [string] $V2SetupPath,
+
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string] $ExpectedV2SetupSha256,
+
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string] $ExpectedV2HostSha256,
+
+    [ValidatePattern('^[0-9A-Fa-f]{64}$')]
+    [string] $ExpectedV2MenuSha256,
+
+    [ValidatePattern('^1\.1\.0\.0$')]
+    [string] $ExpectedV2Version = '1.1.0.0',
+
+    [string] $EvidenceRoot = (Join-Path $env:LOCALAPPDATA `
+        'A4SMenuQualification\LegacySandboxEvidence'),
+
+    [ValidateRange(5, 90)]
+    [int] $TimeoutMinutes = 30,
+
+    [switch] $AllowSandboxLaunch,
+
+    [switch] $ContractSelfTest
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$guestScriptRelativePath = 'tools\Invoke-A4SLegacySandboxGuest.ps1'
+$v1SetupRelativePath = 'build\test-fixtures\A4SMenu-1.0.0.0\A4SMenuSetup.exe'
+$frozenV1 = [ordered]@{
+    Version = '1.0.0.0'
+    SetupSha256 = 'DF282F8DC18B382B7AC28599294E2A371EF97D01F85AE6F66E9DF6A02ACBC7C2'
+    HostSha256 = '9995676D0B74DE2E68E0C4EACB7E4111BE1AF13AA34C3505499C3925708A0573'
+    MenuSha256 = '4C1C9A325FF41A6DD089690874C95DCC8CC8CC5A4561F9B8ECCFA29832C03610'
+}
+
+function Normalize-Sha256 {
+    param([Parameter(Mandatory)][string] $Value)
+    $normalized = $Value.Trim().ToUpperInvariant()
+    if ($normalized -notmatch '^[0-9A-F]{64}$') { throw "Invalid SHA-256: $Value" }
+    return $normalized
+}
+
+function Test-PathWithin {
+    param(
+        [Parameter(Mandatory)][string] $Candidate,
+        [Parameter(Mandatory)][string] $Parent
+    )
+    $candidateFull = [IO.Path]::GetFullPath($Candidate)
+    $parentFull = [IO.Path]::GetFullPath($Parent).TrimEnd('\') + '\'
+    return $candidateFull.StartsWith($parentFull, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Assert-LocalFixedPath {
+    param([Parameter(Mandatory)][string] $Path)
+    $full = [IO.Path]::GetFullPath($Path)
+    if ($full -notmatch '^[A-Za-z]:\\' -or $full.Substring(2).Contains(':')) {
+        throw "Only a normal absolute local path is accepted: $full"
+    }
+    $driveName = $full.Substring(0, 1)
+    $drive = [IO.DriveInfo]::new("${driveName}:\")
+    if (-not $drive.IsReady -or $drive.DriveType -ne [IO.DriveType]::Fixed) {
+        throw "Only a ready fixed local volume is accepted: $full"
+    }
+    $psDrive = Get-PSDrive -Name $driveName -PSProvider FileSystem -ErrorAction Stop
+    if ($psDrive.DisplayRoot) { throw "Mapped drives are not accepted: $full" }
+    return $full
+}
+
+function Assert-NoReparsePointInExistingChain {
+    param([Parameter(Mandatory)][string] $Path)
+    $cursor = Assert-LocalFixedPath $Path
+    while (-not (Test-Path -LiteralPath $cursor)) {
+        $parent = [IO.Directory]::GetParent($cursor)
+        if ($null -eq $parent) { throw "No existing ancestor for $Path." }
+        $cursor = $parent.FullName
+    }
+    while ($cursor) {
+        $item = Get-Item -LiteralPath $cursor -Force
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "A reparse point is not accepted in the path chain: $($item.FullName)"
+        }
+        $parent = [IO.Directory]::GetParent($cursor)
+        $cursor = if ($null -eq $parent) { $null } else { $parent.FullName }
+    }
+}
+
+function Assert-RegularFile {
+    param([Parameter(Mandatory)][string] $Path)
+    $full = Assert-LocalFixedPath $Path
+    Assert-NoReparsePointInExistingChain $full
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        throw "Required file is missing: $full"
+    }
+    $item = Get-Item -LiteralPath $full -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+        throw "A fixture may not be a reparse point: $full"
+    }
+    return $full
+}
+
+function Get-FixedProductVersion {
+    param([Parameter(Mandatory)][string] $Path)
+    $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($Path)
+    return ([Version]::new($info.ProductMajorPart, $info.ProductMinorPart,
+        $info.ProductBuildPart, $info.ProductPrivatePart)).ToString(4)
+}
+
+function Get-PeMachine {
+    param([Parameter(Mandatory)][string] $Path)
+    $stream = [IO.File]::Open($Path, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $reader = [IO.BinaryReader]::new($stream)
+        if ($reader.ReadUInt16() -ne 0x5A4D) { throw "Not a PE image: $Path" }
+        $stream.Position = 0x3C
+        $peOffset = $reader.ReadUInt32()
+        $stream.Position = $peOffset
+        if ($reader.ReadUInt32() -ne 0x00004550) { throw "Invalid PE signature: $Path" }
+        return $reader.ReadUInt16()
+    }
+    finally { $stream.Dispose() }
+}
+
+function Get-FileIdentity {
+    param([Parameter(Mandatory)][string] $Path)
+    $full = Assert-RegularFile $Path
+    if ((Get-PeMachine $full) -ne 0x8664) { throw "Qualification input is not x64: $full" }
+    $item = Get-Item -LiteralPath $full -Force
+    return [ordered]@{
+        Path = $full
+        Length = [long]$item.Length
+        Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $full).Hash.ToUpperInvariant()
+        ProductVersion = Get-FixedProductVersion $full
+        OriginalFilename = $item.VersionInfo.OriginalFilename
+    }
+}
+
+function ConvertTo-RegistryValueRecord {
+    param(
+        [Parameter(Mandatory)][Microsoft.Win32.RegistryKey] $Key,
+        [Parameter(Mandatory)][AllowEmptyString()][string] $Name
+    )
+    $kind = $Key.GetValueKind($Name)
+    $value = $Key.GetValue($Name, $null,
+        [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+    $data = switch ($kind) {
+        ([Microsoft.Win32.RegistryValueKind]::Binary) {
+            [Convert]::ToBase64String([byte[]]$value); break
+        }
+        ([Microsoft.Win32.RegistryValueKind]::None) {
+            [Convert]::ToBase64String([byte[]]$value); break
+        }
+        ([Microsoft.Win32.RegistryValueKind]::MultiString) { @([string[]]$value); break }
+        default { [string]$value; break }
+    }
+    return [ordered]@{ Name = $Name; Kind = $kind.ToString(); Data = $data }
+}
+
+function Get-RegistryTreeSnapshot {
+    param([Parameter(Mandatory)][string] $SubKey)
+    $root = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey, $false)
+    if ($null -eq $root) { return [ordered]@{ Present = $false; Nodes = @() } }
+    $nodes = [Collections.Generic.List[object]]::new()
+    function Add-Node {
+        param(
+            [Parameter(Mandatory)][Microsoft.Win32.RegistryKey] $Key,
+            [Parameter(Mandatory)][AllowEmptyString()][string] $Relative
+        )
+        $values = [Collections.Generic.List[object]]::new()
+        foreach ($name in @($Key.GetValueNames() | Sort-Object)) {
+            $values.Add((ConvertTo-RegistryValueRecord -Key $Key -Name $name))
+        }
+        $nodes.Add([ordered]@{ RelativePath = $Relative; Values = @($values) })
+        foreach ($name in @($Key.GetSubKeyNames() | Sort-Object)) {
+            $child = $Key.OpenSubKey($name, $false)
+            if ($null -eq $child) { throw "Registry key disappeared during snapshot: $SubKey\\$name" }
+            try {
+                $childRelative = if ($Relative) { "$Relative\\$name" } else { $name }
+                Add-Node -Key $child -Relative $childRelative
+            }
+            finally { $child.Dispose() }
+        }
+    }
+    try { Add-Node -Key $root -Relative '' }
+    finally { $root.Dispose() }
+    return [ordered]@{ Present = $true; Nodes = @($nodes) }
+}
+
+function Get-SelectedRegistryValue {
+    param(
+        [Parameter(Mandatory)][string] $SubKey,
+        [Parameter(Mandatory)][string] $Name
+    )
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey, $false)
+    if ($null -eq $key) { return [ordered]@{ Present = $false } }
+    try {
+        $actual = @($key.GetValueNames() | Where-Object { $_ -ieq $Name }) |
+            Select-Object -First 1
+        if ($null -eq $actual) { return [ordered]@{ Present = $false } }
+        return [ordered]@{
+            Present = $true
+            Value = ConvertTo-RegistryValueRecord -Key $key -Name $actual
+        }
+    }
+    finally { $key.Dispose() }
+}
+
+function Get-PathInventory {
+    param([Parameter(Mandatory)][string] $Path)
+    $full = Assert-LocalFixedPath $Path
+    Assert-NoReparsePointInExistingChain $full
+    if (-not (Test-Path -LiteralPath $full)) {
+        return [ordered]@{ Present = $false; Entries = @() }
+    }
+    $entries = [Collections.Generic.List[object]]::new()
+    foreach ($item in @(Get-ChildItem -LiteralPath $full -Force -Recurse |
+            Sort-Object FullName)) {
+        if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+            throw "Host A4S inventory contains a reparse point: $($item.FullName)"
+        }
+        $relative = $item.FullName.Substring($full.TrimEnd('\').Length).TrimStart('\')
+        if ($item.PSIsContainer) {
+            $entries.Add([ordered]@{ RelativePath = $relative; Kind = 'Directory' })
+        }
+        else {
+            $entries.Add([ordered]@{
+                RelativePath = $relative
+                Kind = 'File'
+                Length = [long]$item.Length
+                Sha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $item.FullName).Hash.ToUpperInvariant()
+            })
+        }
+    }
+    return [ordered]@{ Present = $true; Entries = @($entries) }
+}
+
+function Get-HostProductSnapshot {
+    $installRoot = Join-Path $env:LOCALAPPDATA 'A4SMenu'
+    return [ordered]@{
+        Product = Get-RegistryTreeSnapshot 'Software\A4SMenu'
+        Lifecycle = Get-RegistryTreeSnapshot 'Software\A4SMenuLifecycle'
+        Uninstall = Get-RegistryTreeSnapshot 'Software\Microsoft\Windows\CurrentVersion\Uninstall\A4SMenu'
+        Run = Get-SelectedRegistryValue 'Software\Microsoft\Windows\CurrentVersion\Run' 'A4SMenu'
+        CleanupRunOnce = Get-SelectedRegistryValue 'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuCleanup'
+        RecoveryRunOnce = Get-SelectedRegistryValue 'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuServicingRecovery'
+        InstallRoot = Get-PathInventory $installRoot
+    }
+}
+
+function Get-ObjectSha256 {
+    param([Parameter(Mandatory)] $Value)
+    $json = $Value | ConvertTo-Json -Depth 100 -Compress
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '') }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-HostExplorerPid {
+    $session = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $explorers = @(Get-Process -Name explorer -ErrorAction SilentlyContinue |
+        Where-Object { $_.SessionId -eq $session })
+    if ($explorers.Count -ne 1) {
+        throw "Expected exactly one Explorer in host session $session; found $($explorers.Count)."
+    }
+    return [int]$explorers[0].Id
+}
+
+function ConvertTo-GuestRelativePath {
+    param([Parameter(Mandatory)][string] $HostPath)
+    $full = [IO.Path]::GetFullPath($HostPath)
+    if (-not (Test-PathWithin -Candidate $full -Parent $repoRoot)) {
+        throw "The V2 setup must be inside the read-only repository mapping: $full"
+    }
+    return $full.Substring($repoRoot.TrimEnd('\').Length).TrimStart('\')
+}
+
+function New-SandboxConfigurationText {
+    param(
+        [Parameter(Mandatory)][string] $HostRepo,
+        [Parameter(Mandatory)][string] $HostEvidence
+    )
+    $repo = [Security.SecurityElement]::Escape($HostRepo)
+    $evidence = [Security.SecurityElement]::Escape($HostEvidence)
+    $command = [Security.SecurityElement]::Escape(
+        'powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Evidence\request.json"')
+    return @"
+<Configuration>
+  <vGPU>Disable</vGPU>
+  <Networking>Disable</Networking>
+  <AudioInput>Disable</AudioInput>
+  <VideoInput>Disable</VideoInput>
+  <ProtectedClient>Enable</ProtectedClient>
+  <PrinterRedirection>Disable</PrinterRedirection>
+  <ClipboardRedirection>Disable</ClipboardRedirection>
+  <MemoryInMB>4096</MemoryInMB>
+  <MappedFolders>
+    <MappedFolder>
+      <HostFolder>$repo</HostFolder>
+      <SandboxFolder>C:\A4S\Repo</SandboxFolder>
+      <ReadOnly>true</ReadOnly>
+    </MappedFolder>
+    <MappedFolder>
+      <HostFolder>$evidence</HostFolder>
+      <SandboxFolder>C:\A4S\Evidence</SandboxFolder>
+      <ReadOnly>false</ReadOnly>
+    </MappedFolder>
+  </MappedFolders>
+  <LogonCommand>
+    <Command>$command</Command>
+  </LogonCommand>
+</Configuration>
+"@
+}
+
+function Write-Utf8NoBomAtomic {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Text
+    )
+    $temporary = "$Path.new"
+    if (Test-Path -LiteralPath $temporary) { throw "Temporary output collision: $temporary" }
+    [IO.File]::WriteAllText($temporary, $Text, [Text.UTF8Encoding]::new($false))
+    [IO.File]::Move($temporary, $Path)
+}
+
+function Assert-ContractModel {
+    $xmlText = New-SandboxConfigurationText -HostRepo 'C:\Qualification\Repo' `
+        -HostEvidence 'D:\Qualification Evidence\Session'
+    [xml]$xml = $xmlText
+    if ($xml.Configuration.Networking -cne 'Disable' -or
+        $xml.Configuration.ClipboardRedirection -cne 'Disable' -or
+        $xml.Configuration.PrinterRedirection -cne 'Disable' -or
+        $xml.Configuration.AudioInput -cne 'Disable' -or
+        $xml.Configuration.VideoInput -cne 'Disable' -or
+        $xml.Configuration.vGPU -cne 'Disable' -or
+        $xml.Configuration.ProtectedClient -cne 'Enable') {
+        throw 'The in-memory Sandbox isolation contract is incomplete.'
+    }
+    $mappings = @($xml.Configuration.MappedFolders.MappedFolder)
+    if ($mappings.Count -ne 2 -or $mappings[0].ReadOnly -cne 'true' -or
+        $mappings[1].ReadOnly -cne 'false') {
+        throw 'The in-memory Sandbox mapping contract is incomplete.'
+    }
+    if ($xml.Configuration.LogonCommand.Command -notmatch
+        'Invoke-A4SLegacySandboxGuest\.ps1.*request\.json') {
+        throw 'The guest entry point is missing from the Sandbox configuration.'
+    }
+    Write-Host 'A4S legacy Sandbox host in-memory contract passed.'
+}
+
+if ($ContractSelfTest) {
+    Assert-ContractModel
+    return
+}
+
+if (-not $AllowSandboxLaunch) {
+    throw 'Windows Sandbox is not launched by default. Review the runner, then pass -AllowSandboxLaunch.'
+}
+if (-not [Environment]::Is64BitProcess) { throw 'Run this host orchestrator from 64-bit PowerShell.' }
+foreach ($required in @($V2SetupPath, $ExpectedV2SetupSha256,
+        $ExpectedV2HostSha256, $ExpectedV2MenuSha256)) {
+    if ([string]::IsNullOrWhiteSpace($required)) {
+        throw 'V2SetupPath and all three reviewed V2 SHA-256 values are required.'
+    }
+}
+
+$repoRoot = Assert-LocalFixedPath $repoRoot
+Assert-NoReparsePointInExistingChain $repoRoot
+$guestScript = Assert-RegularFile (Join-Path $repoRoot $guestScriptRelativePath)
+$v1Setup = Assert-RegularFile (Join-Path $repoRoot $v1SetupRelativePath)
+$v2Setup = Assert-RegularFile $V2SetupPath
+$v2RelativePath = ConvertTo-GuestRelativePath $v2Setup
+$evidenceRootFull = Assert-LocalFixedPath $EvidenceRoot
+Assert-NoReparsePointInExistingChain $evidenceRootFull
+if ((Test-PathWithin -Candidate $evidenceRootFull -Parent $repoRoot) -or
+    (Test-PathWithin -Candidate $repoRoot -Parent $evidenceRootFull)) {
+    throw 'The writable evidence root must be disjoint from the read-only repository mapping.'
+}
+$hostInstallRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'A4SMenu'))
+if ((Test-PathWithin -Candidate $evidenceRootFull -Parent $hostInstallRoot) -or
+    (Test-PathWithin -Candidate $hostInstallRoot -Parent $evidenceRootFull) -or
+    $evidenceRootFull.Equals($hostInstallRoot, [StringComparison]::OrdinalIgnoreCase)) {
+    throw 'The writable evidence root must be disjoint from the real A4S install root.'
+}
+
+$v1Identity = Get-FileIdentity $v1Setup
+$v2Identity = Get-FileIdentity $v2Setup
+if ($v1Identity.Sha256 -cne $frozenV1.SetupSha256 -or
+    $v1Identity.ProductVersion -cne $frozenV1.Version -or
+    $v1Identity.OriginalFilename -cne 'A4SMenuSetup.exe') {
+    throw 'The frozen V1 setup identity is not the reviewed 1.0.0.0 fixture.'
+}
+$expectedV2Setup = Normalize-Sha256 $ExpectedV2SetupSha256
+if ($v2Identity.Sha256 -cne $expectedV2Setup -or
+    $v2Identity.ProductVersion -cne $ExpectedV2Version -or
+    $v2Identity.OriginalFilename -cne 'A4SMenuSetup.exe') {
+    throw 'The V2 setup identity does not match the reviewed 1.1.0.0 input.'
+}
+
+$sandboxCommand = Get-Command WindowsSandbox.exe -CommandType Application -ErrorAction Stop
+$existingSandboxes = @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessName -match '^WindowsSandbox' })
+if ($existingSandboxes.Count -ne 0) {
+    throw 'Close every existing Windows Sandbox before starting an isolated lifecycle qualification.'
+}
+$activeA4SProcesses = @(Get-Process -ErrorAction SilentlyContinue |
+    Where-Object { $_.ProcessName -match '^A4SMenu(?:Host|Setup|Cleanup)' })
+if ($activeA4SProcesses.Count -ne 0) {
+    throw 'Stop every A4S host/setup/cleanup process before the host-state isolation preflight.'
+}
+$featureState = 'NotQueried'
+if (Get-Command Get-WindowsOptionalFeature -ErrorAction SilentlyContinue) {
+    $feature = $null
+    try {
+        $feature = Get-WindowsOptionalFeature -Online `
+            -FeatureName Containers-DisposableClientVM -ErrorAction Stop
+        $featureState = [string]$feature.State
+    }
+    catch { $featureState = 'QueryUnavailableExecutablePresent' }
+    if ($null -ne $feature -and $featureState -cne 'Enabled') {
+        throw "Windows Sandbox optional feature state is $featureState, not Enabled."
+    }
+}
+
+$hostExplorerPid = Get-HostExplorerPid
+$hostBefore = Get-HostProductSnapshot
+$hostBeforeSha256 = Get-ObjectSha256 $hostBefore
+Start-Sleep -Milliseconds 500
+$hostPreflightConfirmation = Get-HostProductSnapshot
+if ((Get-ObjectSha256 $hostPreflightConfirmation) -cne $hostBeforeSha256 -or
+    (Get-HostExplorerPid) -ne $hostExplorerPid) {
+    throw 'The real A4S profile or Explorer changed during the clean host preflight.'
+}
+$sessionId = [Guid]::NewGuid().ToString('D')
+$nonceBytes = [byte[]]::new(32)
+$nonceGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
+try { $nonceGenerator.GetBytes($nonceBytes) }
+finally { $nonceGenerator.Dispose() }
+$nonce = ([BitConverter]::ToString($nonceBytes)).Replace('-', '')
+$sessionDirectory = Join-Path $evidenceRootFull $sessionId
+if (Test-Path -LiteralPath $sessionDirectory) { throw "Evidence session collision: $sessionDirectory" }
+[IO.Directory]::CreateDirectory($sessionDirectory) | Out-Null
+Assert-NoReparsePointInExistingChain $sessionDirectory
+
+$request = [ordered]@{
+    SchemaVersion = 1
+    Purpose = 'A4S frozen-V1 to reviewed-V2 Windows Sandbox lifecycle qualification'
+    SessionId = $sessionId
+    Nonce = $nonce
+    GuestRepoRoot = 'C:\A4S\Repo'
+    GuestEvidenceRoot = 'C:\A4S\Evidence'
+    V1SetupRelativePath = $v1SetupRelativePath
+    V2SetupRelativePath = $v2RelativePath
+    V1 = $frozenV1
+    V2 = [ordered]@{
+        Version = $ExpectedV2Version
+        SetupSha256 = $expectedV2Setup
+        HostSha256 = Normalize-Sha256 $ExpectedV2HostSha256
+        MenuSha256 = Normalize-Sha256 $ExpectedV2MenuSha256
+    }
+    RequiredMatrix = @(
+        'install-v1', 'update-v1-to-v2', 'rollback-v2-to-v1',
+        'update-v1-to-v2-again', 'repair-v2-same-version', 'uninstall-v2'
+    )
+    ExplorerRestartAuthorized = $false
+    CreatedUtc = [DateTime]::UtcNow.ToString('o')
+    HostPreflight = [ordered]@{
+        ExplorerPid = $hostExplorerPid
+        ProductStateSha256 = $hostBeforeSha256
+        WindowsSandboxExecutable = $sandboxCommand.Source
+        OptionalFeatureState = $featureState
+        RepositoryPath = $repoRoot
+        GuestScriptSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $guestScript).Hash.ToUpperInvariant()
+        V1Setup = $v1Identity
+        V2Setup = $v2Identity
+    }
+}
+$requestPath = Join-Path $sessionDirectory 'request.json'
+Write-Utf8NoBomAtomic -Path $requestPath `
+    -Text ($request | ConvertTo-Json -Depth 100)
+$requestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $requestPath).Hash.ToUpperInvariant()
+$configurationText = New-SandboxConfigurationText -HostRepo $repoRoot -HostEvidence $sessionDirectory
+$configurationPath = Join-Path $sessionDirectory 'A4SLegacyLifecycle.wsb'
+Write-Utf8NoBomAtomic -Path $configurationPath -Text $configurationText
+$configurationSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $configurationPath).Hash.ToUpperInvariant()
+
+$launchRecord = [ordered]@{
+    SchemaVersion = 1
+    SessionId = $sessionId
+    Nonce = $nonce
+    RequestSha256 = $requestSha256
+    ConfigurationSha256 = $configurationSha256
+    StartedUtc = [DateTime]::UtcNow.ToString('o')
+    SandboxProcessId = $null
+    Completion = $null
+    HostBefore = $hostBefore
+    HostAfter = $null
+    HostStateUnchanged = $false
+    ExplorerPidUnchanged = $false
+    Succeeded = $false
+    Failure = $null
+}
+$hostResultPath = Join-Path $sessionDirectory 'host-result.json'
+Write-Utf8NoBomAtomic -Path $hostResultPath `
+    -Text ($launchRecord | ConvertTo-Json -Depth 100)
+
+$sandboxProcess = Start-Process -FilePath $sandboxCommand.Source `
+    -ArgumentList ('"' + $configurationPath + '"') -PassThru
+$launchRecord.SandboxProcessId = $sandboxProcess.Id
+$startedHostResult = "$hostResultPath.started"
+Write-Utf8NoBomAtomic -Path $startedHostResult `
+    -Text ($launchRecord | ConvertTo-Json -Depth 100)
+[IO.File]::Replace($startedHostResult, $hostResultPath, $null)
+$completionPath = Join-Path $sessionDirectory 'completion.json'
+$deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
+$processExitObservedUtc = $null
+$completion = $null
+$guestEvidencePath = Join-Path $sessionDirectory 'evidence.json'
+$hostFailure = $null
+try {
+    while ([DateTime]::UtcNow -lt $deadline) {
+        if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
+            try {
+                $completion = Get-Content -Raw -LiteralPath $completionPath |
+                    ConvertFrom-Json -ErrorAction Stop
+                break
+            }
+            catch {
+                # The guest publishes by rename, but tolerate visibility latency
+                # in the mapped folder rather than consuming a partial file.
+            }
+        }
+        # Windows versions differ on whether the initial launcher remains the
+        # long-lived UI process. Since preflight rejected an existing Sandbox,
+        # any WindowsSandbox* process now belongs to this one launch.
+        $sandboxFamily = @(Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { $_.ProcessName -match '^WindowsSandbox' })
+        if ($sandboxFamily.Count -ne 0) {
+            $processExitObservedUtc = $null
+        }
+        elseif ($null -eq $processExitObservedUtc) {
+            $processExitObservedUtc = [DateTime]::UtcNow
+        }
+        if ($null -ne $processExitObservedUtc -and
+            ([DateTime]::UtcNow - $processExitObservedUtc).TotalSeconds -ge 15) {
+            throw 'Windows Sandbox exited without publishing a completion record.'
+        }
+        Start-Sleep -Milliseconds 500
+    }
+    if ($null -eq $completion) {
+        throw "Timed out after $TimeoutMinutes minutes waiting for the guest completion record. The runner did not terminate Windows Sandbox."
+    }
+    if ([int]$completion.SchemaVersion -ne 1 -or
+        [string]$completion.SessionId -cne $sessionId -or
+        [string]$completion.Nonce -cne $nonce -or
+        [string]$completion.RequestSha256 -cne $requestSha256 -or
+        [string]$completion.EvidenceFile -cne 'evidence.json' -or
+        [string]$completion.EvidenceSha256 -notmatch '^[0-9A-F]{64}$') {
+        throw 'The guest completion record does not authenticate this exact Sandbox request.'
+    }
+    if (-not (Test-Path -LiteralPath $guestEvidencePath -PathType Leaf)) {
+        throw 'The guest completion record names missing evidence.json.'
+    }
+    $actualGuestEvidenceSha256 =
+        (Get-FileHash -Algorithm SHA256 -LiteralPath $guestEvidencePath).Hash.ToUpperInvariant()
+    if ($actualGuestEvidenceSha256 -cne [string]$completion.EvidenceSha256) {
+        throw 'Guest evidence.json does not match the completion-record SHA-256.'
+    }
+    $guestEvidence = Get-Content -Raw -LiteralPath $guestEvidencePath |
+        ConvertFrom-Json -ErrorAction Stop
+    if ([int]$guestEvidence.SchemaVersion -ne 1 -or
+        [string]$guestEvidence.SessionId -cne $sessionId -or
+        [string]$guestEvidence.Nonce -cne $nonce -or
+        [string]$guestEvidence.RequestSha256 -cne $requestSha256 -or
+        -not [bool]$guestEvidence.Succeeded -or
+        [string]$guestEvidence.Environment.Configuration.Sha256 -cne $configurationSha256 -or
+        (@($guestEvidence.Steps | ForEach-Object { [string]$_.Name }) -join '|') -cne
+            (@($request.RequiredMatrix) -join '|') -or
+        [string]$guestEvidence.FinalDisposition.State -cne
+            'LogicallyUninstalledPhysicalCleanupPendingExplorerExit') {
+        throw 'Guest evidence content does not prove the exact requested matrix and configuration.'
+    }
+}
+catch {
+    $hostFailure = $_
+    $launchRecord.Failure = [ordered]@{
+        Message = $_.Exception.Message
+        Category = [string]$_.CategoryInfo.Category
+        ScriptStackTrace = $_.ScriptStackTrace
+        CapturedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+}
+
+try {
+    $hostAfter = Get-HostProductSnapshot
+    $hostAfterSha256 = Get-ObjectSha256 $hostAfter
+    $hostExplorerAfter = Get-HostExplorerPid
+    $launchRecord.HostAfter = $hostAfter
+    $launchRecord.HostStateUnchanged = $hostAfterSha256 -ceq $hostBeforeSha256
+    $launchRecord.ExplorerPidUnchanged = $hostExplorerAfter -eq $hostExplorerPid
+}
+catch {
+    if ($null -eq $hostFailure) { $hostFailure = $_ }
+    if ($null -eq $launchRecord.Failure) {
+        $launchRecord.Failure = [ordered]@{
+            Message = $_.Exception.Message
+            Category = [string]$_.CategoryInfo.Category
+            ScriptStackTrace = $_.ScriptStackTrace
+            CapturedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+    }
+}
+$launchRecord.Completion = $completion
+$launchRecord.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+$launchRecord.Succeeded = $null -eq $hostFailure -and
+    $launchRecord.HostStateUnchanged -and $launchRecord.ExplorerPidUnchanged -and
+    $null -ne $completion -and [string]$completion.Status -ceq 'Passed'
+$updatedHostResult = "$hostResultPath.updated"
+Write-Utf8NoBomAtomic -Path $updatedHostResult `
+    -Text ($launchRecord | ConvertTo-Json -Depth 100)
+[IO.File]::Replace($updatedHostResult, $hostResultPath, $null)
+
+if ($null -ne $hostFailure) {
+    throw "Sandbox qualification host validation failed: $($hostFailure.Exception.Message) Evidence: $hostResultPath"
+}
+if (-not $launchRecord.HostStateUnchanged) {
+    throw "Host A4S product state changed during Sandbox qualification. Evidence: $hostResultPath"
+}
+if (-not $launchRecord.ExplorerPidUnchanged) {
+    throw "Host Explorer PID changed during Sandbox qualification. Evidence: $hostResultPath"
+}
+if ([string]$completion.Status -cne 'Passed') {
+    throw "The Sandbox lifecycle matrix failed. Evidence: $guestEvidencePath"
+}
+
+Write-Host "A4S legacy Sandbox lifecycle passed. Evidence: $guestEvidencePath"
+Write-Host 'Windows Sandbox is left open for inspection; close it manually when finished.'
