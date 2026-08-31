@@ -123,6 +123,8 @@ $restore = Get-CppFunctionBody $container 'bool CMenuContainer::RestoreA4SRootIt
 $publish = Get-CppFunctionBody $container 'void CMenuContainer::PublishA4SRootItems( ULONGLONG folderGeneration,'
 $invalidate = Get-CppFunctionBody $container 'void CMenuContainer::InvalidateA4SRootCache( bool bEnvironment )'
 $clearEnvironment = Get-CppFunctionBody $container 'void ClearEnvironment( void )'
+Assert-Contract ($invalidate -match 'if\s*\(bEnvironment\)\s*g_ItemManager\.ForceA4SFolderWatchReconfigure\(\)') `
+    'environment invalidation does not force same-mask known-folder/watch re-resolution'
 foreach ($body in @($restore, $publish)) {
     Assert-Contract ($body -match 'item\.Clone\(\*it\)') 'a snapshot direction does not deep-clone MenuItem PIDLs'
     Assert-Contract ($body -match 'GetFolderContentGeneration\(\)!=folderGeneration' -and

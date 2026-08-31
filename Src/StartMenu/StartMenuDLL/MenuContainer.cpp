@@ -550,6 +550,12 @@ CMenuContainer::A4SRootCache &CMenuContainer::GetA4SRootCache( void )
 
 void CMenuContainer::InvalidateA4SRootCache( bool bEnvironment )
 {
+	// Environment/policy broadcasts may redirect a known folder or change the
+	// configured pinned path without changing the required bit mask. Force the
+	// watcher to resolve and bind the new canonical identities before any cache
+	// can become eligible again.
+	if (bEnvironment)
+		g_ItemManager.ForceA4SFolderWatchReconfigure();
 	if (!s_pA4SRootCache)
 		return;
 	A4SRootCache &cache=*s_pA4SRootCache;

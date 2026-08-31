@@ -25,7 +25,7 @@ struct MetroLink
 };
 
 // Returns a list of links for all metro apps
-void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10=NULL );
+HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10=NULL );
 
 // Executes the metro link of the given item info
 void ExecuteMetroLink( const CItemManager::ItemInfo *pInfo );

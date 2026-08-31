@@ -164,9 +164,11 @@ Assert-Contract ($itemHeader -match 'HRESULT\s+GetResult\(\s*void\s*\)\s+const' 
 Assert-Contract ($itemSource -match 'CShellItemEnumerator::CShellItemEnumerator\(\s*IShellItem\s*\*pFolder\s*\)\s*:\s*m_Result\(E_FAIL\)' -and
     $enumeratorCtor -match 'm_Result=m_pEnumItems\?S_OK') `
     'enumerator construction does not preserve its terminal HRESULT'
-Assert-Contract ($enumeratorNext -match 'm_Result=nextResult' -and
-    $enumeratorNext -match 'm_Result=pidlResult' -and
-    $enumeratorNext -match 'm_Result=createResult') `
+Assert-Contract ($enumeratorNext -match 'm_Result=nextResult==S_OK\?E_UNEXPECTED:nextResult' -and
+    $enumeratorNext -match 'm_Result=FAILED\(pidlResult\)\?pidlResult:E_UNEXPECTED' -and
+    $enumeratorNext -match 'm_Result=FAILED\(createResult\)\?createResult:E_UNEXPECTED' -and
+    $enumeratorNext -match 'nextResult!=S_OK\s*\|\|\s*!child' -and
+    $enumeratorNext -match 'nextResult!=S_OK\s*\|\|\s*!pChild0') `
     'mid-stream shell enumeration failures are collapsed into clean exhaustion'
 Assert-Contract ($treeHeader -match 'A4S_ASYNC_SUCCESS[\s\S]*A4S_ASYNC_CANCELLED[\s\S]*A4S_ASYNC_FAILURE') `
     'snapshot construction does not propagate success/cancel/failure outcomes'

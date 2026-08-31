@@ -107,6 +107,7 @@ public:
 			validFlags=refreshFlags=0;
 #ifdef A4S_PRODUCT
 			a4sResolvedIconFlags=0;
+			a4sPathIdentityGeneration=0;
 #endif
 			bIconOnly=bTemp=bLink=bExplicitAppId=bNoPin=bNoNew=bMetroLink=bMetroApp=bProtectedLink=false;
 			writestamp.dwHighDateTime=writestamp.dwLowDateTime=0;
@@ -164,6 +165,7 @@ public:
 		// separate from validFlags because legacy StartScreen icon paths
 		// intentionally opt out of persistent icon validation.
 		int a4sResolvedIconFlags;
+		ULONGLONG a4sPathIdentityGeneration;
 #endif
 
 		CAbsolutePidl targetPidl;
@@ -197,8 +199,10 @@ public:
 #ifdef A4S_PRODUCT
 	ULONGLONG GetFolderContentGeneration( void ) const;
 	ULONGLONG GetIconCacheEpoch( void ) const;
+	ULONGLONG GetA4SPathIdentityGeneration( void ) const;
 	void ConfigureA4SFolderWatches( bool bNoCommonFolders,
 		bool bClassicPinnedRoot, bool bMetroAppsSurface );
+	void ForceA4SFolderWatchReconfigure( void );
 	bool IsFolderWatchBaselineReady( void ) const;
 	bool WaitForFolderWatchBaseline( DWORD timeout ) const;
 #endif
@@ -414,19 +418,24 @@ private:
 	volatile LONG m_PendingPidlRefresh;
 	volatile LONGLONG m_FolderContentGeneration;
 	volatile LONGLONG m_IconCacheEpoch;
+	volatile LONGLONG m_A4SPathIdentityGeneration;
+	volatile LONGLONG m_A4SWatchConfigurationGeneration;
+	volatile LONGLONG m_A4SPublishedWatchConfigurationGeneration;
+	volatile LONGLONG m_A4SPublishedWatchIdentityHash;
 	volatile LONG m_A4SFolderWatchReady;
 	volatile LONG m_A4SRequiredWatchMask;
 	volatile LONG m_A4SArmedWatchMask;
 	void AdvanceFolderContentGeneration( void );
 	void AdvanceIconCacheEpoch( void );
+	void AdvanceA4SPathIdentityGeneration( void );
 	void RevokeA4SFolderWatchBaseline( void );
 #endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;
 	bool m_bOldInvertIcons;
 
-	void LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location );
-	void LoadMetroItems( int refreshFlags );
+	HRESULT LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location );
+	HRESULT LoadMetroItems( int refreshFlags );
 	void PreloadItemsThread( void );
 	void CreateDefaultIcons( void );
 	static DWORD CALLBACK StaticPreloadItemsThread( void *param );

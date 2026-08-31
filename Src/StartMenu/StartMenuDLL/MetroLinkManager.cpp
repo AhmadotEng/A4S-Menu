@@ -27,20 +27,30 @@ GUID CLSID_PinExt={0x90AA3A4E,0x1CBA,0x4233,{0xB8,0xBB,0x53,0x57,0x73,0xD4,0x84,
 const wchar_t *MetroAppClassId=L"Launcher.ImmersiveApplication";
 
 // Returns a list of links for all metro apps
-void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10 )
+HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10 )
 {
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (start)");
 	if (bLog && !(g_LogCategories&LOG_APPS))
 		bLog=false;
 	CComPtr<IShellItem> pApps;
-	if (FAILED(ShGetKnownFolderItem(FOLDERID_AppsFolder2,&pApps)))
-		return;
+	HRESULT result=ShGetKnownFolderItem(FOLDERID_AppsFolder2,&pApps);
+	if (FAILED(result) || !pApps)
+		return FAILED(result)?result:E_UNEXPECTED;
 	CComPtr<IEnumShellItems> pEnum;
-	pApps->BindToHandler(NULL,BHID_EnumItems,IID_IEnumShellItems,(void**)&pEnum);
+	result=pApps->BindToHandler(NULL,BHID_EnumItems,IID_IEnumShellItems,
+		(void**)&pEnum);
+	if (FAILED(result) || !pEnum)
+		return FAILED(result)?result:E_UNEXPECTED;
 
 	CComPtr<IShellItem> pChild;
-	while (pEnum && (pChild=NULL,pEnum->Next(1,&pChild,NULL)==S_OK))
+	while (1)
 	{
+		pChild=NULL;
+		result=pEnum->Next(1,&pChild,NULL);
+		if (result==S_FALSE)
+			break;
+		if (result!=S_OK || !pChild)
+			return FAILED(result)?result:E_UNEXPECTED;
 		if (bLog)
 		{
 			CComString pName;
@@ -72,17 +82,18 @@ void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CStrin
 		}
 		if (GetWinVersion()>=WIN_VER_WIN10)
 		{
-			PIDLIST_ABSOLUTE pidl;
-			if (!bNonApp && SUCCEEDED(SHGetIDListFromObject(pChild,&pidl)))
+			PIDLIST_ABSOLUTE pidl=NULL;
+			if (!bNonApp)
 			{
+				result=SHGetIDListFromObject(pChild,&pidl);
+				if (FAILED(result) || !pidl)
+					return FAILED(result)?result:E_UNEXPECTED;
 				links.resize(links.size()+1);
 				MetroLink &link=*links.rbegin();
 				link.pidl.Attach(pidl);
 				link.appid=GetPropertyStoreString(pStore,PKEY_AppUserModel_ID);
 				link.pItem=pChild;
 			}
-			else
-				bNonApp=true;
 			if (bNonApp && pNonApps10)
 				pNonApps10->push_back(GetPropertyStoreString(pStore,PKEY_AppUserModel_ID));
 			continue;
@@ -102,10 +113,17 @@ void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CStrin
 		}
 		PIDLIST_ABSOLUTE pidl=ILCloneFull((PIDLIST_ABSOLUTE)val.caub.pElems);
 		PropVariantClear(&val);
+		if (!pidl)
+			return E_OUTOFMEMORY;
 		links.resize(links.size()+1);
 		MetroLink &link=*links.rbegin();
 		link.pidl.Attach(pidl);
-		SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&link.pItem);
+		result=SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&link.pItem);
+		if (FAILED(result) || !link.pItem)
+		{
+			links.pop_back();
+			return FAILED(result)?result:E_UNEXPECTED;
+		}
 		if (bLog && link.pItem)
 		{
 			CComString pName;
@@ -114,6 +132,7 @@ void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CStrin
 		}
 	}
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (end)");
+	return S_OK;
 }
 
 void ExecuteMetroLink( const CItemManager::ItemInfo *pInfo )
