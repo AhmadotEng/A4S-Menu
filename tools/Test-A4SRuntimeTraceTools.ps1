@@ -31,6 +31,7 @@ Assert-A4S ($performanceSource -match 'AssociateA4SOpenWindow' -and $containerSo
 Assert-A4S ($performanceSource -match 'BeginA4SClosePath\(HWND window\)' -and $containerSource -match 'BeginA4SClosePath\(s_FirstMenu\)') 'close operations are not associated with their exact root menu window'
 Assert-A4S ($performanceSource -match 'matchesOpen=!window \|\| associated==window') 'an old hidden window can clear a newer open operation'
 Assert-A4S ($performanceSource -match 'if \(!window \|\| closeWindow==window\)') 'an unrelated hidden window can complete a newer close operation'
+Assert-A4S ($containerSource -match 'CMenuContainer::OnDestroy[\s\S]+if \(!m_bSubMenu\)[\s\S]+MarkA4SWindowHidden\(m_hWnd\)') 'direct root-window destruction does not complete the correlated close operation'
 
 $capturePath = Join-Path $PSScriptRoot 'Capture-A4SRuntimeTrace.ps1'
 $captureText = Get-Content -LiteralPath $capturePath -Raw

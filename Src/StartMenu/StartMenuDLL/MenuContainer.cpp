@@ -6790,6 +6790,14 @@ LRESULT CMenuContainer::OnChar( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& b
 
 LRESULT CMenuContainer::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
+#ifdef A4S_PRODUCT
+	// Normal menu closure destroys the root window directly and does not
+	// necessarily deliver WM_SHOWWINDOW(FALSE). Complete the correlated open
+	// and close operations while this exact HWND is still valid. A prior hide
+	// notification is harmless because MarkA4SWindowHidden is idempotent.
+	if (!m_bSubMenu)
+		MarkA4SWindowHidden(m_hWnd);
+#endif
 	KillTimer(TIMER_SEARCH_CARET);
 	m_bA4SSearchCaretVisible=false;
 	m_bA4SNativeCaretHidden=false;
