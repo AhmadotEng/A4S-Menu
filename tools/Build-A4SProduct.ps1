@@ -42,7 +42,12 @@ if (-not $SkipValidation) {
     & (Join-Path $PSScriptRoot 'Test-A4SLifecycleTools.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SCacheFirstMetadata.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SAsyncPrograms.ps1')
+    & (Join-Path $PSScriptRoot 'Test-A4SWarmRootCache.ps1')
+    & (Join-Path $PSScriptRoot 'Test-A4SLazySearch.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SPerformanceOptimizations.ps1')
+    & (Join-Path $PSScriptRoot 'Test-A4SRuntimeTraceTools.ps1')
+    & (Join-Path $PSScriptRoot 'Test-A4SPerformanceTools.ps1')
+    & (Join-Path $PSScriptRoot 'Test-A4SInstallerLifecycleContracts.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SProduct.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SSetup.ps1')
 }
