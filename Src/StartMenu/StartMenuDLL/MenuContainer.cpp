@@ -1133,7 +1133,13 @@ HRESULT CMenuContainer::AddFirstFolder( IShellItem *pFolder,
 
 	CShellItemEnumerator enumerator(pFolder);
 	if (!enumerator.IsValid())
+	{
+#ifdef A4S_PRODUCT
 		return FAILED(enumerator.GetResult())?enumerator.GetResult():result;
+#else
+		return result;
+#endif
+	}
 	
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
@@ -1244,9 +1250,11 @@ HRESULT CMenuContainer::AddFirstFolder( IShellItem *pFolder,
 		else if (SUCCEEDED(result))
 			result=hrName;
 	}
+#ifdef A4S_PRODUCT
 	HRESULT terminal=enumerator.GetResult();
 	if (FAILED(terminal) && SUCCEEDED(result))
 		result=terminal;
+#endif
 	return result;
 }
 
@@ -1265,7 +1273,13 @@ HRESULT CMenuContainer::AddSecondFolder( IShellItem *pFolder,
 
 	CShellItemEnumerator enumerator(pFolder);
 	if (!enumerator.IsValid())
+	{
+#ifdef A4S_PRODUCT
 		return FAILED(enumerator.GetResult())?enumerator.GetResult():result;
+#else
+		return result;
+#endif
+	}
 	
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
@@ -1389,9 +1403,11 @@ HRESULT CMenuContainer::AddSecondFolder( IShellItem *pFolder,
 		else if (SUCCEEDED(result))
 			result=hrName;
 	}
+#ifdef A4S_PRODUCT
 	HRESULT terminal=enumerator.GetResult();
 	if (FAILED(terminal) && SUCCEEDED(result))
 		result=terminal;
+#endif
 	return result;
 }
 

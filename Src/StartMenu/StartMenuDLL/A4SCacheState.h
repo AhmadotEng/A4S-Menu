@@ -3,6 +3,7 @@
 // state machine can be compiled and exercised without loading Explorer.
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 namespace A4SCacheState
@@ -43,6 +44,12 @@ namespace A4SCacheState
 		uint32_t completedMask )
 	{
 		return (completedMask&requestedRequiredMask)==requestedRequiredMask;
+	}
+
+	inline bool RequestedFolderLoadsComplete( uint32_t requestedMask,
+		uint32_t completedMask )
+	{
+		return (completedMask&requestedMask)==requestedMask;
 	}
 
 	// Win32 FILE_NOTIFY_CHANGE_* values. Keeping the reviewed product filter in
@@ -98,6 +105,122 @@ namespace A4SCacheState
 			left.normalizedPathIdentity==right.normalizedPathIdentity &&
 			left.sourceGeneration!=0 &&
 			left.sourceGeneration==right.sourceGeneration;
+	}
+
+	inline bool IsCanonicalPathSeparator( wchar_t value )
+	{
+		return value==L'\\' || value==L'/';
+	}
+
+	inline wchar_t FoldCanonicalPathCharacter( wchar_t value )
+	{
+		if (value>=L'a' && value<=L'z')
+			return value-(L'a'-L'A');
+		return IsCanonicalPathSeparator(value)?L'\\':value;
+	}
+
+	inline size_t CanonicalPathLengthWithoutTrailingSeparators(
+		const wchar_t *path )
+	{
+		if (!path)
+			return 0;
+		size_t length=0;
+		while (path[length])
+			length++;
+		while (length>1 && IsCanonicalPathSeparator(path[length-1]))
+			length--;
+		return length;
+	}
+
+	inline bool IsCanonicalPathWithinRoot( const wchar_t *path,
+		const wchar_t *root )
+	{
+		if (!path || !path[0] || !root || !root[0])
+			return false;
+		const size_t rootLength=
+			CanonicalPathLengthWithoutTrailingSeparators(root);
+		for (size_t i=0;i<rootLength;i++)
+		{
+			if (!path[i] || FoldCanonicalPathCharacter(path[i])!=
+				FoldCanonicalPathCharacter(root[i]))
+				return false;
+		}
+		return !path[rootLength] ||
+			IsCanonicalPathSeparator(path[rootLength]);
+	}
+
+	struct WatchRootView
+	{
+		uint32_t watchBit;
+		const wchar_t *canonicalPath;
+		uint64_t rootIdentity;
+		uint64_t identityGeneration;
+		uint64_t sourceGeneration;
+		bool filesystemBacked;
+	};
+
+	inline int SelectCanonicalWatchRoot( const wchar_t *canonicalPath,
+		const WatchRootView *roots, size_t count )
+	{
+		if (!canonicalPath || !canonicalPath[0] || !roots)
+			return -1;
+		int selected=-1;
+		size_t selectedLength=0;
+		for (size_t i=0;i<count;i++)
+		{
+			if (!roots[i].filesystemBacked || !roots[i].watchBit ||
+				!roots[i].rootIdentity || !roots[i].identityGeneration ||
+				!roots[i].sourceGeneration ||
+				!IsCanonicalPathWithinRoot(canonicalPath,
+					roots[i].canonicalPath))
+				continue;
+			const size_t rootLength=
+				CanonicalPathLengthWithoutTrailingSeparators(
+					roots[i].canonicalPath);
+			if (selected<0 || rootLength>selectedLength)
+			{
+				selected=static_cast<int>(i);
+				selectedLength=rootLength;
+			}
+		}
+		return selected;
+	}
+
+	struct WatchBindingIdentity
+	{
+		uint32_t watchBit;
+		uint64_t rootIdentity;
+		uint64_t identityGeneration;
+		uint64_t sourceGeneration;
+	};
+
+	inline bool WatchBindingMatches( const WatchBindingIdentity &validated,
+		const WatchBindingIdentity &current )
+	{
+		return validated.watchBit!=0 &&
+			validated.watchBit==current.watchBit &&
+			validated.rootIdentity!=0 &&
+			validated.rootIdentity==current.rootIdentity &&
+			validated.identityGeneration!=0 &&
+			validated.identityGeneration==current.identityGeneration &&
+			validated.sourceGeneration!=0 &&
+			validated.sourceGeneration==current.sourceGeneration;
+	}
+
+	struct RequiredMetroValueState
+	{
+		bool callSucceeded;
+		bool objectPresent;
+		bool typeValid;
+		bool valueRequired;
+		bool valuePresent;
+	};
+
+	inline bool RequiredMetroValueReady(
+		const RequiredMetroValueState &state )
+	{
+		return state.callSucceeded && state.objectPresent && state.typeValid &&
+			(!state.valueRequired || state.valuePresent);
 	}
 
 	struct CachedMetadataAdmissionState

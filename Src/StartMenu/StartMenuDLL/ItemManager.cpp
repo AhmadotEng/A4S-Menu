@@ -538,6 +538,8 @@ CItemManager::CItemManager( void )
 	m_A4SFolderWatchReady=0;
 	m_A4SRequiredWatchMask=A4SCacheState::RequiredFolderWatchMask(false,false,false);
 	m_A4SArmedWatchMask=0;
+	InitializeSRWLock(&m_A4SWatchRootLock);
+	m_A4SWatchRootTable.count=0;
 	m_A4SItemReadyEvent=NULL;
 	m_A4SFolderWatchReadyEvent=NULL;
 	m_A4SWatchRebuildEvent=NULL;
@@ -661,6 +663,7 @@ bool CItemManager::Init( void )
 	InterlockedExchange(&m_A4SArmedWatchMask,0);
 	InterlockedExchange64(&m_A4SPublishedWatchConfigurationGeneration,0);
 	InterlockedExchange64(&m_A4SPublishedWatchIdentityHash,0);
+	ClearA4SWatchRootTable();
 	m_A4SItemReadyEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
 	m_A4SFolderWatchReadyEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
 	m_A4SWatchRebuildEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
@@ -992,8 +995,18 @@ bool CItemManager::TryGetCachedFileMetadata( unsigned int hash, const CString &P
 			continue;
 
 		admission.entryStable=!info.bTemp && !info.refreshFlags && !info.newPidl;
-		admission.pathCoveredByWatchIdentity=
-			info.location==LOCATION_START_MENU || info.location==LOCATION_METRO;
+		A4SWatchRootBinding currentBinding={};
+		const bool bMapped=!info.a4sCanonicalPath.IsEmpty() &&
+			ResolveA4SItemWatchBinding(info.a4sCanonicalPath,currentBinding);
+		A4SCacheState::WatchBindingIdentity validated={
+			info.a4sWatchRootBit,info.a4sWatchRootIdentity,
+			info.a4sPathIdentityGeneration,info.a4sWatchSourceGeneration};
+		A4SCacheState::WatchBindingIdentity current={
+			currentBinding.watchBit,currentBinding.rootIdentity,
+			currentBinding.identityGeneration,currentBinding.sourceGeneration};
+		admission.pathCoveredByWatchIdentity=bMapped &&
+			info.packagePath.IsEmpty() &&
+			A4SCacheState::WatchBindingMatches(validated,current);
 		admission.requestedFlagsComplete=
 			(info.validFlags&requiredFlags)==requiredFlags;
 		admission.validatedPathGeneration=info.a4sPathIdentityGeneration;
@@ -1042,16 +1055,20 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 
 	FILETIME writeTime={0}, createTime={0};
 #ifdef A4S_PRODUCT
-	const ULONGLONG a4sValidationGeneration=GetA4SPathIdentityGeneration();
 	bool bA4SFileMetadataValidated=false;
+	CString a4sCanonicalPath;
+	A4SWatchRootBinding a4sValidatedBinding={};
 	const bool bUseCachedFileMetadata=TryGetCachedFileMetadata(hash,PATH,refreshFlags,writeTime,createTime);
 #endif
 	if (!path.IsEmpty())
 	{
 #ifdef A4S_PRODUCT
-		if (!bUseCachedFileMetadata)
-#endif
+		if (!bUseCachedFileMetadata &&
+			!GetA4SFileMetadataAndBinding(path,writeTime,createTime,
+				a4sCanonicalPath,a4sValidatedBinding))
+#else
 		if (!MenuGetFileTimestamp(path,&writeTime,&createTime))
+#endif
 		{
 			if (refreshFlags&INFO_VALIDATE_FILE)
 				return NULL;
@@ -1089,10 +1106,19 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 			pInfo->extraLargeIcon=m_DefaultExtraLargeIcon;
 			pInfo->validFlags=0;
 #ifdef A4S_PRODUCT
-			pInfo->a4sPathIdentityGeneration=
-				bA4SFileMetadataValidated &&
-				GetA4SPathIdentityGeneration()==a4sValidationGeneration?
-				a4sValidationGeneration:0;
+			const bool bBindingCurrent=bA4SFileMetadataValidated &&
+				a4sValidatedBinding.watchBit &&
+				IsA4SItemWatchBindingCurrent(a4sCanonicalPath,
+					a4sValidatedBinding);
+			pInfo->a4sPathIdentityGeneration=bBindingCurrent?
+				a4sValidatedBinding.identityGeneration:0;
+			pInfo->a4sWatchRootBit=bBindingCurrent?
+				a4sValidatedBinding.watchBit:0;
+			pInfo->a4sWatchRootIdentity=bBindingCurrent?
+				a4sValidatedBinding.rootIdentity:0;
+			pInfo->a4sWatchSourceGeneration=bBindingCurrent?
+				a4sValidatedBinding.sourceGeneration:0;
+			pInfo->a4sCanonicalPath=bBindingCurrent?a4sCanonicalPath:CString();
 #endif
 		}
 		else
@@ -1124,10 +1150,22 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 			}
 #ifdef A4S_PRODUCT
 			if (!bUseCachedFileMetadata)
-				pInfo->a4sPathIdentityGeneration=
-					bA4SFileMetadataValidated &&
-					GetA4SPathIdentityGeneration()==a4sValidationGeneration?
-					a4sValidationGeneration:0;
+			{
+				const bool bBindingCurrent=bA4SFileMetadataValidated &&
+					pInfo->packagePath.IsEmpty() &&
+					a4sValidatedBinding.watchBit &&
+					IsA4SItemWatchBindingCurrent(a4sCanonicalPath,
+						a4sValidatedBinding);
+				pInfo->a4sPathIdentityGeneration=bBindingCurrent?
+					a4sValidatedBinding.identityGeneration:0;
+				pInfo->a4sWatchRootBit=bBindingCurrent?
+					a4sValidatedBinding.watchBit:0;
+				pInfo->a4sWatchRootIdentity=bBindingCurrent?
+					a4sValidatedBinding.rootIdentity:0;
+				pInfo->a4sWatchSourceGeneration=bBindingCurrent?
+					a4sValidatedBinding.sourceGeneration:0;
+				pInfo->a4sCanonicalPath=bBindingCurrent?a4sCanonicalPath:CString();
+			}
 #endif
 		}
 		if (pInfo->location==LOCATION_UNKNOWN && !pInfo->PATH.IsEmpty())
@@ -1178,12 +1216,16 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 
 	FILETIME writeTime={0}, createTime={0};
 #ifdef A4S_PRODUCT
-	const ULONGLONG a4sValidationGeneration=GetA4SPathIdentityGeneration();
 	bool bA4SFileMetadataValidated=false;
+	CString a4sCanonicalPath;
+	A4SWatchRootBinding a4sValidatedBinding={};
 	const bool bUseCachedFileMetadata=TryGetCachedFileMetadata(hash,PATH,refreshFlags,writeTime,createTime);
-	if (!bUseCachedFileMetadata)
-#endif
+	if (!bUseCachedFileMetadata &&
+		!GetA4SFileMetadataAndBinding(path,writeTime,createTime,
+			a4sCanonicalPath,a4sValidatedBinding))
+#else
 	if (!MenuGetFileTimestamp(path,&writeTime,&createTime))
+#endif
 	{
 		if (refreshFlags&INFO_VALIDATE_FILE)
 			return NULL;
@@ -1222,10 +1264,19 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 			pInfo->extraLargeIcon=m_DefaultExtraLargeIcon;
 			pInfo->validFlags=0;
 #ifdef A4S_PRODUCT
-			pInfo->a4sPathIdentityGeneration=
-				bA4SFileMetadataValidated &&
-				GetA4SPathIdentityGeneration()==a4sValidationGeneration?
-				a4sValidationGeneration:0;
+			const bool bBindingCurrent=bA4SFileMetadataValidated &&
+				a4sValidatedBinding.watchBit &&
+				IsA4SItemWatchBindingCurrent(a4sCanonicalPath,
+					a4sValidatedBinding);
+			pInfo->a4sPathIdentityGeneration=bBindingCurrent?
+				a4sValidatedBinding.identityGeneration:0;
+			pInfo->a4sWatchRootBit=bBindingCurrent?
+				a4sValidatedBinding.watchBit:0;
+			pInfo->a4sWatchRootIdentity=bBindingCurrent?
+				a4sValidatedBinding.rootIdentity:0;
+			pInfo->a4sWatchSourceGeneration=bBindingCurrent?
+				a4sValidatedBinding.sourceGeneration:0;
+			pInfo->a4sCanonicalPath=bBindingCurrent?a4sCanonicalPath:CString();
 #endif
 		}
 		else
@@ -1260,10 +1311,22 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 			}
 #ifdef A4S_PRODUCT
 			if (!bUseCachedFileMetadata)
-				pInfo->a4sPathIdentityGeneration=
-					bA4SFileMetadataValidated &&
-					GetA4SPathIdentityGeneration()==a4sValidationGeneration?
-					a4sValidationGeneration:0;
+			{
+				const bool bBindingCurrent=bA4SFileMetadataValidated &&
+					pInfo->packagePath.IsEmpty() &&
+					a4sValidatedBinding.watchBit &&
+					IsA4SItemWatchBindingCurrent(a4sCanonicalPath,
+						a4sValidatedBinding);
+				pInfo->a4sPathIdentityGeneration=bBindingCurrent?
+					a4sValidatedBinding.identityGeneration:0;
+				pInfo->a4sWatchRootBit=bBindingCurrent?
+					a4sValidatedBinding.watchBit:0;
+				pInfo->a4sWatchRootIdentity=bBindingCurrent?
+					a4sValidatedBinding.rootIdentity:0;
+				pInfo->a4sWatchSourceGeneration=bBindingCurrent?
+					a4sValidatedBinding.sourceGeneration:0;
+				pInfo->a4sCanonicalPath=bBindingCurrent?a4sCanonicalPath:CString();
+			}
 #endif
 		}
 		if (pInfo->location==LOCATION_UNKNOWN && !pInfo->PATH.IsEmpty())
@@ -2680,6 +2743,7 @@ void CItemManager::RevokeA4SFolderWatchBaseline( void )
 	InterlockedExchange(&m_A4SArmedWatchMask,0);
 	if (m_A4SFolderWatchReadyEvent)
 		ResetEvent(m_A4SFolderWatchReadyEvent);
+	ClearA4SWatchRootTable();
 	// Generation changes before callers can observe readiness again. Any cache
 	// that raced the old ready state therefore fails its final epoch check.
 	AdvanceFolderContentGeneration();
@@ -3277,6 +3341,7 @@ void CItemManager::LoadCustomIcon(const wchar_t *iconPath, int iconIndex, int re
 }
 
 // Recursive function to preload the items for a folder
+#ifdef A4S_PRODUCT
 HRESULT CItemManager::LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location )
 {
 	if (m_LoadingStage!=LOAD_LOADING)
@@ -3336,6 +3401,46 @@ HRESULT CItemManager::LoadFolderItems( IShellItem *pFolder, int refreshFlags, in
 		return HRESULT_FROM_WIN32(ERROR_CANCELLED);
 	return terminal==S_FALSE?S_OK:(FAILED(terminal)?terminal:E_UNEXPECTED);
 }
+#else
+void CItemManager::LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location )
+{
+	CShellItemEnumerator enumerator(pFolder);
+	if (!enumerator.IsValid()) return;
+
+	int queueFlags=refreshFlags&INFO_ICON;
+	refreshFlags&=~INFO_ICON;
+	CComPtr<IShellItem> pChild;
+	CAbsolutePidl childPidl;
+	while (enumerator.GetNext(pChild,childPidl))
+	{
+		if (location==CItemManager::LOCATION_DESKTOP)
+		{
+			// collect only links from the desktop. this is an attempt to skip the SkyDrive item, which is causing problems.
+			SFGAOF attr=0;
+			if (FAILED(pChild->GetAttributes(SFGAO_LINK,&attr)) || !(attr&SFGAO_LINK))
+				continue;
+		}
+		if (m_LoadingStage!=LOAD_LOADING) break;
+
+		ItemInfo *pItemInfo=const_cast<ItemInfo*>(GetItemInfo(pChild,childPidl,refreshFlags,location));
+		if (queueFlags)
+		{
+			RWLock lock(this,true,RWLOCK_ITEMS);
+			QueueItemInfo(pItemInfo,queueFlags);
+		}
+
+		if (levels>1)
+		{
+			SFGAOF flags=0;
+			if (SUCCEEDED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_STREAM|SFGAO_LINK,&flags)) && (flags&(SFGAO_FOLDER|SFGAO_STREAM|SFGAO_LINK))==SFGAO_FOLDER)
+			{
+				// go into subfolders but not archives or links to folders
+				LoadFolderItems(pChild,refreshFlags|queueFlags,levels-1,location);
+			}
+		}
+	}
+}
+#endif
 
 CItemManager::TLocation CItemManager::DetermineLocation( const wchar_t *PATH )
 {
@@ -3357,6 +3462,7 @@ CItemManager::TLocation CItemManager::DetermineLocation( const wchar_t *PATH )
 }
 
 // Recursive function to preload the metro apps
+#ifdef A4S_PRODUCT
 HRESULT CItemManager::LoadMetroItems( int refreshFlags )
 {
 	if (m_LoadingStage!=LOAD_LOADING)
@@ -3425,6 +3531,62 @@ HRESULT CItemManager::LoadMetroItems( int refreshFlags )
 		return HRESULT_FROM_WIN32(ERROR_CANCELLED);
 	return S_OK;
 }
+#else
+void CItemManager::LoadMetroItems( int refreshFlags )
+{
+	std::vector<MetroLink> links;
+	std::vector<CString> nonApps10;
+	GetMetroLinks(links,false,&nonApps10);
+	int queueFlags=refreshFlags&INFO_ICON;
+	refreshFlags&=~queueFlags;
+	for (std::vector<MetroLink>::const_iterator it=links.begin();it!=links.end();++it)
+	{
+		ItemInfo *pItemInfo=const_cast<ItemInfo*>(GetItemInfo(it->pItem,it->pidl,refreshFlags,LOCATION_METRO));
+		if (queueFlags)
+		{
+			RWLock lock(this,true,RWLOCK_ITEMS);
+			QueueItemInfo(pItemInfo,queueFlags);
+		}
+		if (m_LoadingStage!=LOAD_LOADING) break;
+	}
+	if (GetWinVersion()>=WIN_VER_WIN10)
+	{
+		wchar_t APPID[256];
+		for (std::vector<MetroLink>::const_iterator it=links.begin();it!=links.end();++it)
+		{
+			const ItemInfo *pInfo=GetItemInfo(it->pItem,it->pidl,INFO_LINK|INFO_LINK_APPID|INFO_METRO);
+			Strcpy(APPID,_countof(APPID),it->appid);
+			CharUpper(APPID);
+			unsigned int hash=CalcFNVHash(APPID);
+			{
+				RWLock lock(this,true,RWLOCK_ITEMS);
+				std::map<unsigned int,const ItemInfo*>::const_iterator it2=m_MetroItemInfos10.find(hash);
+				if (it2==m_MetroItemInfos10.end())
+					m_MetroItemInfos10[hash]=pInfo;
+				std::set<unsigned int>::iterator it3=m_BlackListInfos10.find(hash);
+				if (it3!=m_BlackListInfos10.end())
+					m_BlackListInfos10.erase(it3);
+			}
+		}
+
+		{
+			RWLock lock(this,true,RWLOCK_ITEMS);
+			for (std::vector<CString>::const_iterator it=nonApps10.begin();it!=nonApps10.end();++it)
+			{
+				Strcpy(APPID,_countof(APPID),*it);
+				CharUpper(APPID);
+				unsigned int hash=CalcFNVHash(APPID);
+				std::map<unsigned int,const ItemInfo*>::const_iterator it2=m_MetroItemInfos10.find(hash);
+				if (it2==m_MetroItemInfos10.end())
+					m_MetroItemInfos10[hash]=NULL;
+				std::set<unsigned int>::iterator it3=m_BlackListInfos10.find(hash);
+				if (it3!=m_BlackListInfos10.end())
+					m_BlackListInfos10.erase(it3);
+			}
+		}
+	}
+}
+#endif
 
 static KNOWNFOLDERID FOLDERID_TaskbarPinned={'TASK', 'BA', 'R', {'P', 'I', 'N', 'N', 'E', 'D'}};
 static KNOWNFOLDERID FOLDERID_ClassicPinned={'CLAS', 'SI', 'C', {'P', 'I', 'N', 'N', 'E', 'D'}};
@@ -3454,16 +3616,39 @@ const int NUM_WATCHED_DIRS=7;
 #ifdef A4S_PRODUCT
 struct A4SDirectoryIdentity
 {
+	CString canonicalPath;
 	ULONGLONG normalizedPathHash;
 	ULONGLONG volumeIdentity;
 	ULONGLONG fileIdentity;
+	ULONGLONG rootIdentity;
 
 	bool operator==( const A4SDirectoryIdentity &other ) const
 	{
-		return normalizedPathHash==other.normalizedPathHash &&
+		return canonicalPath==other.canonicalPath &&
+			normalizedPathHash==other.normalizedPathHash &&
 			volumeIdentity==other.volumeIdentity &&
-			fileIdentity==other.fileIdentity;
+			fileIdentity==other.fileIdentity &&
+			rootIdentity==other.rootIdentity;
 	}
+};
+
+struct A4SDirectoryWatch
+{
+	A4SDirectoryWatch( void )
+	{
+		directory=INVALID_HANDLE_VALUE;
+		eventHandle=NULL;
+		watchBit=0;
+		memset(&overlapped,0,sizeof(overlapped));
+		memset(buffer,0,sizeof(buffer));
+	}
+
+	HANDLE directory;
+	HANDLE eventHandle;
+	OVERLAPPED overlapped;
+	DWORD buffer[2048]; // ReadDirectoryChangesW requires DWORD alignment.
+	DWORD watchBit;
+	A4SDirectoryIdentity identity;
 };
 
 static HRESULT ResolveA4SCacheFolder( int index, CAbsolutePidl &pidl,
@@ -3530,45 +3715,37 @@ static HRESULT ResolveA4SCacheFolder( int index, CAbsolutePidl &pidl,
 	return S_OK;
 }
 
-static HRESULT QueryA4SDirectoryIdentity( const wchar_t *path,
+static HRESULT QueryA4SHandleIdentity( HANDLE handle, DWORD watchBit,
 	A4SDirectoryIdentity &identity )
 {
-	memset(&identity,0,sizeof(identity));
-	if (!path || !path[0])
+	identity.canonicalPath.Empty();
+	identity.normalizedPathHash=identity.volumeIdentity=
+		identity.fileIdentity=identity.rootIdentity=0;
+	if (!handle || handle==INVALID_HANDLE_VALUE)
 		return E_INVALIDARG;
-	HANDLE directory=CreateFile(path,FILE_READ_ATTRIBUTES,
-		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,
-		FILE_FLAG_BACKUP_SEMANTICS,NULL);
-	if (directory==INVALID_HANDLE_VALUE)
-		return HRESULT_FROM_WIN32(GetLastError());
 
 	BY_HANDLE_FILE_INFORMATION information={};
-	if (!GetFileInformationByHandle(directory,&information))
-	{
-		const HRESULT result=HRESULT_FROM_WIN32(GetLastError());
-		CloseHandle(directory);
-		return result;
-	}
+	if (!GetFileInformationByHandle(handle,&information))
+		return HRESULT_FROM_WIN32(GetLastError());
 	std::vector<wchar_t> finalPath(512);
-	DWORD length=GetFinalPathNameByHandle(directory,&finalPath[0],
+	DWORD length=GetFinalPathNameByHandle(handle,&finalPath[0],
 		static_cast<DWORD>(finalPath.size()),
 		FILE_NAME_NORMALIZED|VOLUME_NAME_NT);
 	if (length>=finalPath.size())
 	{
 		finalPath.resize(static_cast<size_t>(length)+1);
-		length=GetFinalPathNameByHandle(directory,&finalPath[0],
+		length=GetFinalPathNameByHandle(handle,&finalPath[0],
 			static_cast<DWORD>(finalPath.size()),
 			FILE_NAME_NORMALIZED|VOLUME_NAME_NT);
 	}
 	if (!length || length>=finalPath.size())
 	{
 		const DWORD error=GetLastError();
-		CloseHandle(directory);
 		return HRESULT_FROM_WIN32(error?error:ERROR_INVALID_DATA);
 	}
-	CloseHandle(directory);
 
 	CharUpperBuff(&finalPath[0],length);
+	identity.canonicalPath.SetString(&finalPath[0],length);
 	ULONGLONG pathHash=A4SCacheState::WATCH_PATH_HASH_OFFSET;
 	for (DWORD i=0;i<length;i++)
 	{
@@ -3581,30 +3758,155 @@ static HRESULT QueryA4SDirectoryIdentity( const wchar_t *path,
 	identity.volumeIdentity=information.dwVolumeSerialNumber;
 	identity.fileIdentity=(static_cast<ULONGLONG>(information.nFileIndexHigh)<<32)|
 		information.nFileIndexLow;
+	identity.rootIdentity=A4SCacheState::FoldWatchPathIdentity(
+		A4SCacheState::WATCH_PATH_HASH_OFFSET,watchBit,
+		identity.normalizedPathHash,identity.volumeIdentity,
+		identity.fileIdentity);
+	if (!identity.rootIdentity)
+		identity.rootIdentity=1;
 	return S_OK;
 }
 
-static bool ComputeA4SRequiredWatchIdentity( DWORD requiredMask,
-	ULONGLONG &aggregateIdentity )
+static HANDLE OpenA4SDirectoryHandle( const wchar_t *path, bool bOverlapped )
+{
+	if (!path || !path[0])
+		return INVALID_HANDLE_VALUE;
+	// Deliberately follow directory reparse points. The canonical target identity
+	// is captured from this same handle and configuration/path redirection forces
+	// a full rebuild. OPEN_REPARSE_POINT is therefore intentionally omitted.
+	DWORD flags=FILE_FLAG_BACKUP_SEMANTICS;
+	if (bOverlapped)
+		flags|=FILE_FLAG_OVERLAPPED;
+	return CreateFile(path,FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,
+		flags,NULL);
+}
+
+static void CloseA4SDirectoryWatch( A4SDirectoryWatch &watch )
+{
+	if (watch.directory!=INVALID_HANDLE_VALUE)
+	{
+		CancelIoEx(watch.directory,&watch.overlapped);
+		// OVERLAPPED and its output buffer must remain alive until cancellation
+		// completes. This thread is the sole issuer/consumer for the handle.
+		DWORD ignored=0;
+		GetOverlappedResult(watch.directory,&watch.overlapped,&ignored,TRUE);
+		CloseHandle(watch.directory);
+		watch.directory=INVALID_HANDLE_VALUE;
+	}
+	if (watch.eventHandle)
+	{
+		CloseHandle(watch.eventHandle);
+		watch.eventHandle=NULL;
+	}
+	watch.watchBit=0;
+	watch.identity=A4SDirectoryIdentity();
+}
+
+static bool ArmA4SDirectoryWatch( A4SDirectoryWatch &watch )
+{
+	if (watch.directory==INVALID_HANDLE_VALUE || !watch.eventHandle)
+		return false;
+	ResetEvent(watch.eventHandle);
+	memset(&watch.overlapped,0,sizeof(watch.overlapped));
+	watch.overlapped.hEvent=watch.eventHandle;
+	return ReadDirectoryChangesW(watch.directory,watch.buffer,
+		static_cast<DWORD>(sizeof(watch.buffer)),TRUE,
+		static_cast<DWORD>(A4SCacheState::RequiredDirectoryNotifyFilter()),
+		NULL,&watch.overlapped,NULL)!=FALSE;
+}
+
+static bool OpenA4SDirectoryWatch( const wchar_t *path, DWORD watchBit,
+	A4SDirectoryWatch &watch )
+{
+	CloseA4SDirectoryWatch(watch);
+	watch.directory=OpenA4SDirectoryHandle(path,true);
+	if (watch.directory==INVALID_HANDLE_VALUE)
+		return false;
+	watch.watchBit=watchBit;
+	if (FAILED(QueryA4SHandleIdentity(watch.directory,watchBit,
+		watch.identity)))
+	{
+		CloseA4SDirectoryWatch(watch);
+		return false;
+	}
+	watch.eventHandle=CreateEvent(NULL,TRUE,FALSE,NULL);
+	if (!watch.eventHandle || !ArmA4SDirectoryWatch(watch))
+	{
+		CloseA4SDirectoryWatch(watch);
+		return false;
+	}
+	// Query the exact monitored handle again after ReadDirectoryChangesW is armed.
+	A4SDirectoryIdentity armedIdentity;
+	if (FAILED(QueryA4SHandleIdentity(watch.directory,watchBit,
+		armedIdentity)) || !(armedIdentity==watch.identity))
+	{
+		CloseA4SDirectoryWatch(watch);
+		return false;
+	}
+	return true;
+}
+
+static bool ConsumeAndRearmA4SDirectoryWatch( A4SDirectoryWatch &watch )
+{
+	DWORD bytes=0;
+	if (!GetOverlappedResult(watch.directory,&watch.overlapped,&bytes,FALSE))
+		return false;
+	return ArmA4SDirectoryWatch(watch);
+}
+
+static bool QueryA4SConfiguredDirectoryIdentity( int index, DWORD watchBit,
+	A4SDirectoryIdentity &identity )
+{
+	CAbsolutePidl pidl;
+	CComPtr<IShellItem> pFolder;
+	CString path;
+	if (FAILED(ResolveA4SCacheFolder(index,pidl,pFolder,path)))
+		return false;
+	HANDLE directory=OpenA4SDirectoryHandle(path,false);
+	if (directory==INVALID_HANDLE_VALUE)
+		return false;
+	const HRESULT result=QueryA4SHandleIdentity(directory,watchBit,identity);
+	CloseHandle(directory);
+	return SUCCEEDED(result);
+}
+
+static int FindA4SDirectoryWatch( const A4SDirectoryWatch *watches,
+	int watchCount, DWORD watchBit )
+{
+	for (int i=0;i<watchCount;i++)
+		if (watches[i].watchBit==watchBit)
+			return i;
+	return -1;
+}
+
+static bool VerifyA4SRequiredWatchConfiguration( DWORD requiredMask,
+	const A4SDirectoryWatch *watches, int watchCount,
+	A4SDirectoryIdentity *verifiedByIndex, ULONGLONG &aggregateIdentity )
 {
 	aggregateIdentity=A4SCacheState::MixWatchIdentityWord(
 		A4SCacheState::WATCH_PATH_HASH_OFFSET,requiredMask);
-	for (int i=0;i<NUM_WATCHED_DIRS;i++)
+	for (int index=0;index<NUM_WATCHED_DIRS;index++)
 	{
-		const DWORD watchBit=1U<<i;
+		const DWORD watchBit=1U<<index;
 		if (!(requiredMask&watchBit))
 			continue;
-		CAbsolutePidl pidl;
-		CComPtr<IShellItem> pFolder;
-		CString path;
-		if (FAILED(ResolveA4SCacheFolder(i,pidl,pFolder,path)))
+		const int watchIndex=FindA4SDirectoryWatch(watches,watchCount,watchBit);
+		if (watchIndex<0)
 			return false;
-		A4SDirectoryIdentity identity={};
-		if (FAILED(QueryA4SDirectoryIdentity(path,identity)))
+		A4SDirectoryIdentity sameHandleIdentity;
+		if (FAILED(QueryA4SHandleIdentity(watches[watchIndex].directory,
+			watchBit,sameHandleIdentity)) ||
+			!(sameHandleIdentity==watches[watchIndex].identity))
 			return false;
-		aggregateIdentity=A4SCacheState::FoldWatchPathIdentity(
-			aggregateIdentity,watchBit,identity.normalizedPathHash,
-			identity.volumeIdentity,identity.fileIdentity);
+		A4SDirectoryIdentity configuredIdentity;
+		if (!QueryA4SConfiguredDirectoryIdentity(index,watchBit,
+			configuredIdentity) || !(configuredIdentity==sameHandleIdentity))
+			return false;
+		if (verifiedByIndex)
+			verifiedByIndex[index]=sameHandleIdentity;
+		aggregateIdentity=A4SCacheState::MixWatchIdentityWord(
+			aggregateIdentity,sameHandleIdentity.rootIdentity);
 	}
 	if (!aggregateIdentity)
 		aggregateIdentity=1;
@@ -3616,6 +3918,95 @@ static_assert(A4SCacheState::RequiredDirectoryNotifyFilter()==
 	FILE_NOTIFY_CHANGE_ATTRIBUTES|FILE_NOTIFY_CHANGE_SIZE|
 	FILE_NOTIFY_CHANGE_LAST_WRITE|FILE_NOTIFY_CHANGE_CREATION|
 	FILE_NOTIFY_CHANGE_SECURITY),"A4S watcher metadata filter drift");
+
+void CItemManager::ClearA4SWatchRootTable( void )
+{
+	AcquireSRWLockExclusive(&m_A4SWatchRootLock);
+	for (int i=0;i<m_A4SWatchRootTable.count;i++)
+		m_A4SWatchRootTable.roots[i]=A4SWatchRootBinding();
+	m_A4SWatchRootTable.count=0;
+	ReleaseSRWLockExclusive(&m_A4SWatchRootLock);
+}
+
+void CItemManager::PublishA4SWatchRootTable(
+	const A4SWatchRootBinding *roots, int count )
+{
+	AcquireSRWLockExclusive(&m_A4SWatchRootLock);
+	for (int i=0;i<m_A4SWatchRootTable.count;i++)
+		m_A4SWatchRootTable.roots[i]=A4SWatchRootBinding();
+	m_A4SWatchRootTable.count=0;
+	if (roots && count>0 && count<=A4S_MAX_REQUIRED_WATCH_ROOTS)
+	{
+		for (int i=0;i<count;i++)
+			m_A4SWatchRootTable.roots[i]=roots[i];
+		m_A4SWatchRootTable.count=count;
+	}
+	ReleaseSRWLockExclusive(&m_A4SWatchRootLock);
+}
+
+bool CItemManager::ResolveA4SItemWatchBinding( const wchar_t *canonicalPath,
+	A4SWatchRootBinding &binding ) const
+{
+	binding=A4SWatchRootBinding();
+	AcquireSRWLockShared(&m_A4SWatchRootLock);
+	A4SCacheState::WatchRootView views[A4S_MAX_REQUIRED_WATCH_ROOTS]={};
+	for (int i=0;i<m_A4SWatchRootTable.count;i++)
+	{
+		const A4SWatchRootBinding &root=m_A4SWatchRootTable.roots[i];
+		views[i].watchBit=root.watchBit;
+		views[i].canonicalPath=root.canonicalPath;
+		views[i].rootIdentity=root.rootIdentity;
+		views[i].identityGeneration=root.identityGeneration;
+		views[i].sourceGeneration=root.sourceGeneration;
+		views[i].filesystemBacked=true;
+	}
+	const int selected=A4SCacheState::SelectCanonicalWatchRoot(canonicalPath,
+		views,static_cast<size_t>(m_A4SWatchRootTable.count));
+	if (selected>=0)
+		binding=m_A4SWatchRootTable.roots[selected];
+	ReleaseSRWLockShared(&m_A4SWatchRootLock);
+	return selected>=0;
+}
+
+bool CItemManager::IsA4SItemWatchBindingCurrent(
+	const wchar_t *canonicalPath, const A4SWatchRootBinding &binding ) const
+{
+	A4SWatchRootBinding current;
+	if (!ResolveA4SItemWatchBinding(canonicalPath,current))
+		return false;
+	A4SCacheState::WatchBindingIdentity validated={binding.watchBit,
+		binding.rootIdentity,binding.identityGeneration,
+		binding.sourceGeneration};
+	A4SCacheState::WatchBindingIdentity observed={current.watchBit,
+		current.rootIdentity,current.identityGeneration,
+		current.sourceGeneration};
+	return A4SCacheState::WatchBindingMatches(validated,observed);
+}
+
+bool CItemManager::GetA4SFileMetadataAndBinding( const wchar_t *path,
+	FILETIME &writeTime, FILETIME &createTime, CString &canonicalPath,
+	A4SWatchRootBinding &binding ) const
+{
+	canonicalPath.Empty();
+	binding=A4SWatchRootBinding();
+	HANDLE file=CreateFile(path,FILE_READ_ATTRIBUTES,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,NULL,OPEN_EXISTING,
+		FILE_FLAG_BACKUP_SEMANTICS,NULL);
+	if (file==INVALID_HANDLE_VALUE)
+		return MenuGetFileTimestamp(path,&writeTime,&createTime);
+	const bool bTimestamp=GetFileTime(file,&createTime,NULL,&writeTime)!=FALSE;
+	A4SDirectoryIdentity identity;
+	const bool bCanonical=SUCCEEDED(QueryA4SHandleIdentity(file,0,identity));
+	CloseHandle(file);
+	if (!bTimestamp)
+		return false;
+	if (bCanonical)
+	{
+		canonicalPath=identity.canonicalPath;
+		ResolveA4SItemWatchBinding(canonicalPath,binding);
+	}
+	return true;
+}
 #endif
 
 void CItemManager::PreloadItemsThread( void )
@@ -3637,13 +4028,14 @@ void CItemManager::PreloadItemsThread( void )
 	const DWORD WATCH_RETRY_MAX_MS=30000;
 	const DWORD WATCH_IDENTITY_RECHECK_MS=30000;
 	const int WATCH_DRAIN_LIMIT=64;
-	HANDLE watchHandles[NUM_WATCHED_DIRS]={};
-	DWORD watchMasks[NUM_WATCHED_DIRS]={};
+	A4SDirectoryWatch watches[NUM_WATCHED_DIRS];
 	int watchCount=0;
 	DWORD armedMask=0;
 	DWORD setupRequiredMask=0;
 	ULONGLONG setupConfigurationGeneration=0;
 	ULONGLONG setupIdentityHash=0;
+	DWORD baselineRequestedLoadMask=0;
+	DWORD baselineCompletedLoadMask=0;
 	DWORD dirMask=0xFFFFFFFF;
 	DWORD retryDelay=WATCH_RETRY_MIN_MS;
 	bool bBuildWatches=true;
@@ -3655,11 +4047,9 @@ void CItemManager::PreloadItemsThread( void )
 	auto CloseWatches=[&]()
 	{
 		for (int i=0;i<watchCount;i++)
-			FindCloseChangeNotification(watchHandles[i]);
+			CloseA4SDirectoryWatch(watches[i]);
 		watchCount=0;
 		armedMask=0;
-		memset(watchHandles,0,sizeof(watchHandles));
-		memset(watchMasks,0,sizeof(watchMasks));
 	};
 
 	auto WaitForWatchRetry=[&](DWORD timeout)->bool
@@ -3677,14 +4067,15 @@ void CItemManager::PreloadItemsThread( void )
 		if (bBuildWatches)
 		{
 			CloseWatches();
+			baselineRequestedLoadMask=0;
+			baselineCompletedLoadMask=0;
 			ResetEvent(m_A4SWatchRebuildEvent);
 			setupRequiredMask=static_cast<DWORD>(InterlockedCompareExchange(
 				&m_A4SRequiredWatchMask,0,0));
 			setupConfigurationGeneration=static_cast<ULONGLONG>(
 				InterlockedCompareExchange64(
 					&m_A4SWatchConfigurationGeneration,0,0));
-			setupIdentityHash=A4SCacheState::MixWatchIdentityWord(
-				A4SCacheState::WATCH_PATH_HASH_OFFSET,setupRequiredMask);
+			setupIdentityHash=0;
 			for (int i=0;i<NUM_WATCHED_DIRS;i++)
 			{
 				const DWORD watchBit=1U<<i;
@@ -3693,97 +4084,76 @@ void CItemManager::PreloadItemsThread( void )
 				CString path;
 				if (FAILED(ResolveA4SCacheFolder(i,pidl,pFolder,path)))
 					continue;
-
-				A4SDirectoryIdentity beforeIdentity={};
-				const bool bRequired=(setupRequiredMask&watchBit)!=0;
-				if (bRequired && FAILED(QueryA4SDirectoryIdentity(
-					path,beforeIdentity)))
+				if (!OpenA4SDirectoryWatch(path,watchBit,watches[watchCount]))
 					continue;
-				HANDLE watch=FindFirstChangeNotification(path,TRUE,
-					static_cast<DWORD>(
-						A4SCacheState::RequiredDirectoryNotifyFilter()));
-				if (watch==INVALID_HANDLE_VALUE)
-					continue;
-				if (bRequired)
-				{
-					A4SDirectoryIdentity afterIdentity={};
-					if (FAILED(QueryA4SDirectoryIdentity(path,afterIdentity)) ||
-						!(beforeIdentity==afterIdentity))
-					{
-						FindCloseChangeNotification(watch);
-						continue;
-					}
-					setupIdentityHash=A4SCacheState::FoldWatchPathIdentity(
-						setupIdentityHash,watchBit,
-						afterIdentity.normalizedPathHash,
-						afterIdentity.volumeIdentity,
-						afterIdentity.fileIdentity);
-				}
-				watchHandles[watchCount]=watch;
-				watchMasks[watchCount]=watchBit;
 				armedMask|=watchBit;
 				watchCount++;
 			}
-			if (!setupIdentityHash)
-				setupIdentityHash=1;
 		}
 
-		bool bLoadedAny=false;
-		DWORD completedRequiredLoadMask=0;
-		const DWORD requestedRequiredLoadMask=dirMask&setupRequiredMask;
+		DWORD requestedLoadMask=0;
+		DWORD completedLoadMask=0;
 		for (int i=0;i<_countof(g_CacheFolders);i++)
 		{
 			if (m_LoadingStage!=LOAD_LOADING) break;
-			if (!(dirMask&(1<<i))) continue;
+			const DWORD loadBit=1U<<i;
+			if (!(dirMask&loadBit)) continue;
 			if (!bInitialPreload && bBuildWatches && i>=NUM_WATCHED_DIRS)
 				continue;
 			if (g_CacheFolders[i].folder==FOLDERID_Favorites &&
 				!m_bPreloadFavorites) continue;
 			const bool bShouldLoad=bInitialPreload || !bBuildWatches ||
-				((setupRequiredMask&(1U<<i))!=0);
+				((setupRequiredMask&loadBit)!=0);
 			if (!bShouldLoad)
 				continue;
+			int refreshFlags=g_CacheFolders[i].refreshFlags;
+			if (!m_bPreloadIcons)
+				refreshFlags&=CItemManager::INFO_DATA;
+			if (!refreshFlags)
+				continue;
+			if (g_CacheFolders[i].location==CItemManager::LOCATION_DESKTOP &&
+				(GetSettingInt(L"CompatibilityFixes")&COMPATIBILITY_SKIP_DESKTOP))
+			{
+				// Policy deliberately excludes this optional preload root.
+				continue;
+			}
+
+			// Selection makes this root part of the disk-cache transaction. Resolve,
+			// enumeration, recursion, and Metro property failures must all complete
+			// before this pass is allowed to replace the last good cache file.
+			requestedLoadMask|=loadBit;
 
 			CAbsolutePidl pidl;
 			CComPtr<IShellItem> pFolder;
 			CString filesystemPath;
 			if (FAILED(ResolveA4SCacheFolder(i,pidl,pFolder,filesystemPath)))
 				continue;
-			int refreshFlags=g_CacheFolders[i].refreshFlags;
-			if (!m_bPreloadIcons)
-				refreshFlags&=CItemManager::INFO_DATA;
-			HRESULT loadResult=S_OK;
-			if (refreshFlags)
-			{
-				if (g_CacheFolders[i].folder!=FOLDERID_MetroApps)
-				{
-					if (g_CacheFolders[i].location==CItemManager::LOCATION_DESKTOP)
-					{
-						int compat=GetSettingInt(L"CompatibilityFixes");
-						if (compat&COMPATIBILITY_SKIP_DESKTOP)
-						{
-							// Desktop is optional for A4S readiness and may be
-							// deliberately excluded from background metadata work.
-							continue;
-						}
-					}
-					loadResult=LoadFolderItems(pFolder,refreshFlags,
-						g_CacheFolders[i].levels,g_CacheFolders[i].location);
-				}
-				else
-					loadResult=LoadMetroItems(refreshFlags);
-			}
+			const HRESULT loadResult=g_CacheFolders[i].folder!=FOLDERID_MetroApps?
+				LoadFolderItems(pFolder,refreshFlags,g_CacheFolders[i].levels,
+					g_CacheFolders[i].location):
+				LoadMetroItems(refreshFlags);
 			if (SUCCEEDED(loadResult))
 			{
-				if (i<NUM_WATCHED_DIRS)
-					completedRequiredLoadMask|=1U<<i;
-				bLoadedAny=true;
+				completedLoadMask|=loadBit;
 				preloadedFolders++;
 			}
 		}
+		if (bEstablishingBaseline)
+		{
+			baselineRequestedLoadMask|=requestedLoadMask;
+			baselineCompletedLoadMask=
+				(baselineCompletedLoadMask&~requestedLoadMask)|completedLoadMask;
+		}
+		const DWORD transactionRequestedLoadMask=bEstablishingBaseline?
+			baselineRequestedLoadMask:requestedLoadMask;
+		const DWORD transactionCompletedLoadMask=bEstablishingBaseline?
+			baselineCompletedLoadMask:completedLoadMask;
 		const bool bRequiredLoadsComplete=
 			A4SCacheState::RequiredFolderLoadsComplete(
-				requestedRequiredLoadMask,completedRequiredLoadMask);
+				setupRequiredMask,transactionCompletedLoadMask);
+		const bool bRequestedLoadsComplete=
+			A4SCacheState::RequestedFolderLoadsComplete(
+				transactionRequestedLoadMask,transactionCompletedLoadMask);
 
 		if (bInitialPreload)
 		{
@@ -3795,13 +4165,8 @@ void CItemManager::PreloadItemsThread( void )
 			}
 			bInitialPreload=false;
 		}
-		if (bLoadedAny && bRequiredLoadsComplete)
-		{
-			// Never replace the last good disk cache with a partial required pass.
-			// Optional-only passes have an empty required mask and remain best effort.
-			// SaveCacheFile supplies the existing debounce and atomic tmp replacement.
-			SaveCacheFile();
-		}
+		const bool bSaveCacheThisPass=transactionRequestedLoadMask &&
+			bRequestedLoadsComplete;
 
 		if (bEstablishingBaseline)
 		{
@@ -3810,23 +4175,21 @@ void CItemManager::PreloadItemsThread( void )
 			const ULONGLONG currentConfigurationGeneration=
 				static_cast<ULONGLONG>(InterlockedCompareExchange64(
 					&m_A4SWatchConfigurationGeneration,0,0));
-			const bool bRequirementsStable=
+			bool bRequirementsStable=
 				currentRequiredMask==setupRequiredMask &&
 				currentConfigurationGeneration==setupConfigurationGeneration;
-			ULONGLONG confirmedIdentityHash=0;
-			const bool bCanonicalIdentityStable=
-				ComputeA4SRequiredWatchIdentity(currentRequiredMask,
-					confirmedIdentityHash) &&
-				confirmedIdentityHash==setupIdentityHash;
-			bool bWaitApiHealthy=true;
+			bool bWaitApiHealthy=watchCount>0;
 			bool bRearmApiHealthy=true;
 			bool bDrainComplete=true;
 			DWORD pendingMask=0;
 			int drainCount=0;
+			HANDLE drainHandles[NUM_WATCHED_DIRS];
+			for (int i=0;i<watchCount;i++)
+				drainHandles[i]=watches[i].eventHandle;
 			while (bRequirementsStable && bWaitApiHealthy &&
 				bRearmApiHealthy && drainCount<WATCH_DRAIN_LIMIT)
 			{
-				DWORD wait=WaitForMultipleObjects(watchCount,watchHandles,FALSE,0);
+				DWORD wait=WaitForMultipleObjects(watchCount,drainHandles,FALSE,0);
 				if (wait==WAIT_TIMEOUT)
 					break;
 				if (wait==WAIT_FAILED || wait<WAIT_OBJECT_0 ||
@@ -3836,19 +4199,56 @@ void CItemManager::PreloadItemsThread( void )
 					break;
 				}
 				const int watch=static_cast<int>(wait-WAIT_OBJECT_0);
-				pendingMask|=watchMasks[watch];
+				pendingMask|=watches[watch].watchBit;
 				drainCount++;
-				if (!FindNextChangeNotification(watchHandles[watch]))
+				if (!ConsumeAndRearmA4SDirectoryWatch(watches[watch]))
 					bRearmApiHealthy=false;
 			}
 			if (bRequirementsStable && bWaitApiHealthy &&
 				bRearmApiHealthy && drainCount==WATCH_DRAIN_LIMIT)
 			{
-				DWORD wait=WaitForMultipleObjects(watchCount,watchHandles,FALSE,0);
+				DWORD wait=WaitForMultipleObjects(watchCount,drainHandles,FALSE,0);
 				if (wait==WAIT_FAILED)
 					bWaitApiHealthy=false;
 				else if (wait!=WAIT_TIMEOUT)
 					bDrainComplete=false;
+			}
+
+			A4SDirectoryIdentity verifiedByIndex[NUM_WATCHED_DIRS];
+			ULONGLONG confirmedIdentityHash=0;
+			bool bCanonicalIdentityStable=bRequirementsStable &&
+				VerifyA4SRequiredWatchConfiguration(currentRequiredMask,watches,
+					watchCount,verifiedByIndex,confirmedIdentityHash);
+			const DWORD finalRequiredMask=static_cast<DWORD>(
+				InterlockedCompareExchange(&m_A4SRequiredWatchMask,0,0));
+			const ULONGLONG finalConfigurationGeneration=
+				static_cast<ULONGLONG>(InterlockedCompareExchange64(
+					&m_A4SWatchConfigurationGeneration,0,0));
+			bRequirementsStable=bRequirementsStable &&
+				finalRequiredMask==currentRequiredMask &&
+				finalConfigurationGeneration==currentConfigurationGeneration;
+			if (bRequirementsStable && bCanonicalIdentityStable &&
+				bWaitApiHealthy && bRearmApiHealthy && bDrainComplete)
+			{
+				// Close the identity-query window with one final nonblocking event
+				// observation. Any signal prevents publication this iteration.
+				const DWORD finalWait=WaitForMultipleObjects(watchCount,
+					drainHandles,FALSE,0);
+				if (finalWait==WAIT_FAILED)
+					bWaitApiHealthy=false;
+				else if (finalWait!=WAIT_TIMEOUT)
+				{
+					if (finalWait<WAIT_OBJECT_0 || finalWait>=
+						WAIT_OBJECT_0+static_cast<DWORD>(watchCount))
+						bWaitApiHealthy=false;
+					else
+					{
+						const int watch=static_cast<int>(finalWait-WAIT_OBJECT_0);
+						pendingMask|=watches[watch].watchBit;
+						if (!ConsumeAndRearmA4SDirectoryWatch(watches[watch]))
+							bRearmApiHealthy=false;
+					}
+				}
 			}
 			const bool bWatcherHealthy=bRequirementsStable && bDrainComplete &&
 				A4SCacheState::RequiredFolderWatchesReady(currentRequiredMask,
@@ -3908,7 +4308,26 @@ void CItemManager::PreloadItemsThread( void )
 				continue;
 			}
 
+			setupIdentityHash=confirmedIdentityHash;
 			AdvanceFolderContentGeneration();
+			A4SWatchRootBinding publishedRoots[A4S_MAX_REQUIRED_WATCH_ROOTS]={};
+			int publishedRootCount=0;
+			const ULONGLONG identityGeneration=GetA4SPathIdentityGeneration();
+			for (int i=0;i<NUM_WATCHED_DIRS;i++)
+			{
+				const DWORD watchBit=1U<<i;
+				if (!(setupRequiredMask&watchBit))
+					continue;
+				A4SWatchRootBinding &root=publishedRoots[publishedRootCount++];
+				root.watchBit=watchBit;
+				root.canonicalPath=verifiedByIndex[i].canonicalPath;
+				root.volumeIdentity=verifiedByIndex[i].volumeIdentity;
+				root.fileIdentity=verifiedByIndex[i].fileIdentity;
+				root.rootIdentity=verifiedByIndex[i].rootIdentity;
+				root.identityGeneration=identityGeneration;
+				root.sourceGeneration=setupConfigurationGeneration;
+			}
+			PublishA4SWatchRootTable(publishedRoots,publishedRootCount);
 			InterlockedExchange64(&m_A4SPublishedWatchIdentityHash,
 				static_cast<LONGLONG>(setupIdentityHash));
 			InterlockedExchange64(&m_A4SPublishedWatchConfigurationGeneration,
@@ -3922,9 +4341,18 @@ void CItemManager::PreloadItemsThread( void )
 			retryDelay=WATCH_RETRY_MIN_MS;
 		}
 
+		if (bSaveCacheThisPass)
+		{
+			// Every selected root, including optional metadata roots, participates in
+			// the transaction. Partial runtime data may remain useful, but it must not
+			// overwrite the previous complete disk cache. Establishing passes reach
+			// this point only after a quiet, identity-verified watcher publication.
+			SaveCacheFile();
+		}
+
 		HANDLE waitHandles[NUM_WATCHED_DIRS+2];
 		for (int i=0;i<watchCount;i++)
-			waitHandles[i]=watchHandles[i];
+			waitHandles[i]=watches[i].eventHandle;
 		waitHandles[watchCount]=m_A4SWatchRebuildEvent;
 		waitHandles[watchCount+1]=m_ExitEvent;
 		DWORD wait=WaitForMultipleObjects(watchCount+2,waitHandles,FALSE,
@@ -3939,8 +4367,8 @@ void CItemManager::PreloadItemsThread( void )
 				static_cast<ULONGLONG>(InterlockedCompareExchange64(
 					&m_A4SWatchConfigurationGeneration,0,0));
 			ULONGLONG currentIdentityHash=0;
-			const bool bIdentityCertain=ComputeA4SRequiredWatchIdentity(
-				currentRequiredMask,currentIdentityHash);
+			const bool bIdentityCertain=VerifyA4SRequiredWatchConfiguration(
+				currentRequiredMask,watches,watchCount,NULL,currentIdentityHash);
 			A4SCacheState::WatchConfigurationIdentity published={
 				setupRequiredMask,setupIdentityHash,
 				setupConfigurationGeneration};
@@ -3990,13 +4418,13 @@ void CItemManager::PreloadItemsThread( void )
 		}
 
 		const int watch=static_cast<int>(wait-WAIT_OBJECT_0);
-		dirMask=watchMasks[watch];
+		dirMask=watches[watch].watchBit;
 		DWORD requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
 			&m_A4SRequiredWatchMask,0,0));
 		bool bRequiredChange=(dirMask&requiredMask)!=0;
 		if (bRequiredChange)
 			RevokeA4SFolderWatchBaseline();
-		bool bWatchFailure=!FindNextChangeNotification(watchHandles[watch]);
+		bool bWatchFailure=!ConsumeAndRearmA4SDirectoryWatch(watches[watch]);
 		bool bRebuildRequested=false;
 		bool bExitRequested=false;
 
@@ -4012,7 +4440,7 @@ void CItemManager::PreloadItemsThread( void )
 			const DWORD remaining=static_cast<DWORD>(debounceDeadline-now);
 			HANDLE debounceHandles[NUM_WATCHED_DIRS+2];
 			for (int i=0;i<watchCount;i++)
-				debounceHandles[i]=watchHandles[i];
+				debounceHandles[i]=watches[i].eventHandle;
 			debounceHandles[watchCount]=m_A4SWatchRebuildEvent;
 			debounceHandles[watchCount+1]=m_ExitEvent;
 			DWORD debounce=WaitForMultipleObjects(watchCount+2,
@@ -4037,7 +4465,7 @@ void CItemManager::PreloadItemsThread( void )
 			}
 
 			const int changedWatch=static_cast<int>(debounce-WAIT_OBJECT_0);
-			dirMask|=watchMasks[changedWatch];
+			dirMask|=watches[changedWatch].watchBit;
 			requiredMask=static_cast<DWORD>(InterlockedCompareExchange(
 				&m_A4SRequiredWatchMask,0,0));
 			if (!bRequiredChange && (dirMask&requiredMask)!=0)
@@ -4045,7 +4473,7 @@ void CItemManager::PreloadItemsThread( void )
 				bRequiredChange=true;
 				RevokeA4SFolderWatchBaseline();
 			}
-			if (!FindNextChangeNotification(watchHandles[changedWatch]))
+			if (!ConsumeAndRearmA4SDirectoryWatch(watches[changedWatch]))
 				bWatchFailure=true;
 		}
 
@@ -4062,7 +4490,7 @@ void CItemManager::PreloadItemsThread( void )
 		}
 		if (bWatchFailure)
 		{
-			// Either WaitForMultipleObjects or FindNextChangeNotification failed.
+			// Either WaitForMultipleObjects or overlapped consumption/rearm failed.
 			// Revoke even for an optional handle because the watch set is no longer
 			// known to be complete, then rebuild using capped event-driven backoff.
 			RevokeA4SFolderWatchBaseline();
@@ -4089,6 +4517,7 @@ void CItemManager::PreloadItemsThread( void )
 			bEstablishingBaseline=false;
 		}
 	}
+	RevokeA4SFolderWatchBaseline();
 	CloseWatches();
 	if (preloadOperation)
 		EndA4SPerformanceOperation(A4S_PERF_PRELOAD,preloadOperation,preloadedFolders);
@@ -4137,13 +4566,12 @@ void CItemManager::PreloadItemsThread( void )
 				if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pFolder)) || !pFolder) continue;
 			}
 
-			wchar_t path[_MAX_PATH]={};
+			wchar_t path[_MAX_PATH];
 			if (i<NUM_WATCHED_DIRS && dirMask==0xFFFFFFFF &&
-				SHGetPathFromIDList(pidl,path) && path[0])
+				SUCCEEDED(SHGetPathFromIDList(pidl,path)))
 			{
 				handles[dirCount]=FindFirstChangeNotification(path,TRUE,
-					static_cast<DWORD>(
-						A4SCacheState::RequiredDirectoryNotifyFilter()));
+					FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_DIR_NAME|FILE_NOTIFY_CHANGE_LAST_WRITE);
 				if (handles[dirCount]!=INVALID_HANDLE_VALUE)
 				{
 					dirMasks[dirCount]=1<<i;
@@ -5061,6 +5489,7 @@ STDAPI ShGetKnownFolderItem(REFKNOWNFOLDERID rfid, IShellItem **ppItem )
 
 ///////////////////////////////////////////////////////////////////////////////
 
+#ifdef A4S_PRODUCT
 CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )
 	: m_Result(E_FAIL)
 {
@@ -5210,3 +5639,100 @@ bool CShellItemEnumerator::GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &
 	m_Result=E_UNEXPECTED;
 	return false;
 }
+#else
+CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )
+{
+	int compat=GetSettingInt(L"CompatibilityFixes");
+	if (!(compat&COMPATIBILITY_ENUM_SHELLITEM))
+	{
+		CComPtr<IShellFolder> pFolder0;
+		HRESULT hr=pFolder->BindToHandler(NULL,BHID_SFObject,IID_IShellFolder,(void**)&pFolder0);
+		if (FAILED(hr))
+		{
+			CComQIPtr<IShellItem2> pFolder2=pFolder;
+			if (pFolder2)
+			{
+				// The operation may fail if pFolder has a simple pidl (like from a network path). Update the shell item and try again
+				pFolder2->Update(NULL);
+				hr=pFolder->BindToHandler(NULL,BHID_SFObject,IID_IShellFolder,(void**)&pFolder0);
+				if (FAILED(hr))
+					return;
+			}
+		}
+		if (FAILED(SHGetIDListFromObject(pFolder,&m_Root)))
+			return;
+		hr=pFolder0->EnumObjects(NULL,SHCONTF_FOLDERS|SHCONTF_NONFOLDERS,(IEnumIDList**)&m_pEnumPidls);
+	}
+	else
+	{
+		HRESULT hr=pFolder->BindToHandler(NULL,BHID_EnumItems,IID_IEnumShellItems,(void**)&m_pEnumItems);
+		if (FAILED(hr))
+		{
+			m_pEnumItems=NULL;
+			// The operation may fail if pFolder has a simple pidl (like from a network path). Update the shell item and try again
+			CComQIPtr<IShellItem2> pFolder2=pFolder;
+			if (pFolder2)
+			{
+				pFolder2->Update(NULL);
+				hr=pFolder->BindToHandler(NULL,BHID_EnumItems,IID_IEnumShellItems,(void**)&m_pEnumItems);
+				if (FAILED(hr))
+				{
+					m_pEnumItems=NULL;
+					return;
+				}
+			}
+		}
+		if (compat&COMPATIBILITY_ENUM_FIX_PIDLS)
+			SHGetIDListFromObject(pFolder,&m_Root);
+	}
+}
+
+bool CShellItemEnumerator::IsValid( void ) const
+{
+	return m_pEnumPidls || m_pEnumItems;
+}
+
+bool CShellItemEnumerator::GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &childPidl )
+{
+	pChild=NULL;
+	childPidl.Clear();
+	if (m_pEnumPidls)
+	{
+		CAbsolutePidl child;
+		if (m_pEnumPidls->Next(1,(PITEMID_CHILD*)&child,NULL)!=S_OK)
+			return false;
+
+		CAbsolutePidl pidl;
+		pidl.Attach(ILCombine(m_Root,child));
+		if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pChild)))
+			return false;
+		childPidl.Swap(pidl);
+		return true;
+	}
+	else
+	{
+		CComPtr<IShellItem> pChild0;
+		if (m_pEnumItems->Next(1,&pChild0,NULL)!=S_OK)
+			return false;
+
+		CAbsolutePidl pidl0;
+		if (FAILED(SHGetIDListFromObject(pChild0,&pidl0)))
+			return false;
+
+		if (m_Root)
+		{
+			CAbsolutePidl pidl;
+			pidl.Attach(ILCombine(m_Root,ILFindLastID(pidl0)));
+			if (SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pChild)))
+			{
+				childPidl.Swap(pidl);
+				return true;
+			}
+		}
+
+		childPidl.Swap(pidl0);
+		pChild=pChild0;
+		return true;
+	}
+}
+#endif

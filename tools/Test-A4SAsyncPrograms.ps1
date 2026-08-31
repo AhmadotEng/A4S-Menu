@@ -89,7 +89,9 @@ function Get-CppFunctionBody {
 
 $createItems = Get-CppFunctionBody $treeSource 'bool CProgramsTree::CreateItems( void )'
 $requestItems = Get-CppFunctionBody $treeSource 'void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,'
+$startWorker = Get-CppFunctionBody $treeSource 'bool CProgramsTree::StartA4SAsyncWorkerLocked( void )'
 $worker = Get-CppFunctionBody $treeSource 'DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )'
+$waitBaseline = Get-CppFunctionBody $treeSource 'CProgramsTree::A4SAsyncResult CProgramsTree::WaitForA4SFolderWatchBaseline('
 $buildSnapshot = Get-CppFunctionBody $treeSource 'CProgramsTree::A4SAsyncResult CProgramsTree::BuildA4SRootSnapshot('
 $applySnapshot = Get-CppFunctionBody $treeSource 'bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )'
 $applyRoot = Get-CppFunctionBody $treeSource 'void CProgramsTree::ApplyA4SRootItems( std::vector<CTreeItem*> &newItems,'
@@ -198,8 +200,22 @@ Assert-Contract ($liveConfiguration -match 'IsFolderWatchBaselineReady\(\)' -and
     $liveConfiguration -match 'GetFolderContentGeneration\(\)' -and
     $liveConfiguration -match 'GetIconCacheEpoch\(\)') `
     'live snapshot validation omits baseline, folder generation, or icon epoch'
-Assert-Contract ($worker -match 'while\s*\(IsA4SGenerationCurrent\(generation\)\s*&&[\s\S]*!g_ItemManager\.IsFolderWatchBaselineReady\(\)\)[\s\S]*WaitForFolderWatchBaseline\(100\)') `
-    'Programs can enumerate or publish before the directory watcher baseline'
+Assert-Contract ($treeHeader -match 'HANDLE\s+s_A4SAsyncStateEvent\s*;' -and
+    $startWorker -match 'CreateEvent\(NULL,TRUE,FALSE,NULL\)') `
+    'the Programs worker lacks a generation/shutdown wake event'
+Assert-Contract ($waitBaseline -match 'GetA4SFolderWatchReadyEvent\(\)' -and
+    $waitBaseline -match 'WaitForMultipleObjects\([^;]+A4S_PROGRAMS_WATCH_BASELINE_TIMEOUT\)' -and
+    $treeSource -match 'A4S_PROGRAMS_WATCH_BASELINE_TIMEOUT\s*=\s*30000') `
+    'Programs does not use one bounded wait for watcher readiness and state changes'
+Assert-Contract ($waitBaseline -match 'WAIT_OBJECT_0\+1[\s\S]*A4S_ASYNC_CANCELLED' -and
+    $waitBaseline -match 'wait!=WAIT_OBJECT_0[\s\S]*A4S_ASYNC_FAILURE') `
+    'watcher wait cannot distinguish cancellation from timeout or wait failure'
+Assert-Contract ($worker -match 'WaitForA4SFolderWatchBaseline\(generation,stateEvent\)' -and
+    $worker -notmatch 'WaitForFolderWatchBaseline\(100\)|Sleep\s*\(|while\s*\([^\)]*IsFolderWatchBaselineReady') `
+    'Programs still polls watcher readiness instead of waiting event-first'
+Assert-Contract ($requestItems -match 'InterlockedIncrement\(&s_A4SAsyncGeneration\)[\s\S]{0,180}SetEvent\(s_A4SAsyncStateEvent\)' -and
+    $supersedeConfiguration -match 'InterlockedIncrement\(&s_A4SAsyncGeneration\)[\s\S]{0,180}SetEvent\(s_A4SAsyncStateEvent\)') `
+    'generation changes do not wake the bounded watcher wait'
 $supersedeCallCount = [Regex]::Matches($worker, 'SupersedeA4SConfigurationIfStale\(configuration,generation\)').Count
 Assert-Contract ($supersedeCallCount -ge 3) `
     'worker does not validate live epochs before build, before publication, and after a publication race'
@@ -219,6 +235,9 @@ Assert-Contract ($destroy -match 'UnsubscribeA4SItems\(m_hWnd,m_A4SInstanceCooki
     'destroyed trees remain subscribed to worker completion'
 Assert-Contract ($shutdown -match 's_bA4SAsyncStopping\s*=\s*true[\s\S]*InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
     'shutdown does not gate new requests before cancelling the active generation'
+Assert-Contract ($shutdown -match 'InterlockedIncrement\(&s_A4SAsyncGeneration\)[\s\S]{0,180}SetEvent\(s_A4SAsyncStateEvent\)' -and
+    $shutdown -match 'WaitForSingleObject\(worker,timeout\)[\s\S]*CloseHandle\(s_A4SAsyncStateEvent\)') `
+    'shutdown cannot promptly wake and safely retire the Programs state event'
 Assert-Contract ($shutdown -match 'WaitForSingleObject\(worker,timeout\)\s*!=\s*WAIT_OBJECT_0[\s\S]*return\s+false') `
     'shutdown can dismantle ItemManager without proving worker exit'
 Assert-Contract ($worker -match 's_bA4SAsyncStopping[\s\S]*break\s*;') `

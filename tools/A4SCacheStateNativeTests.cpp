@@ -33,8 +33,8 @@ int main()
 		if ((result=Require(!RequiredFolderWatchesReady(full,
 			full&~requiredBits[i],true,true,false),21+static_cast<int>(i))))
 			return result;
-	// Inject WaitForMultipleObjects and FindNextChangeNotification failures
-	// independently. Either failure must make publication impossible.
+	// Inject wait and overlapped-rearm failures independently. Either failure
+	// must make publication impossible.
 	if ((result=Require(!RequiredFolderWatchesReady(full,full,false,true,false),30)))
 		return result;
 	if ((result=Require(!RequiredFolderWatchesReady(full,full,true,false,false),31)))
@@ -54,6 +54,13 @@ int main()
 	// block a required-load bit.
 	if ((result=Require(RequiredFolderLoadsComplete(base,
 		base|WATCH_DESKTOP|WATCH_TASKBAR_PINNED),39)))
+		return result;
+	const uint32_t requestedLoads=base|WATCH_DESKTOP|WATCH_TASKBAR_PINNED;
+	if ((result=Require(RequestedFolderLoadsComplete(requestedLoads,
+		requestedLoads),71)))
+		return result;
+	if ((result=Require(!RequestedFolderLoadsComplete(requestedLoads,
+		requestedLoads&~WATCH_DESKTOP),72)))
 		return result;
 
 	const uint32_t notifyFilter=RequiredDirectoryNotifyFilter();
@@ -83,6 +90,69 @@ int main()
 		return result;
 	WatchConfigurationIdentity unknownSource={base,pathA,0};
 	if ((result=Require(!WatchConfigurationMatches(identityA,unknownSource),58)))
+		return result;
+
+	WatchRootView roots[]={
+		{WATCH_START_MENU,L"\\??\\C:\\USERS\\ADMIN\\START MENU",101,7,5,true},
+		{WATCH_COMMON_START_MENU,L"\\??\\C:\\USERS\\ADMIN\\START MENU\\PROGRAMS",102,7,5,true},
+	};
+	if ((result=Require(IsCanonicalPathWithinRoot(
+		L"\\??\\c:\\users\\admin\\start menu\\Programs\\Tool.lnk",
+		roots[0].canonicalPath),73)))
+		return result;
+	if ((result=Require(!IsCanonicalPathWithinRoot(
+		L"\\??\\C:\\USERS\\ADMIN\\START MENUEVIL\\Tool.lnk",
+		roots[0].canonicalPath),74)))
+		return result;
+	if ((result=Require(SelectCanonicalWatchRoot(
+		L"\\??\\C:\\USERS\\ADMIN\\START MENU\\PROGRAMS\\Tool.lnk",
+		roots,sizeof(roots)/sizeof(roots[0]))==1,75)))
+		return result;
+	// A path validated under a redirected old root cannot bind to the new root.
+	if ((result=Require(SelectCanonicalWatchRoot(
+		L"\\??\\D:\\REDIRECTED\\START MENU\\Tool.lnk",roots,
+		sizeof(roots)/sizeof(roots[0]))==-1,76)))
+		return result;
+	// Shell namespace entries have no filesystem source and must bypass this
+	// cache unless a real canonical source is added explicitly.
+	if ((result=Require(SelectCanonicalWatchRoot(
+		L"shell:::{4234d49b-0245-4df3-b780-3893943456e1}",roots,
+		sizeof(roots)/sizeof(roots[0]))==-1,77)))
+		return result;
+
+	WatchBindingIdentity binding={WATCH_START_MENU,101,7,5};
+	WatchBindingIdentity sameBinding={WATCH_START_MENU,101,7,5};
+	if ((result=Require(WatchBindingMatches(binding,sameBinding),78)))
+		return result;
+	WatchBindingIdentity changedBinding=binding;
+	changedBinding.rootIdentity++;
+	if ((result=Require(!WatchBindingMatches(binding,changedBinding),79)))
+		return result;
+	changedBinding=binding;
+	changedBinding.identityGeneration++;
+	if ((result=Require(!WatchBindingMatches(binding,changedBinding),80)))
+		return result;
+	changedBinding=binding;
+	changedBinding.sourceGeneration++;
+	if ((result=Require(!WatchBindingMatches(binding,changedBinding),81)))
+		return result;
+
+	RequiredMetroValueState metro={true,true,true,true,true};
+	if ((result=Require(RequiredMetroValueReady(metro),82)))
+		return result;
+	bool *requiredMetroStages[]={&metro.callSucceeded,&metro.objectPresent,
+		&metro.typeValid,&metro.valuePresent};
+	for (size_t i=0;i<sizeof(requiredMetroStages)/sizeof(requiredMetroStages[0]);i++)
+	{
+		*requiredMetroStages[i]=false;
+		if ((result=Require(!RequiredMetroValueReady(metro),
+			83+static_cast<int>(i))))
+			return result;
+		*requiredMetroStages[i]=true;
+	}
+	metro.valueRequired=false;
+	metro.valuePresent=false;
+	if ((result=Require(RequiredMetroValueReady(metro),87)))
 		return result;
 
 	CachedMetadataAdmissionState metadata={};

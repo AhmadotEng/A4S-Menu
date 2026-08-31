@@ -108,6 +108,9 @@ public:
 #ifdef A4S_PRODUCT
 			a4sResolvedIconFlags=0;
 			a4sPathIdentityGeneration=0;
+			a4sWatchRootBit=0;
+			a4sWatchRootIdentity=0;
+			a4sWatchSourceGeneration=0;
 #endif
 			bIconOnly=bTemp=bLink=bExplicitAppId=bNoPin=bNoNew=bMetroLink=bMetroApp=bProtectedLink=false;
 			writestamp.dwHighDateTime=writestamp.dwLowDateTime=0;
@@ -166,6 +169,10 @@ public:
 		// intentionally opt out of persistent icon validation.
 		int a4sResolvedIconFlags;
 		ULONGLONG a4sPathIdentityGeneration;
+		DWORD a4sWatchRootBit;
+		ULONGLONG a4sWatchRootIdentity;
+		ULONGLONG a4sWatchSourceGeneration;
+		CString a4sCanonicalPath;
 #endif
 
 		CAbsolutePidl targetPidl;
@@ -205,6 +212,8 @@ public:
 	void ForceA4SFolderWatchReconfigure( void );
 	bool IsFolderWatchBaselineReady( void ) const;
 	bool WaitForFolderWatchBaseline( DWORD timeout ) const;
+	HANDLE GetA4SFolderWatchReadyEvent( void ) const
+		{ return m_A4SFolderWatchReadyEvent; }
 #endif
 #ifdef A4S_PRODUCT
 	// Creates or finds a custom icon entry but always leaves decoding to the
@@ -415,6 +424,22 @@ private:
 	};
 	volatile TLoadingStage m_LoadingStage;
 #ifdef A4S_PRODUCT
+	enum { A4S_MAX_REQUIRED_WATCH_ROOTS=7 };
+	struct A4SWatchRootBinding
+	{
+		DWORD watchBit;
+		CString canonicalPath;
+		ULONGLONG volumeIdentity;
+		ULONGLONG fileIdentity;
+		ULONGLONG rootIdentity;
+		ULONGLONG identityGeneration;
+		ULONGLONG sourceGeneration;
+	};
+	struct A4SWatchRootTable
+	{
+		A4SWatchRootBinding roots[A4S_MAX_REQUIRED_WATCH_ROOTS];
+		int count;
+	};
 	volatile LONG m_PendingPidlRefresh;
 	volatile LONGLONG m_FolderContentGeneration;
 	volatile LONGLONG m_IconCacheEpoch;
@@ -425,17 +450,34 @@ private:
 	volatile LONG m_A4SFolderWatchReady;
 	volatile LONG m_A4SRequiredWatchMask;
 	volatile LONG m_A4SArmedWatchMask;
+	mutable SRWLOCK m_A4SWatchRootLock;
+	A4SWatchRootTable m_A4SWatchRootTable;
 	void AdvanceFolderContentGeneration( void );
 	void AdvanceIconCacheEpoch( void );
 	void AdvanceA4SPathIdentityGeneration( void );
 	void RevokeA4SFolderWatchBaseline( void );
+	void ClearA4SWatchRootTable( void );
+	void PublishA4SWatchRootTable( const A4SWatchRootBinding *roots,
+		int count );
+	bool ResolveA4SItemWatchBinding( const wchar_t *canonicalPath,
+		A4SWatchRootBinding &binding ) const;
+	bool IsA4SItemWatchBindingCurrent( const wchar_t *canonicalPath,
+		const A4SWatchRootBinding &binding ) const;
+	bool GetA4SFileMetadataAndBinding( const wchar_t *path,
+		FILETIME &writeTime, FILETIME &createTime, CString &canonicalPath,
+		A4SWatchRootBinding &binding ) const;
 #endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;
 	bool m_bOldInvertIcons;
 
+#ifdef A4S_PRODUCT
 	HRESULT LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location );
 	HRESULT LoadMetroItems( int refreshFlags );
+#else
+	void LoadFolderItems( IShellItem *pFolder, int refreshFlags, int levels, TLocation location );
+	void LoadMetroItems( int refreshFlags );
+#endif
 	void PreloadItemsThread( void );
 	void CreateDefaultIcons( void );
 	static DWORD CALLBACK StaticPreloadItemsThread( void *param );
@@ -492,15 +534,19 @@ public:
 	CShellItemEnumerator( IShellItem *pFolder );
 	bool IsValid( void ) const;
 	bool GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &childPidl );
+#ifdef A4S_PRODUCT
 	// S_OK while enumeration is active, S_FALSE after a clean end, otherwise the
 	// constructor/enumeration failure that made GetNext return false.
 	HRESULT GetResult( void ) const { return m_Result; }
+#endif
 
 private:
 	CComPtr<IEnumIDList> m_pEnumPidls;
 	CComPtr<IEnumShellItems> m_pEnumItems;
 	CAbsolutePidl m_Root;
+#ifdef A4S_PRODUCT
 	HRESULT m_Result;
+#endif
 };
 
 struct UserAssistData

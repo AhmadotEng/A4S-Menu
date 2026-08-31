@@ -104,14 +104,17 @@ Assert-Contract ($header -match 'a4sPathIdentityGeneration\s*=\s*0' -and
 foreach ($overload in @($shellOverload, $pathOverload)) {
     Assert-Contract ($overload -match '#ifdef\s+A4S_PRODUCT[\s\S]*TryGetCachedFileMetadata\(') `
         'a GetItemInfo overload does not product-guard the cache-first call'
-    Assert-Contract ($overload -match 'if\s*\(!bUseCachedFileMetadata\)[\s\S]*MenuGetFileTimestamp\(') `
-        'a GetItemInfo overload can still stat a successful cache hit'
+    Assert-Contract ($overload -match '!bUseCachedFileMetadata\s*&&[\s\S]{0,120}GetA4SFileMetadataAndBinding\(') `
+        'a GetItemInfo overload does not bind real metadata validation to its canonical watch source'
     Assert-Contract ($overload -match '!bUseCachedFileMetadata\s*&&\s*!pInfo->packagePath\.IsEmpty\(\)') `
         'a GetItemInfo overload can still stat a cached package path'
     Assert-Contract ($overload -match 'bA4SFileMetadataValidated\s*=\s*true' -and
-        $overload -match 'pInfo->a4sPathIdentityGeneration\s*=' -and
-        $overload -match 'GetA4SPathIdentityGeneration\(\)==a4sValidationGeneration') `
-        'real timestamp validation is not bound to the current path-identity generation'
+        $overload -match 'IsA4SItemWatchBindingCurrent\(a4sCanonicalPath' -and
+        $overload -match 'pInfo->a4sWatchRootBit\s*=' -and
+        $overload -match 'pInfo->a4sWatchRootIdentity\s*=' -and
+        $overload -match 'pInfo->a4sWatchSourceGeneration\s*=' -and
+        $overload -match 'pInfo->a4sCanonicalPath\s*=') `
+        'real timestamp validation is not stamped with its exact current watch binding'
 }
 
 # The watched classic-pins directory must remain inside the notification set;
@@ -140,7 +143,7 @@ Assert-Contract ($stateHeader -match 'constexpr\s+uint32_t\s+RequiredDirectoryNo
     $stateHeader -match 'FILE_NOTIFY_CHANGE_SIZE' -and
     $stateHeader -match 'FILE_NOTIFY_CHANGE_CREATION' -and
     $stateHeader -match 'FILE_NOTIFY_CHANGE_SECURITY' -and
-    $source -match 'FindFirstChangeNotification\(path,TRUE,[\s\S]{0,160}RequiredDirectoryNotifyFilter\(\)') `
+    $source -match 'ReadDirectoryChangesW\(watch\.directory,[\s\S]{0,220}RequiredDirectoryNotifyFilter\(\)') `
     'the production watcher does not use the full shared metadata-change filter'
 Assert-Contract ($source -match 'static_assert\(A4SCacheState::RequiredDirectoryNotifyFilter\(\)==[\s\S]{0,300}FILE_NOTIFY_CHANGE_SECURITY') `
     'the pure notify-filter contract is not tied to the exact Win32 production constants'
@@ -219,15 +222,37 @@ Assert-Contract ($metroLinks -match 'ShGetKnownFolderItem' -and
     $metroLinks -match 'if\s*\(result==S_FALSE\)\s*break' -and
     $metroLinks -match 'if\s*\(result!=S_OK\s*\|\|\s*!pChild\)') `
     'Apps known-folder, enumerator construction, or terminal failure can be mistaken for success'
-Assert-Contract ($stateHeader -match 'inline\s+bool\s+RequiredFolderLoadsComplete' -and
-    $productPreload -match 'requestedRequiredLoadMask=dirMask&setupRequiredMask' -and
-    $productPreload -match 'completedRequiredLoadMask\|=1U<<i' -and
+Assert-Contract ($stateHeader -match 'inline\s+bool\s+RequestedFolderLoadsComplete' -and
+    $productPreload -match 'requestedLoadMask\|=loadBit' -and
+    $productPreload -match 'completedLoadMask\|=loadBit' -and
+    $productPreload -match 'baselineRequestedLoadMask\|=requestedLoadMask' -and
+    $productPreload -match 'baselineCompletedLoadMask=\s*\(baselineCompletedLoadMask&~requestedLoadMask\)\|completedLoadMask' -and
     $productPreload -match '!bRequiredLoadsComplete' -and
-    $productPreload -match 'if\s*\(bLoadedAny\s*&&\s*bRequiredLoadsComplete\)[\s\S]{0,400}SaveCacheFile\(\)') `
-    'required initial/reload success is not part of baseline publication'
-Assert-Contract ($productPreload -match 'Desktop is optional for A4S readiness' -and
+    $productPreload -match 'RequestedFolderLoadsComplete\([\s\S]{0,120}transactionRequestedLoadMask,transactionCompletedLoadMask' -and
+    $productPreload -match 'bSaveCacheThisPass=transactionRequestedLoadMask\s*&&[\s\S]{0,80}bRequestedLoadsComplete' -and
+    $productPreload -match 'if\s*\(bSaveCacheThisPass\)[\s\S]{0,500}SaveCacheFile\(\)') `
+    'all selected required and optional roots are not one disk-cache transaction'
+Assert-Contract ($productPreload -match 'Policy deliberately excludes this optional preload root' -and
     $requiredMask -notmatch 'WATCH_DESKTOP|WATCH_PUBLIC_DESKTOP|WATCH_TASKBAR_PINNED') `
     'optional preload failure semantics are no longer explicit'
+
+# Required Metro values are fail-closed in the product while the upstream
+# branch preserves legacy best-effort discovery exactly.
+Assert-Contract ($stateHeader -match 'struct\s+RequiredMetroValueState' -and
+    $stateHeader -match 'inline\s+bool\s+RequiredMetroValueReady') `
+    'Metro property failures lack a native fault-injection seam'
+Assert-Contract ($metroLinks -match 'BindToHandler\(NULL,BHID_PropertyStore' -and
+    $metroLinks -match 'RequiredMetroValueReady\(storeState\)' -and
+    $metroLinks -match 'GetValue\(PKEY_MetroAppLauncher' -and
+    $metroLinks -match 'RequiredMetroValueReady\(launcherState\)' -and
+    $metroLinks -match 'GetRequiredMetroString\(pStore,PKEY_AppUserModel_ID' -and
+    $metroLinks -match 'GetValue\(PKEY_MetroAppLink' -and
+    $metroLinks -match 'RequiredMetroValueReady\(linkState\)') `
+    'A4S Apps discovery does not propagate property-store bind/value/type/string failure'
+Assert-Contract ($metroSource -match '#else\s+void\s+GetMetroLinks\(' -and
+    $metroSource -match 'LOG_MENU\(LOG_APPS,L"    No Store"\);\s*continue;' -and
+    $metroSource -match 'LOG_MENU\(LOG_APPS,L"    No launcher"\);\s*bNonApp=true;') `
+    'upstream Metro discovery no longer retains its legacy best-effort behavior'
 
 # Icon/metadata invalidation has an independent epoch. ResetTempIcons executes
 # on every menu toggle, so a true no-op must preserve warm snapshot identity.
@@ -282,15 +307,16 @@ $pathGenerationRevokeIndex = $revoke.IndexOf('AdvanceA4SPathIdentityGeneration()
 Assert-Contract ($readyResetIndex -ge 0 -and $armedResetIndex -gt $readyResetIndex -and
     $generationRevokeIndex -gt $armedResetIndex -and
     $pathGenerationRevokeIndex -gt $generationRevokeIndex -and
-    $revoke -match 'ResetEvent\(m_A4SFolderWatchReadyEvent\)') `
+    $revoke -match 'ResetEvent\(m_A4SFolderWatchReadyEvent\)' -and
+    $revoke -match 'ClearA4SWatchRootTable\(\)') `
     'watch failure does not revoke readiness and advance both content and path generations'
-$baselineSequence = 'AdvanceFolderContentGeneration\(\);\s*InterlockedExchange64\(&m_A4SPublishedWatchIdentityHash,[\s\S]*?\);\s*InterlockedExchange64\(&m_A4SPublishedWatchConfigurationGeneration,[\s\S]*?\);\s*InterlockedExchange\(&m_A4SArmedWatchMask,[\s\S]*?\);\s*InterlockedExchange\(&m_A4SFolderWatchReady,1\);\s*SetEvent\(m_A4SFolderWatchReadyEvent\);'
+$baselineSequence = 'AdvanceFolderContentGeneration\(\);[\s\S]*?PublishA4SWatchRootTable\(publishedRoots,publishedRootCount\);\s*InterlockedExchange64\(&m_A4SPublishedWatchIdentityHash,[\s\S]*?\);\s*InterlockedExchange64\(&m_A4SPublishedWatchConfigurationGeneration,[\s\S]*?\);\s*InterlockedExchange\(&m_A4SArmedWatchMask,[\s\S]*?\);\s*InterlockedExchange\(&m_A4SFolderWatchReady,1\);\s*SetEvent\(m_A4SFolderWatchReadyEvent\);'
 Assert-Contract ($preload -match $baselineSequence) `
     'watcher readiness is signaled before generation and canonical identity publication'
 Assert-Contract ($preload -match 'setupRequiredMask' -and
     $preload -match 'armedMask\|=watchBit' -and
     $preload -match 'currentRequiredMask==setupRequiredMask' -and
-    $preload -match 'pendingMask\|=watchMasks\[watch\]' -and
+    $preload -match 'pendingMask\|=watches\[watch\]\.watchBit' -and
     $preload -match 'pendingMask&currentRequiredMask' -and
     $preload -match 'dirMask=pendingMask') `
     'required handles are not tracked or pending required/optional changes are not separated'
@@ -298,21 +324,48 @@ Assert-Contract ($preload -match 'setupRequiredMask' -and
 # Required watch handles are bound to canonical final directory identities and
 # a same-mask source generation, never merely to a bitmask.
 $resolveFolder = Get-CppFunctionBody -Text $source -Signature 'static HRESULT ResolveA4SCacheFolder( int index, CAbsolutePidl &pidl,'
-$queryIdentity = Get-CppFunctionBody -Text $source -Signature 'static HRESULT QueryA4SDirectoryIdentity( const wchar_t *path,'
+$queryIdentity = Get-CppFunctionBody -Text $source -Signature 'static HRESULT QueryA4SHandleIdentity( HANDLE handle, DWORD watchBit,'
+$openWatch = Get-CppFunctionBody -Text $source -Signature 'static bool OpenA4SDirectoryWatch( const wchar_t *path, DWORD watchBit,'
+$closeWatch = Get-CppFunctionBody -Text $source -Signature 'static void CloseA4SDirectoryWatch( A4SDirectoryWatch &watch )'
+$verifyWatches = Get-CppFunctionBody -Text $source -Signature 'static bool VerifyA4SRequiredWatchConfiguration( DWORD requiredMask,'
 $forceReconfigure = Get-CppFunctionBody -Text $source -Signature 'void CItemManager::ForceA4SFolderWatchReconfigure( void )'
 Assert-Contract ($resolveFolder -match '!SHGetPathFromIDList\(pidl,path\)\s*\|\|\s*!path\[0\]' -and
     $resolveFolder -notmatch 'SUCCEEDED\(SHGetPathFromIDList') `
     'a failed or empty Win32 watch path can be mistaken for a successful HRESULT'
-Assert-Contract ($queryIdentity -match 'CreateFile\(path,FILE_READ_ATTRIBUTES' -and
-    $queryIdentity -match 'GetFileInformationByHandle\(' -and
+Assert-Contract ($queryIdentity -match 'GetFileInformationByHandle\(' -and
     $queryIdentity -match 'GetFinalPathNameByHandle\(' -and
     $queryIdentity -match 'FILE_NAME_NORMALIZED\|VOLUME_NAME_NT') `
     'watch identity is not derived from the canonical final directory and stable file identity'
-Assert-Contract ($productPreload -match 'QueryA4SDirectoryIdentity\([\s\S]{0,500}FindFirstChangeNotification\([\s\S]{0,500}QueryA4SDirectoryIdentity\(' -and
-    $productPreload -match 'beforeIdentity==afterIdentity' -and
-    $productPreload -match 'ComputeA4SRequiredWatchIdentity' -and
+Assert-Contract ($openWatch -match 'OpenA4SDirectoryHandle\(path,true\)' -and
+    $openWatch -match 'QueryA4SHandleIdentity\(watch\.directory' -and
+    $openWatch -match 'ArmA4SDirectoryWatch\(watch\)' -and
+    $openWatch -match 'armedIdentity==watch\.identity' -and
+    $source -match 'ReadDirectoryChangesW\(watch\.directory' -and
+    $closeWatch -match 'CancelIoEx\(watch\.directory,&watch\.overlapped\)' -and
+    $closeWatch -match 'GetOverlappedResult\(watch\.directory,&watch\.overlapped,&ignored,TRUE\)') `
+    'watching, identity, cancellation, or lifetime is not tied to one directory handle'
+Assert-Contract ($productPreload -notmatch 'FindFirstChangeNotification|FindNextChangeNotification|FindCloseChangeNotification' -and
+    $productPreload -match 'VerifyA4SRequiredWatchConfiguration' -and
+    $verifyWatches -match 'QueryA4SHandleIdentity\(watches\[watchIndex\]\.directory' -and
+    $verifyWatches -match 'QueryA4SConfiguredDirectoryIdentity' -and
     $productPreload -match 'WatchConfigurationMatches\(published,observed\)') `
-    'reparse/path uncertainty is not checked around handle creation, publication, and steady state'
+    'reparse/path uncertainty is not checked on exact live handles through steady state'
+Assert-Contract ($source -match 'OPEN_REPARSE_POINT is therefore intentionally omitted' -and
+    $source -match 'FILE_FLAG_BACKUP_SEMANTICS[\s\S]{0,120}FILE_FLAG_OVERLAPPED') `
+    'directory reparse handling is not explicit or overlapped'
+Assert-Contract ($header -match 'struct\s+A4SWatchRootBinding' -and
+    $header -match 'DWORD\s+watchBit' -and
+    $header -match 'CString\s+canonicalPath' -and
+    $header -match 'ULONGLONG\s+rootIdentity' -and
+    $header -match 'ULONGLONG\s+identityGeneration' -and
+    $header -match 'ULONGLONG\s+sourceGeneration' -and
+    $source -match 'SelectCanonicalWatchRoot\(canonicalPath' -and
+    $source -match 'WatchBindingMatches\(validated,current\)') `
+    'per-entry metadata is not bound to an immutable canonical required-root table'
+Assert-Contract ($helper -notmatch 'LOCATION_START_MENU|LOCATION_METRO' -and
+    $helper -match '!info\.a4sCanonicalPath\.IsEmpty\(\)' -and
+    $helper -match 'info\.packagePath\.IsEmpty\(\)') `
+    'LOCATION or a virtual/package entry can authorize cached filesystem metadata'
 Assert-Contract ($header -match 'm_A4SWatchConfigurationGeneration' -and
     $header -match 'm_A4SPublishedWatchConfigurationGeneration' -and
     $header -match 'm_A4SPublishedWatchIdentityHash' -and
@@ -332,9 +385,9 @@ Assert-Contract ($preload -match 'WATCH_RETRY_MIN_MS=250' -and
     $preload -match 'm_A4SWatchRebuildEvent') `
     'watch recovery is not bounded, event-driven, and reconfigurable'
 $waitFailureCount = [Regex]::Matches($preload, 'WAIT_FAILED[\s\S]{0,700}RevokeA4SFolderWatchBaseline\(\)').Count
-$rearmFailureCount = [Regex]::Matches($preload, '!FindNextChangeNotification[\s\S]{0,1400}RevokeA4SFolderWatchBaseline\(\)').Count
+$rearmFailureCount = [Regex]::Matches($preload, '!ConsumeAndRearmA4SDirectoryWatch[\s\S]{0,1800}RevokeA4SFolderWatchBaseline\(\)').Count
 Assert-Contract ($waitFailureCount -ge 2 -and $rearmFailureCount -ge 1) `
-    'WaitForMultipleObjects or FindNextChangeNotification failure can leave readiness published'
+    'WaitForMultipleObjects or overlapped rearm failure can leave readiness published'
 
 # Deterministic fail-closed decision model for the exact conditions encoded by
 # TryGetCachedFileMetadata. This exercises every rejection edge without loading

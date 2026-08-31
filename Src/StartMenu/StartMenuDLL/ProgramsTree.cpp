@@ -36,8 +36,14 @@ bool CProgramsTree::s_bA4SAsyncAutoSort=false;
 bool CProgramsTree::s_bA4SAsyncWorkerRunning=false;
 bool CProgramsTree::s_bA4SAsyncStopping=false;
 HANDLE CProgramsTree::s_A4SAsyncWorker=NULL;
+HANDLE CProgramsTree::s_A4SAsyncStateEvent=NULL;
 HWND CProgramsTree::s_A4SAsyncNotifyWindow=NULL;
 LONG CProgramsTree::s_A4SAsyncNotifyCookie=0;
+
+// A watcher that cannot establish its baseline is a failed preload, not an
+// invitation to poll Explorer forever. Generation and shutdown changes wake
+// this wait immediately through s_A4SAsyncStateEvent.
+static const DWORD A4S_PROGRAMS_WATCH_BASELINE_TIMEOUT=30000;
 #endif
 
 const wchar_t *ORDER_PREFIX=L"#";
@@ -415,6 +421,8 @@ bool CProgramsTree::SupersedeA4SConfigurationIfStale(
 		s_A4SAsyncConfiguration=latest;
 		InterlockedIncrement(&s_A4SAsyncGeneration);
 		s_A4SAsyncFailedGeneration=0;
+		if (s_A4SAsyncStateEvent)
+			SetEvent(s_A4SAsyncStateEvent);
 	}
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 	return true;
@@ -438,19 +446,32 @@ bool CProgramsTree::StartA4SAsyncWorkerLocked( void )
 		CloseHandle(s_A4SAsyncWorker);
 		s_A4SAsyncWorker=NULL;
 	}
+	if (!s_A4SAsyncStateEvent)
+	{
+		s_A4SAsyncStateEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
+		if (!s_A4SAsyncStateEvent)
+		{
+			s_A4SAsyncFailedGeneration=s_A4SAsyncGeneration;
+			return false;
+		}
+	}
 
 	// The worker may outlive an individual menu window. Retain the module until
 	// its COM apartment and all shell objects have been torn down.
 	HMODULE module=NULL;
 	if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
 		(LPCTSTR)(ULONG_PTR)&A4SAsyncWorkerProc,&module))
+	{
+		s_A4SAsyncFailedGeneration=s_A4SAsyncGeneration;
 		return false;
+	}
 
 	s_bA4SAsyncWorkerRunning=true;
 	HANDLE thread=CreateThread(NULL,0,A4SAsyncWorkerProc,module,0,NULL);
 	if (!thread)
 	{
 		s_bA4SAsyncWorkerRunning=false;
+		s_A4SAsyncFailedGeneration=s_A4SAsyncGeneration;
 		FreeLibrary(module);
 		return false;
 	}
@@ -475,6 +496,8 @@ void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
 		s_A4SAsyncConfiguration=configuration;
 		InterlockedIncrement(&s_A4SAsyncGeneration);
 		s_A4SAsyncFailedGeneration=0;
+		if (s_A4SAsyncStateEvent)
+			SetEvent(s_A4SAsyncStateEvent);
 	}
 
 	if (pOwner)
@@ -491,11 +514,15 @@ void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
 	{
 		InterlockedIncrement(&s_A4SAsyncGeneration);
 		s_A4SAsyncFailedGeneration=0;
+		if (s_A4SAsyncStateEvent)
+			SetEvent(s_A4SAsyncStateEvent);
 	}
 	else if (s_A4SAsyncFailedGeneration==s_A4SAsyncGeneration)
 	{
 		InterlockedIncrement(&s_A4SAsyncGeneration);
 		s_A4SAsyncFailedGeneration=0;
+		if (s_A4SAsyncStateEvent)
+			SetEvent(s_A4SAsyncStateEvent);
 	}
 
 	if (bConfigurationChanged || bInvalidate || !s_bA4SAsyncHasSnapshot ||
@@ -515,6 +542,8 @@ bool CProgramsTree::ShutdownA4SItems( DWORD timeout )
 	AcquireSRWLockExclusive(&s_A4SAsyncLock);
 	s_bA4SAsyncStopping=true;
 	InterlockedIncrement(&s_A4SAsyncGeneration);
+	if (s_A4SAsyncStateEvent)
+		SetEvent(s_A4SAsyncStateEvent);
 	s_A4SAsyncNotifyWindow=NULL;
 	s_A4SAsyncNotifyCookie=0;
 	worker=s_A4SAsyncWorker;
@@ -528,6 +557,11 @@ bool CProgramsTree::ShutdownA4SItems( DWORD timeout )
 	{
 		CloseHandle(s_A4SAsyncWorker);
 		s_A4SAsyncWorker=NULL;
+	}
+	if (s_A4SAsyncStateEvent)
+	{
+		CloseHandle(s_A4SAsyncStateEvent);
+		s_A4SAsyncStateEvent=NULL;
 	}
 	s_bA4SAsyncWorkerRunning=false;
 	s_bA4SAsyncHasSnapshot=false;
@@ -883,6 +917,28 @@ CProgramsTree::A4SAsyncResult CProgramsTree::WaitForA4SIcons(
 	return A4S_ASYNC_CANCELLED;
 }
 
+CProgramsTree::A4SAsyncResult CProgramsTree::WaitForA4SFolderWatchBaseline(
+	LONG generation, HANDLE stateEvent )
+{
+	if (!IsA4SGenerationCurrent(generation))
+		return A4S_ASYNC_CANCELLED;
+	if (g_ItemManager.IsFolderWatchBaselineReady())
+		return A4S_ASYNC_SUCCESS;
+
+	HANDLE watchReadyEvent=g_ItemManager.GetA4SFolderWatchReadyEvent();
+	if (!watchReadyEvent || !stateEvent)
+		return A4S_ASYNC_FAILURE;
+	HANDLE handles[2]={watchReadyEvent,stateEvent};
+	const DWORD wait=WaitForMultipleObjects(_countof(handles),handles,FALSE,
+		A4S_PROGRAMS_WATCH_BASELINE_TIMEOUT);
+	if (wait==WAIT_OBJECT_0+1 || !IsA4SGenerationCurrent(generation))
+		return A4S_ASYNC_CANCELLED;
+	if (wait!=WAIT_OBJECT_0)
+		return A4S_ASYNC_FAILURE;
+	return g_ItemManager.IsFolderWatchBaselineReady()?
+		A4S_ASYNC_SUCCESS:A4S_ASYNC_FAILURE;
+}
+
 DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 {
 	HMODULE module=(HMODULE)param;
@@ -894,10 +950,17 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 	{
 		A4SAsyncConfiguration configuration;
 		LONG generation;
+		HANDLE stateEvent=NULL;
 		AcquireSRWLockShared(&s_A4SAsyncLock);
 		const bool bStopping=s_bA4SAsyncStopping;
 		configuration=s_A4SAsyncConfiguration;
 		generation=InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0);
+		stateEvent=s_A4SAsyncStateEvent;
+		// Generation mutations require the exclusive lock and signal afterwards.
+		// Resetting under this shared lock consumes only older notifications and
+		// cannot lose a future cancellation.
+		if (!bStopping && stateEvent)
+			ResetEvent(stateEvent);
 		ReleaseSRWLockShared(&s_A4SAsyncLock);
 		if (bStopping)
 			break;
@@ -905,22 +968,21 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		// The watcher thread intentionally starts after a short idle delay. Do not
 		// let a snapshot captured in that blind window become publishable. The
 		// baseline signal advances the folder generation before it wakes us.
-		while (IsA4SGenerationCurrent(generation) &&
-			!g_ItemManager.IsFolderWatchBaselineReady())
-		{
-			g_ItemManager.WaitForFolderWatchBaseline(100);
-		}
-		if (!IsA4SGenerationCurrent(generation))
+		A4SAsyncResult result=WaitForA4SFolderWatchBaseline(generation,stateEvent);
+		if (result==A4S_ASYNC_CANCELLED)
 			continue;
-		if (SupersedeA4SConfigurationIfStale(configuration,generation))
+		if (result==A4S_ASYNC_SUCCESS &&
+			SupersedeA4SConfigurationIfStale(configuration,generation))
 			continue;
 
 		std::vector<CTreeItem> items;
 		bool bAutoSort=false;
-		A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
-		const A4SAsyncResult result=BuildA4SRootSnapshot(configuration,generation,
-			items,bAutoSort);
-		programsScope.SetResult(static_cast<UINT32>(items.size()),FALSE);
+		if (result==A4S_ASYNC_SUCCESS)
+		{
+			A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
+			result=BuildA4SRootSnapshot(configuration,generation,items,bAutoSort);
+			programsScope.SetResult(static_cast<UINT32>(items.size()),FALSE);
+		}
 		if (result==A4S_ASYNC_CANCELLED && !IsA4SGenerationCurrent(generation))
 			continue;
 		if (result==A4S_ASYNC_SUCCESS &&

@@ -9,6 +9,9 @@
 #include "FNVHash.h"
 #include "ResourceHelper.h"
 #include "Translations.h"
+#ifdef A4S_PRODUCT
+#include "A4SCacheState.h"
+#endif
 #include <propkey.h>
 #include <map>
 
@@ -27,6 +30,27 @@ GUID CLSID_PinExt={0x90AA3A4E,0x1CBA,0x4233,{0xB8,0xBB,0x53,0x57,0x73,0xD4,0x84,
 const wchar_t *MetroAppClassId=L"Launcher.ImmersiveApplication";
 
 // Returns a list of links for all metro apps
+#ifdef A4S_PRODUCT
+static HRESULT GetRequiredMetroString( IPropertyStore *pStore,
+	REFPROPERTYKEY key, CString &value )
+{
+	value.Empty();
+	PROPVARIANT data;
+	PropVariantInit(&data);
+	const HRESULT result=pStore?pStore->GetValue(key,&data):E_POINTER;
+	const bool bTypeValid=data.vt==VT_LPWSTR || data.vt==VT_BSTR;
+	if (SUCCEEDED(result) && data.vt==VT_LPWSTR && data.pwszVal)
+		value=data.pwszVal;
+	else if (SUCCEEDED(result) && data.vt==VT_BSTR && data.bstrVal)
+		value=data.bstrVal;
+	A4SCacheState::RequiredMetroValueState state={
+		SUCCEEDED(result),pStore!=NULL,bTypeValid,true,!value.IsEmpty()};
+	PropVariantClear(&data);
+	if (!A4SCacheState::RequiredMetroValueReady(state))
+		return FAILED(result)?result:HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
+	return S_OK;
+}
+
 HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10 )
 {
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (start)");
@@ -58,28 +82,25 @@ HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CSt
 			LOG_MENU(LOG_APPS,L"App: %s",(const wchar_t*)pName);
 		}
 		CComPtr<IPropertyStore> pStore;
-		if (FAILED(pChild->BindToHandler(NULL,BHID_PropertyStore,IID_IPropertyStore,(void**)&pStore)))
-		{
-			LOG_MENU(LOG_APPS,L"    No Store");
-			continue;
-		}
+		result=pChild->BindToHandler(NULL,BHID_PropertyStore,
+			IID_IPropertyStore,(void**)&pStore);
+		A4SCacheState::RequiredMetroValueState storeState={
+			SUCCEEDED(result),pStore!=NULL,true,false,true};
+		if (!A4SCacheState::RequiredMetroValueReady(storeState))
+			return FAILED(result)?result:E_UNEXPECTED;
 		PROPVARIANT val;
 		PropVariantInit(&val);
-		bool bNonApp=false;
-		if (FAILED(pStore->GetValue(PKEY_MetroAppLauncher,&val)))
+		result=pStore->GetValue(PKEY_MetroAppLauncher,&val);
+		const bool bLauncherType=val.vt==VT_I4 || val.vt==VT_UI4;
+		A4SCacheState::RequiredMetroValueState launcherState={
+			SUCCEEDED(result),true,bLauncherType,false,true};
+		if (!A4SCacheState::RequiredMetroValueReady(launcherState))
 		{
-			LOG_MENU(LOG_APPS,L"    No launcher");
-			bNonApp=true;
-		}
-		else
-		{
-			if ((val.vt!=VT_I4 && val.vt!=VT_UI4) || !val.intVal)
-			{
-				LOG_MENU(LOG_APPS,L"    No launcher: %d",val.vt);
-				bNonApp=true;
-			}
 			PropVariantClear(&val);
+			return FAILED(result)?result:HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
 		}
+		const bool bNonApp=val.intVal==0;
+		PropVariantClear(&val);
 		if (GetWinVersion()>=WIN_VER_WIN10)
 		{
 			PIDLIST_ABSOLUTE pidl=NULL;
@@ -91,25 +112,35 @@ HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CSt
 				links.resize(links.size()+1);
 				MetroLink &link=*links.rbegin();
 				link.pidl.Attach(pidl);
-				link.appid=GetPropertyStoreString(pStore,PKEY_AppUserModel_ID);
+				result=GetRequiredMetroString(pStore,PKEY_AppUserModel_ID,
+					link.appid);
+				if (FAILED(result))
+				{
+					links.pop_back();
+					return result;
+				}
 				link.pItem=pChild;
 			}
 			if (bNonApp && pNonApps10)
-				pNonApps10->push_back(GetPropertyStoreString(pStore,PKEY_AppUserModel_ID));
+			{
+				CString appid;
+				result=GetRequiredMetroString(pStore,PKEY_AppUserModel_ID,appid);
+				if (FAILED(result))
+					return result;
+				pNonApps10->push_back(appid);
+			}
 			continue;
 		}
 		if (bNonApp)
 			continue;
-		if (FAILED(pStore->GetValue(PKEY_MetroAppLink,&val)))
+		result=pStore->GetValue(PKEY_MetroAppLink,&val);
+		const bool bLinkType=val.vt==(VT_VECTOR|VT_UI1);
+		A4SCacheState::RequiredMetroValueState linkState={
+			SUCCEEDED(result),true,bLinkType,true,val.caub.pElems!=NULL};
+		if (!A4SCacheState::RequiredMetroValueReady(linkState))
 		{
-			LOG_MENU(LOG_APPS,L"    No link");
-			continue;
-		}
-		if (val.vt!=(VT_VECTOR|VT_UI1) || !val.caub.pElems)
-		{
-			LOG_MENU(LOG_APPS,L"    No link: %d",val.vt);
 			PropVariantClear(&val);
-			continue;
+			return FAILED(result)?result:HRESULT_FROM_WIN32(ERROR_INVALID_DATA);
 		}
 		PIDLIST_ABSOLUTE pidl=ILCloneFull((PIDLIST_ABSOLUTE)val.caub.pElems);
 		PropVariantClear(&val);
@@ -134,6 +165,96 @@ HRESULT GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CSt
 	LOG_MENU(LOG_APPS,L"Collect Metro Links (end)");
 	return S_OK;
 }
+#else
+void GetMetroLinks( std::vector<MetroLink> &links, bool bLog, std::vector<CString> *pNonApps10 )
+{
+	LOG_MENU(LOG_APPS,L"Collect Metro Links (start)");
+	if (bLog && !(g_LogCategories&LOG_APPS))
+		bLog=false;
+	CComPtr<IShellItem> pApps;
+	if (FAILED(ShGetKnownFolderItem(FOLDERID_AppsFolder2,&pApps)))
+		return;
+	CComPtr<IEnumShellItems> pEnum;
+	pApps->BindToHandler(NULL,BHID_EnumItems,IID_IEnumShellItems,(void**)&pEnum);
+
+	CComPtr<IShellItem> pChild;
+	while (pEnum && (pChild=NULL,pEnum->Next(1,&pChild,NULL)==S_OK))
+	{
+		if (bLog)
+		{
+			CComString pName;
+			pChild->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName);
+			LOG_MENU(LOG_APPS,L"App: %s",(const wchar_t*)pName);
+		}
+		CComPtr<IPropertyStore> pStore;
+		if (FAILED(pChild->BindToHandler(NULL,BHID_PropertyStore,IID_IPropertyStore,(void**)&pStore)))
+		{
+			LOG_MENU(LOG_APPS,L"    No Store");
+			continue;
+		}
+		PROPVARIANT val;
+		PropVariantInit(&val);
+		bool bNonApp=false;
+		if (FAILED(pStore->GetValue(PKEY_MetroAppLauncher,&val)))
+		{
+			LOG_MENU(LOG_APPS,L"    No launcher");
+			bNonApp=true;
+		}
+		else
+		{
+			if ((val.vt!=VT_I4 && val.vt!=VT_UI4) || !val.intVal)
+			{
+				LOG_MENU(LOG_APPS,L"    No launcher: %d",val.vt);
+				bNonApp=true;
+			}
+			PropVariantClear(&val);
+		}
+		if (GetWinVersion()>=WIN_VER_WIN10)
+		{
+			PIDLIST_ABSOLUTE pidl;
+			if (!bNonApp && SUCCEEDED(SHGetIDListFromObject(pChild,&pidl)))
+			{
+				links.resize(links.size()+1);
+				MetroLink &link=*links.rbegin();
+				link.pidl.Attach(pidl);
+				link.appid=GetPropertyStoreString(pStore,PKEY_AppUserModel_ID);
+				link.pItem=pChild;
+			}
+			else
+				bNonApp=true;
+			if (bNonApp && pNonApps10)
+				pNonApps10->push_back(GetPropertyStoreString(pStore,PKEY_AppUserModel_ID));
+			continue;
+		}
+		if (bNonApp)
+			continue;
+		if (FAILED(pStore->GetValue(PKEY_MetroAppLink,&val)))
+		{
+			LOG_MENU(LOG_APPS,L"    No link");
+			continue;
+		}
+		if (val.vt!=(VT_VECTOR|VT_UI1) || !val.caub.pElems)
+		{
+			LOG_MENU(LOG_APPS,L"    No link: %d",val.vt);
+			PropVariantClear(&val);
+			continue;
+		}
+		PIDLIST_ABSOLUTE pidl=ILCloneFull((PIDLIST_ABSOLUTE)val.caub.pElems);
+		PropVariantClear(&val);
+		links.resize(links.size()+1);
+		MetroLink &link=*links.rbegin();
+		link.pidl.Attach(pidl);
+		SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&link.pItem);
+		if (bLog && link.pItem)
+		{
+			CComString pName;
+			link.pItem->GetDisplayName(SIGDN_DESKTOPABSOLUTEPARSING,&pName);
+			LOG_MENU(LOG_APPS,L"    Link: %s",(const wchar_t*)pName);
+		}
+	}
+	LOG_MENU(LOG_APPS,L"Collect Metro Links (end)");
+}
+#endif
 
 void ExecuteMetroLink( const CItemManager::ItemInfo *pInfo )
 {

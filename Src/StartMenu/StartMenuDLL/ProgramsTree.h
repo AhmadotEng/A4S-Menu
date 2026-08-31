@@ -287,6 +287,7 @@ private:
 	static bool s_bA4SAsyncWorkerRunning;
 	static bool s_bA4SAsyncStopping;
 	static HANDLE s_A4SAsyncWorker;
+	static HANDLE s_A4SAsyncStateEvent;
 	static HWND s_A4SAsyncNotifyWindow;
 	static LONG s_A4SAsyncNotifyCookie;
 
@@ -296,6 +297,8 @@ private:
 		const A4SAsyncConfiguration &configuration, LONG generation );
 	static bool StartA4SAsyncWorkerLocked( void );
 	static DWORD CALLBACK A4SAsyncWorkerProc( void *param );
+	static A4SAsyncResult WaitForA4SFolderWatchBaseline( LONG generation,
+		HANDLE stateEvent );
 	static A4SAsyncResult BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
 		LONG generation, std::vector<CTreeItem> &items, bool &bAutoSort );
 	static A4SAsyncResult WaitForA4SIcons( std::vector<CTreeItem> &items,
