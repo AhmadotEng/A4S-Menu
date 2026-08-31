@@ -50,7 +50,8 @@ void MarkA4SPerformanceEvent( A4SPerformanceEvent event, UINT32 value=0,
 
 void SetA4SActivationSource( A4SActivationSource source );
 UINT64 BeginA4SOpenPath( void );
-UINT64 BeginA4SClosePath( void );
+void AssociateA4SOpenWindow( HWND window );
+UINT64 BeginA4SClosePath( HWND window );
 UINT64 CurrentA4SOpenOperation( void );
 void MarkA4SFirstPaint( HWND window );
 void MarkA4SWindowVisible( HWND window );
@@ -97,7 +98,8 @@ inline void InitializeA4SPerformance( void ) {}
 inline void CloseA4SPerformance( void ) {}
 inline void SetA4SActivationSource( A4SActivationSource ) {}
 inline UINT64 BeginA4SOpenPath( void ) { return 0; }
-inline UINT64 BeginA4SClosePath( void ) { return 0; }
+inline void AssociateA4SOpenWindow( HWND ) {}
+inline UINT64 BeginA4SClosePath( HWND ) { return 0; }
 inline UINT64 CurrentA4SOpenOperation( void ) { return 0; }
 inline void MarkA4SFirstPaint( HWND ) {}
 inline void MarkA4SWindowVisible( HWND ) {}

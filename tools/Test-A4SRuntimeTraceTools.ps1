@@ -23,6 +23,15 @@ foreach ($name in $ownedFiles) {
     Assert-A4S ($parseErrors.Count -eq 0) "$name has PowerShell parse errors: $($parseErrors -join '; ')"
 }
 
+$performanceSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Src\StartMenu\StartMenuDLL\A4SPerformance.cpp') -Raw
+$containerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Src\StartMenu\StartMenuDLL\MenuContainer.cpp') -Raw
+Assert-A4S ($performanceSource -match 'InterlockedCompareExchange\(&g_registered,-1,0\)') 'provider registration is published before TraceLoggingRegister completes'
+Assert-A4S ($performanceSource -match 'BeginA4SPerformanceOperation[\s\S]+if \(!ProviderEnabled\(\)\)[\s\S]+return 0;') 'phase operations can begin outside an enabled ETW session'
+Assert-A4S ($performanceSource -match 'AssociateA4SOpenWindow' -and $containerSource -match 'AssociateA4SOpenWindow\(pStartMenu->m_hWnd\)') 'open operations are not associated with their exact root menu window'
+Assert-A4S ($performanceSource -match 'BeginA4SClosePath\(HWND window\)' -and $containerSource -match 'BeginA4SClosePath\(s_FirstMenu\)') 'close operations are not associated with their exact root menu window'
+Assert-A4S ($performanceSource -match 'matchesOpen=!window \|\| associated==window') 'an old hidden window can clear a newer open operation'
+Assert-A4S ($performanceSource -match 'if \(!window \|\| closeWindow==window\)') 'an unrelated hidden window can complete a newer close operation'
+
 $capturePath = Join-Path $PSScriptRoot 'Capture-A4SRuntimeTrace.ps1'
 $captureText = Get-Content -LiteralPath $capturePath -Raw
 Assert-A4S ($captureText -match '\[switch\]\$AllowMenuAutomation') 'capture tool has no explicit AllowMenuAutomation switch'

@@ -7938,7 +7938,7 @@ bool CMenuContainer::CloseStartMenu( void )
 	if (s_Menus.empty()) return false;
 	if (!CMenuContainer::CanShowMenu()) return false;
 #ifdef A4S_PRODUCT
-	BeginA4SClosePath();
+	BeginA4SClosePath(s_FirstMenu);
 #endif
  
 	HWND taskBar=s_TaskBar?s_TaskBar:g_TaskBar;
@@ -8852,6 +8852,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #endif
 			return NULL;
 		}
+#ifdef A4S_PRODUCT
+		AssociateA4SOpenWindow(pStartMenu->m_hWnd);
+#endif
 		dummyRc=rc;
 	}
 
