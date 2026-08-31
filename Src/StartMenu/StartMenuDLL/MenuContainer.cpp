@@ -8182,6 +8182,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		EnableStartTooltip(false);
 	}
 
+#ifdef A4S_PRODUCT
+	BeginA4SOpenPath();
+#endif
+
 	{
 		CRegKey regKey;
 		if (regKey.Open(HKEY_CURRENT_USER,GetSettingsRegPath())!=ERROR_SUCCESS)
@@ -8196,6 +8200,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 				if (regKey.QueryDWORDValue(L"ShowedStyle2",val)==ERROR_SUCCESS && val)
 				{
 					EditSettings(false,IDS_STYLE_SETTINGS);
+#ifdef A4S_PRODUCT
+					MarkA4SWindowHidden(NULL);
+#endif
 					return NULL;
 				}
 			}
@@ -8252,11 +8259,6 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		CSettingsLockWrite lock;
 		UpdateDefaultSettings();
 	}
-
-#ifdef A4S_PRODUCT
-	BeginA4SOpenPath();
-#endif
-
 	// initialize all settings
 	bool bErr=false;
 	HMONITOR initialMonitor=MonitorFromWindow(s_TaskBar,MONITOR_DEFAULTTONEAREST);
