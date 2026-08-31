@@ -91,6 +91,7 @@ $script:expectedCleanupHash = $null
 $script:fixturePaths = @()
 $script:lifecycleMutex = $null
 $script:lifecycleMutexHeld = $false
+$script:productSetupMutexName = $null
 $script:lastOwnedAggregate = $null
 $script:ownedAggregateLedger = [Collections.Generic.List[object]]::new()
 $script:knownPayloadBySlotName = [ordered]@{}
@@ -102,16 +103,37 @@ function Normalize-Sha256 {
     return $normalized
 }
 
+function Get-CurrentUserSidHashSuffix {
+    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    if ($null -eq $sid -or $sid.BinaryLength -le 0) {
+        throw 'The current-user SID could not be resolved for global servicing coordination.'
+    }
+    $bytes = [byte[]]::new($sid.BinaryLength)
+    $sid.GetBinaryForm($bytes, 0)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '').Substring(0, 32)
+    }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-LifecycleMutexNames {
+    $suffix = Get-CurrentUserSidHashSuffix
+    return [ordered]@{
+        Lifecycle = "Global\A4SMenu.LifecycleQualification.v1.$suffix"
+        ProductSetup = "Global\A4SMenu.Setup.v1.$suffix"
+    }
+}
+
 function Acquire-LifecycleMutex {
     if ($script:lifecycleMutexHeld) { throw 'The lifecycle mutex is already held by this harness.' }
-    $sid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
-    $bytes = [Text.Encoding]::UTF8.GetBytes($sid)
-    $algorithm = [Security.Cryptography.SHA256]::Create()
-    try { $suffix = ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '').Substring(0, 32) }
-    finally { $algorithm.Dispose() }
-    $name = "Local\A4SMenuInstallerLifecycle-$suffix"
-    $script:lifecycleMutex = [Threading.Mutex]::new($false, $name)
+    $names = Get-LifecycleMutexNames
+    $name = $names.Lifecycle
     try {
+        # Global scope makes this lease visible to service/session-0 and every
+        # interactive session. An existing object whose ACL denies this user is
+        # an unknown coordinator, so construction/access failure is fatal.
+        $script:lifecycleMutex = [Threading.Mutex]::new($false, $name)
         try { $acquired = $script:lifecycleMutex.WaitOne(0) }
         catch [Threading.AbandonedMutexException] { $acquired = $true }
         if (-not $acquired) {
@@ -121,9 +143,36 @@ function Acquire-LifecycleMutex {
         return $name
     }
     catch {
-        $script:lifecycleMutex.Dispose()
+        if ($null -ne $script:lifecycleMutex) { $script:lifecycleMutex.Dispose() }
         $script:lifecycleMutex = $null
-        throw
+        throw "Could not acquire the fail-closed global A4S lifecycle lease '$name': $($_.Exception.Message)"
+    }
+}
+
+function Assert-ProductSetupCoordinationAvailable {
+    if (-not $script:productSetupMutexName) {
+        $script:productSetupMutexName = (Get-LifecycleMutexNames).ProductSetup
+    }
+    $probe = $null
+    $acquired = $false
+    try {
+        # This is the exact Global SID-scoped mutex used by native Setup. It is
+        # probed, then released so the child Setup can acquire it itself. A
+        # cross-session service lock or access-denied DACL fails closed.
+        $probe = [Threading.Mutex]::new($false, $script:productSetupMutexName)
+        try { $acquired = $probe.WaitOne(0) }
+        catch [Threading.AbandonedMutexException] { $acquired = $true }
+        if (-not $acquired) {
+            throw 'Another native A4S setup operation owns the Global current-user servicing mutex.'
+        }
+        return [ordered]@{ Name = $script:productSetupMutexName; Available = $true }
+    }
+    catch {
+        throw "Native A4S setup coordination is unavailable or access denied: $($_.Exception.Message)"
+    }
+    finally {
+        if ($acquired -and $null -ne $probe) { $probe.ReleaseMutex() }
+        if ($null -ne $probe) { $probe.Dispose() }
     }
 }
 
@@ -170,9 +219,6 @@ function Assert-NoReparsePointInExistingChain {
             throw "No existing ancestor could be validated for $Path."
         }
         $cursor = $parent.FullName
-    }
-    if ($tail.Count -ne 0 -and -not (Test-Path -LiteralPath $cursor -PathType Container)) {
-        throw "The nearest existing ancestor for $full is not a directory: $cursor"
     }
     while ($cursor) {
         $item = Get-Item -LiteralPath $cursor -Force
@@ -490,11 +536,12 @@ function Get-NamedMemberValue {
     )
     if ($Value -is [Collections.IDictionary]) {
         if (-not $Value.Contains($Name)) { throw "Required member '$Name' is absent." }
-        return $Value[$Name]
+        Write-Output -NoEnumerate $Value[$Name]
+        return
     }
     $property = $Value.PSObject.Properties[$Name]
     if ($null -eq $property) { throw "Required member '$Name' is absent." }
-    return $property.Value
+    Write-Output -NoEnumerate $property.Value
 }
 
 function Get-StableUserStateProjection {
@@ -526,60 +573,174 @@ function ConvertFrom-EncodedRegistryData {
     }
 }
 
-function Restore-RegistryValueSnapshot {
+function Get-ObjectFieldNames {
+    param([Parameter(Mandatory)] $Value)
+
+    if ($Value -is [Collections.IDictionary]) {
+        return @($Value.Keys | ForEach-Object { [string]$_ })
+    }
+    return @($Value.PSObject.Properties | ForEach-Object { [string]$_.Name })
+}
+
+function Assert-ExactObjectFields {
     param(
-        [Parameter(Mandatory)][string] $SubKey,
-        [Parameter(Mandatory)] $Snapshot
+        [Parameter(Mandatory)] $Value,
+        [Parameter(Mandatory)][string[]] $Expected,
+        [Parameter(Mandatory)][string] $Description
     )
 
-    if (-not $Snapshot.Present) {
-        $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($SubKey, $true)
-        if ($null -ne $key) {
-            try { $key.DeleteValue([string]$Snapshot.Name, $false); $key.Flush() }
-            finally { $key.Dispose() }
-        }
-        return
-    }
-    $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($SubKey, $true)
-    if ($null -eq $key) { throw "Could not create HKCU\$SubKey during recovery." }
-    try {
-        $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
-            [Microsoft.Win32.RegistryValueKind], [string]$Snapshot.Kind, $false)
-        # Remove case-insensitively before recreating so the original value-name
-        # casing is restored as well as its native kind and bytes.
-        $key.DeleteValue([string]$Snapshot.Name, $false)
-        $key.SetValue([string]$Snapshot.Name, (ConvertFrom-EncodedRegistryData $Snapshot), $kind)
-        $key.Flush()
-    }
-    finally {
-        $key.Dispose()
+    $actual = @(Get-ObjectFieldNames $Value | Sort-Object)
+    $wanted = @($Expected | Sort-Object)
+    if ($actual.Count -ne $wanted.Count -or
+        (Compare-Object -ReferenceObject $wanted -DifferenceObject $actual -CaseSensitive)) {
+        throw "$Description does not have the exact recovery schema."
     }
 }
 
-function Restore-RegistryTreeSnapshot {
+function Assert-ValidRegistryTreeSnapshot {
     param(
         [Parameter(Mandatory)][string] $ExpectedSubKey,
         [Parameter(Mandatory)] $Snapshot
     )
 
-    if ([string]$Snapshot.SubKey -cne $ExpectedSubKey) {
+    Assert-ExactObjectFields -Value $Snapshot -Expected @('SubKey', 'Exists', 'Nodes') `
+        -Description 'Registry tree snapshot'
+    if ([string](Get-NamedMemberValue $Snapshot 'SubKey') -cne $ExpectedSubKey) {
         throw "Recovery snapshot path mismatch: expected HKCU\$ExpectedSubKey."
     }
-    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ExpectedSubKey, $false)
-    if (-not $Snapshot.Exists) { return }
-    foreach ($node in @($Snapshot.Nodes)) {
-        $relative = [string]$node.RelativePath
-        if ([IO.Path]::IsPathRooted($relative) -or $relative.Split('\') -contains '..') {
+    $exists = Get-NamedMemberValue $Snapshot 'Exists'
+    if ($exists -isnot [bool]) {
+        throw 'Registry tree snapshot Exists must be a Boolean.'
+    }
+    $nodesValue = Get-NamedMemberValue $Snapshot 'Nodes'
+    if ($null -eq $nodesValue -or $nodesValue -is [string] -or
+        $nodesValue -isnot [Collections.IEnumerable]) {
+        throw 'Registry tree snapshot Nodes must be an array.'
+    }
+    $nodes = @($nodesValue)
+    if (-not $exists) {
+        if ($nodes.Count -ne 0) {
+            throw 'A non-existent registry tree snapshot cannot contain nodes.'
+        }
+        return $Snapshot
+    }
+
+    $paths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $validatedNodes = [Collections.Generic.List[object]]::new()
+    foreach ($node in $nodes) {
+        Assert-ExactObjectFields -Value $node -Expected @('RelativePath', 'Values') `
+            -Description 'Registry tree node'
+        $relativeValue = Get-NamedMemberValue $node 'RelativePath'
+        if ($relativeValue -isnot [string]) {
+            throw 'Registry node RelativePath must be a string.'
+        }
+        $relative = [string]$relativeValue
+        if ($relative.Contains([char]0) -or [IO.Path]::IsPathRooted($relative) -or
+            $relative.StartsWith('\') -or $relative.EndsWith('\') -or
+            $relative.Contains('\\') -or
+            @($relative.Split('\') | Where-Object { $_ -eq '.' -or $_ -eq '..' }).Count -ne 0) {
             throw "Unsafe relative registry path in recovery snapshot: $relative"
         }
+        if (-not $paths.Add($relative)) {
+            throw "Duplicate registry node path in recovery snapshot: $relative"
+        }
+        $valuesValue = Get-NamedMemberValue $node 'Values'
+        if ($null -eq $valuesValue -or $valuesValue -is [string] -or
+            $valuesValue -isnot [Collections.IEnumerable]) {
+            throw "Registry node '$relative' Values must be an array."
+        }
+        $valueNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+        foreach ($value in @($valuesValue)) {
+            Assert-ExactObjectFields -Value $value -Expected @('Name', 'Kind', 'Data') `
+                -Description "Registry value in '$relative'"
+            $nameValue = Get-NamedMemberValue $value 'Name'
+            $kindValue = Get-NamedMemberValue $value 'Kind'
+            if ($nameValue -isnot [string] -or ([string]$nameValue).Contains([char]0)) {
+                throw "Registry value name in '$relative' is invalid."
+            }
+            if (-not $valueNames.Add([string]$nameValue)) {
+                throw "Duplicate registry value name '$nameValue' in '$relative'."
+            }
+            if ($kindValue -isnot [string]) {
+                throw "Registry value kind for '$nameValue' is invalid."
+            }
+            $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
+                [Microsoft.Win32.RegistryValueKind], [string]$kindValue, $false)
+            $data = Get-NamedMemberValue $value 'Data'
+            switch ($kind) {
+                ([Microsoft.Win32.RegistryValueKind]::String) {
+                    if ($data -isnot [string]) { throw "REG_SZ '$nameValue' data must be a string." }
+                }
+                ([Microsoft.Win32.RegistryValueKind]::ExpandString) {
+                    if ($data -isnot [string]) { throw "REG_EXPAND_SZ '$nameValue' data must be a string." }
+                }
+                ([Microsoft.Win32.RegistryValueKind]::MultiString) {
+                    if ($null -eq $data -or $data -is [string] -or
+                        $data -isnot [Collections.IEnumerable] -or
+                        @($data | Where-Object { $_ -isnot [string] }).Count -ne 0) {
+                        throw "REG_MULTI_SZ '$nameValue' data must be a string array."
+                    }
+                }
+                default {
+                    if ($data -isnot [string]) {
+                        throw "Encoded registry data for '$nameValue' must be a string."
+                    }
+                }
+            }
+            # Decode every value before any registry mutation. This validates
+            # base64, numeric ranges, enum values, and supported native kinds.
+            ConvertFrom-EncodedRegistryData $value | Out-Null
+        }
+        $validatedNodes.Add($node)
+    }
+    if (-not $paths.Contains('')) {
+        throw 'An existing registry tree snapshot must contain exactly one root node.'
+    }
+    foreach ($node in $validatedNodes) {
+        $relative = [string](Get-NamedMemberValue $node 'RelativePath')
+        if (-not $relative) { continue }
+        $separator = $relative.LastIndexOf('\')
+        $parent = if ($separator -lt 0) { '' } else { $relative.Substring(0, $separator) }
+        if (-not $paths.Contains($parent)) {
+            throw "Registry node '$relative' has no parent node in the snapshot."
+        }
+    }
+    return $Snapshot
+}
+
+function Test-RegistryTreeSnapshotsEqual {
+    param(
+        [Parameter(Mandatory)] $Left,
+        [Parameter(Mandatory)] $Right
+    )
+    return (Get-ObjectFingerprint $Left) -ceq (Get-ObjectFingerprint $Right)
+}
+
+function Apply-ValidatedRegistryTreeSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSubKey,
+        [Parameter(Mandatory)] $Snapshot
+    )
+
+    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($ExpectedSubKey, $false)
+    if (-not (Get-NamedMemberValue $Snapshot 'Exists')) { return }
+    $snapshotNodes = Get-NamedMemberValue $Snapshot 'Nodes'
+    $orderedNodes = @($snapshotNodes | Sort-Object `
+        @{ Expression = { if ([string]$_.RelativePath) { ([string]$_.RelativePath).Split('\').Count } else { 0 } } }, `
+        @{ Expression = { [string]$_.RelativePath } })
+    foreach ($node in $orderedNodes) {
+        $relative = [string](Get-NamedMemberValue $node 'RelativePath')
         $subKey = if ($relative) { "$ExpectedSubKey\$relative" } else { $ExpectedSubKey }
         $key = [Microsoft.Win32.Registry]::CurrentUser.CreateSubKey($subKey, $true)
         if ($null -eq $key) { throw "Could not restore HKCU\$subKey." }
         try {
-            foreach ($value in @($node.Values)) {
+            $nodeValues = Get-NamedMemberValue $node 'Values'
+            foreach ($value in $nodeValues) {
                 $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
-                    [Microsoft.Win32.RegistryValueKind], [string]$value.Kind, $false)
-                $key.SetValue([string]$value.Name, (ConvertFrom-EncodedRegistryData $value), $kind)
+                    [Microsoft.Win32.RegistryValueKind],
+                    [string](Get-NamedMemberValue $value 'Kind'), $false)
+                $key.SetValue([string](Get-NamedMemberValue $value 'Name'),
+                    (ConvertFrom-EncodedRegistryData $value), $kind)
             }
             $key.Flush()
         }
@@ -589,29 +750,125 @@ function Restore-RegistryTreeSnapshot {
     }
 }
 
+function Restore-RegistryTreeSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $ExpectedSubKey,
+        [Parameter(Mandatory)] $Snapshot
+    )
+
+    # Target validation and an exact immediate pre-state capture both happen
+    # before the sole destructive primitive is reached.
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot | Out-Null
+    $immediatePreState = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
+        -Snapshot $immediatePreState | Out-Null
+    if (Test-RegistryTreeSnapshotsEqual $immediatePreState $Snapshot) {
+        return [ordered]@{ Changed = $false; RolledBack = $false; Snapshot = $immediatePreState }
+    }
+
+    try {
+        Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot
+        $actual = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+        Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $actual | Out-Null
+        if (-not (Test-RegistryTreeSnapshotsEqual $actual $Snapshot)) {
+            throw 'Registry restoration verification did not match the validated target snapshot.'
+        }
+        return [ordered]@{ Changed = $true; RolledBack = $false; Snapshot = $actual }
+    }
+    catch {
+        $primaryFailure = $_.Exception.Message
+        try {
+            Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
+                -Snapshot $immediatePreState
+            $rolledBack = Get-RegistryTreeSnapshot -SubKey $ExpectedSubKey
+            Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey `
+                -Snapshot $rolledBack | Out-Null
+            if (-not (Test-RegistryTreeSnapshotsEqual $rolledBack $immediatePreState)) {
+                throw 'Immediate pre-state rollback verification failed.'
+            }
+        }
+        catch {
+            throw "Registry restoration failed ('$primaryFailure') and rollback to the immediate pre-state also failed: $($_.Exception.Message)"
+        }
+        throw "Registry restoration failed and was rolled back to the exact immediate pre-state: $primaryFailure"
+    }
+}
+
+function New-MergedInstalledStateSnapshot {
+    param(
+        [Parameter(Mandatory)] $OriginalProjection,
+        [Parameter(Mandatory)] $FinalInstallerRegistration
+    )
+
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $OriginalProjection | Out-Null
+    $nodes = [Collections.Generic.List[object]]::new()
+    $originalNodes = Get-NamedMemberValue $OriginalProjection 'Nodes'
+    foreach ($node in $originalNodes) {
+        $values = [Collections.Generic.List[object]]::new()
+        $originalValues = Get-NamedMemberValue $node 'Values'
+        foreach ($value in $originalValues) {
+            $values.Add([ordered]@{
+                Name = [string](Get-NamedMemberValue $value 'Name')
+                Kind = [string](Get-NamedMemberValue $value 'Kind')
+                Data = Get-NamedMemberValue $value 'Data'
+            })
+        }
+        $nodes.Add([ordered]@{
+            RelativePath = [string](Get-NamedMemberValue $node 'RelativePath')
+            Values = @($values)
+        })
+    }
+    $root = @($nodes | Where-Object { -not [string]$_.RelativePath }) | Select-Object -First 1
+    if ($null -eq $root) {
+        $root = [ordered]@{ RelativePath = ''; Values = @() }
+        $nodes.Insert(0, $root)
+    }
+    $rootValues = [Collections.Generic.List[object]]::new()
+    foreach ($value in @($root.Values | Where-Object {
+            $existingName = [string]$_.Name
+            -not @($installerOwnedRootValues | Where-Object { $_ -ieq $existingName }).Count
+        })) {
+        $rootValues.Add($value)
+    }
+    foreach ($name in $installerOwnedRootValues) {
+        $snapshot = Get-NamedMemberValue $FinalInstallerRegistration $name
+        Assert-ExactObjectFields -Value $snapshot -Expected @('Present', 'Name', 'Kind', 'Data') `
+            -Description "Final installer-owned $name snapshot"
+        $presentValue = Get-NamedMemberValue $snapshot 'Present'
+        $nameValue = Get-NamedMemberValue $snapshot 'Name'
+        $kindValue = Get-NamedMemberValue $snapshot 'Kind'
+        $dataValue = Get-NamedMemberValue $snapshot 'Data'
+        if ($presentValue -isnot [bool] -or -not $presentValue -or
+            $nameValue -isnot [string] -or [string]$nameValue -cne $name -or
+            $kindValue -isnot [string] -or [string]$kindValue -cne 'String' -or
+            $dataValue -isnot [string]) {
+            throw "Cannot merge user state without one exact REG_SZ installer-owned $name value."
+        }
+        $rootValues.Add([ordered]@{
+            Name = $name
+            Kind = 'String'
+            Data = [string]$dataValue
+        })
+    }
+    $root.Values = @($rootValues | Sort-Object { [string]$_.Name })
+    $target = [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @($nodes) }
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey -Snapshot $target | Out-Null
+    return $target
+}
+
 function Restore-UserStateProjection {
     param(
         [Parameter(Mandatory)] $OriginalProjection,
         [Parameter(Mandatory)] $FinalInstallerRegistration
     )
 
-    foreach ($name in $installerOwnedRootValues) {
-        $snapshot = $FinalInstallerRegistration[$name]
-        if ($null -eq $snapshot -or -not $snapshot.Present) {
-            throw "Cannot merge user state without the final installer-owned $name value."
-        }
-    }
-
-    # Rebuild only the product state key. The final installer-owned root values
-    # are captured first and then merged with the exact original user projection;
-    # Run and uninstall registration are deliberately left untouched.
-    [Microsoft.Win32.Registry]::CurrentUser.DeleteSubKeyTree($stateSubKey, $false)
-    if ($OriginalProjection.Exists) {
-        Restore-RegistryTreeSnapshot -ExpectedSubKey $stateSubKey -Snapshot $OriginalProjection
-    }
-    foreach ($name in $installerOwnedRootValues) {
-        Restore-RegistryValueSnapshot -SubKey $stateSubKey -Snapshot $FinalInstallerRegistration[$name]
-    }
+    # Merge into one fully validated target, then transact the whole product
+    # state tree. Run and uninstall registration are deliberately untouched.
+    $mergedTarget = New-MergedInstalledStateSnapshot -OriginalProjection $OriginalProjection `
+        -FinalInstallerRegistration $FinalInstallerRegistration
+    $transaction = Restore-RegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $mergedTarget
 
     $actualProjection = Get-UserStateProjection
     $expectedFingerprint = Get-ObjectFingerprint $OriginalProjection
@@ -629,13 +886,15 @@ function Restore-UserStateProjection {
         ExpectedSha256 = $expectedFingerprint
         ActualSha256 = $actualFingerprint
         InstallerRegistrationSha256 = $actualInstallerFingerprint
+        Transaction = $transaction
         Projection = $actualProjection
     }
 }
 
 function Restore-CleanUserStateProjection {
     param([Parameter(Mandatory)] $OriginalProjection)
-    Restore-RegistryTreeSnapshot -ExpectedSubKey $stateSubKey -Snapshot $OriginalProjection
+    $transaction = Restore-RegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $OriginalProjection
     $actual = Get-UserStateProjection
     $expectedFingerprint = Get-ObjectFingerprint $OriginalProjection
     $actualFingerprint = Get-ObjectFingerprint $actual
@@ -645,6 +904,7 @@ function Restore-CleanUserStateProjection {
     return [ordered]@{
         ExpectedSha256 = $expectedFingerprint
         ActualSha256 = $actualFingerprint
+        Transaction = $transaction
         Projection = $actual
     }
 }
@@ -893,6 +1153,9 @@ function Get-PhysicalPathRecord {
         $parent = [IO.Directory]::GetParent($cursor)
         if ($null -eq $parent) { throw "Could not resolve a nearest existing ancestor for $full." }
         $cursor = $parent.FullName
+    }
+    if ($tail.Count -ne 0 -and -not (Test-Path -LiteralPath $cursor -PathType Container)) {
+        throw "The nearest existing ancestor for $full is not a directory: $cursor"
     }
     $resolved = [A4SInstallerLifecycleNative]::ResolveExistingPath($cursor)
     $canonical = [string]$resolved.FinalPath
@@ -1282,6 +1545,7 @@ function Assert-LastOwnedAggregateImmediatelyBeforeSetup {
     if ($null -eq $script:lastOwnedAggregate) {
         throw "$Label has no previously validated harness-owned state."
     }
+    $setupCoordination = Assert-ProductSetupCoordinationAvailable
     $actual = Assert-AggregateFingerprintImmediatelyBeforeMutation `
         -ExpectedFingerprint $script:lastOwnedAggregate.Fingerprint -Label $Label
     return [ordered]@{
@@ -1290,6 +1554,7 @@ function Assert-LastOwnedAggregateImmediatelyBeforeSetup {
         ExpectedFingerprint = $script:lastOwnedAggregate.Fingerprint
         ActualFingerprint = $actual.Fingerprint
         Aggregate = $actual
+        ProductSetupCoordination = $setupCoordination
     }
 }
 
@@ -1626,6 +1891,66 @@ function Get-HostProcessRecords {
     }
     if ($records.Count -gt 1) { throw 'More than one resident A4SMenuHost process is active.' }
     return @($records)
+}
+
+function Test-ExactInstalledProcessSet {
+    param(
+        [Parameter(Mandatory)] $AggregateProcesses,
+        [Parameter(Mandatory)] $HostProcesses,
+        [Parameter(Mandatory)] $ActiveHost,
+        [Parameter(Mandatory)][int] $ExpectedSessionId
+    )
+
+    $aggregate = @($AggregateProcesses)
+    $hosts = @($HostProcesses)
+    if ($aggregate.Count -ne $hosts.Count) { return $false }
+    $seen = [Collections.Generic.HashSet[int]]::new()
+    foreach ($process in $aggregate) {
+        if ([string](Get-NamedMemberValue $process 'Name') -cne 'A4SMenuHost' -or
+            (Get-NamedMemberValue $process 'PathError') -or
+            [int](Get-NamedMemberValue $process 'SessionId') -ne $ExpectedSessionId) {
+            return $false
+        }
+        $id = [int](Get-NamedMemberValue $process 'Id')
+        if (-not $seen.Add($id)) { return $false }
+        try {
+            $path = [IO.Path]::GetFullPath([string](Get-NamedMemberValue $process 'Path'))
+            $expectedPath = [IO.Path]::GetFullPath(
+                [string](Get-NamedMemberValue $ActiveHost 'Path'))
+        }
+        catch { return $false }
+        if (-not $path.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+            [string](Get-NamedMemberValue $process 'Sha256') -cne
+                [string](Get-NamedMemberValue $ActiveHost 'Sha256')) {
+            return $false
+        }
+        $matchingHosts = @($hosts | Where-Object {
+            [int](Get-NamedMemberValue $_ 'Id') -eq $id
+        })
+        if ($matchingHosts.Count -ne 1) { return $false }
+        $hostRecord = $matchingHosts[0]
+        try { $hostPath = [IO.Path]::GetFullPath([string](Get-NamedMemberValue $hostRecord 'Path')) }
+        catch { return $false }
+        if ([int](Get-NamedMemberValue $hostRecord 'SessionId') -ne $ExpectedSessionId -or
+            -not $hostPath.Equals($expectedPath, [StringComparison]::OrdinalIgnoreCase) -or
+            [string](Get-NamedMemberValue $hostRecord 'Sha256') -cne
+                [string](Get-NamedMemberValue $ActiveHost 'Sha256')) {
+            return $false
+        }
+    }
+    return $true
+}
+
+function Assert-ExactInstalledProcessSet {
+    param([Parameter(Mandatory)] $Checkpoint)
+
+    if (-not (Test-ExactInstalledProcessSet `
+            -AggregateProcesses $Checkpoint.Aggregate.Snapshot.A4SProcesses `
+            -HostProcesses $Checkpoint.HostProcesses `
+            -ActiveHost $Checkpoint.ActiveSlot.Files.Host `
+            -ExpectedSessionId ([Diagnostics.Process]::GetCurrentProcess().SessionId))) {
+        throw "$($Checkpoint.Label) process inventory is not the exact active-host-only set; an unexpected setup, cleanup, duplicate, wrong-session, path, or hash record is present."
+    }
 }
 
 function Get-HostStatusRecord {
@@ -1993,6 +2318,7 @@ function Assert-InstalledCheckpoint {
     $expectedSlots = @($ExpectedActiveSlot)
     if ($ExpectedPreviousSlot) { $expectedSlots += $ExpectedPreviousSlot }
     Assert-ExactVersionsInventory -Checkpoint $Checkpoint -ExpectedSlotPaths $expectedSlots
+    Assert-ExactInstalledProcessSet -Checkpoint $Checkpoint
     Assert-NoTransientServicingState -Checkpoint $Checkpoint
 }
 
@@ -2304,6 +2630,8 @@ try {
     # This independent current-user lock is held continuously through preflight,
     # all process launches, evidence writes, and any recovery decision.
     $lifecycleMutexName = Acquire-LifecycleMutex
+    $script:productSetupMutexName = (Get-LifecycleMutexNames).ProductSetup
+    $productSetupPreflight = Assert-ProductSetupCoordinationAvailable
 
     $reviewedV1Hash = Normalize-Sha256 $ExpectedV1SetupSha256
     $reviewedV2Hash = Normalize-Sha256 $ExpectedV2SetupSha256
@@ -2378,6 +2706,8 @@ try {
         SessionId = $sessionId
         CurrentSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
         LifecycleMutexName = $lifecycleMutexName
+        ProductSetupMutexName = $script:productSetupMutexName
+        ProductSetupPreflight = $productSetupPreflight
         PhysicalPaths = [ordered]@{
             InstallRoot = $installPhysical
             V1Fixture = $v1Physical
@@ -2407,6 +2737,7 @@ try {
         LastUpdatedUtc = [DateTime]::UtcNow.ToString('o')
         SessionId = $sessionId
         LifecycleMutexName = $lifecycleMutexName
+        ProductSetupMutexName = $script:productSetupMutexName
         EvidencePath = $script:evidencePath
         ImmutableManifest = $manifestRecord
         Warning = 'LIVE HKCU install mutation; no --restart-explorer command is permitted.'
@@ -2584,6 +2915,12 @@ try {
         -ExpectedPayload $v2Payload -ExpectedActiveSlot $v2Slot `
         -ExpectedPreviousSlot $finalPreviousSlot -ExpectedPreviousPayload $finalPreviousPayload
     Assert-ExpectedHostState -Checkpoint $finalInstallCheckpoint -KnownMenuSha256 $knownMenuHashes -AllowDeferredStopped
+    # Prove the final install itself preserved the immediately preceding
+    # Config/Menu/Legacy/DataCache state. This check intentionally runs before
+    # restoration so the later recovery step cannot mask installer damage.
+    Assert-UserStateAndCacheInvariant -Checkpoint $finalInstallCheckpoint `
+        -OriginalPartitions $uninstallCheckpoint.UserStatePartitions `
+        -OriginalDataCache $uninstallCheckpoint.DataCache
     Register-OwnedAggregate -Aggregate $finalInstallCheckpoint.Aggregate -Kind FinalInstalled `
         -Label 'final-v2-before-restoration' -Validation $finalInstallCheckpoint | Out-Null
     Write-Evidence

@@ -693,7 +693,11 @@ namespace
         return buffer;
     }
 
-    bool RemoveKnownSlot(const std::wstring &slot)
+    // The checked wrapper is implemented after Explorer-module inspection.
+    // No caller may bypass that inspection before removing a slot.
+    bool RemoveKnownSlot(const std::wstring &slot);
+
+    bool RemoveKnownSlotFilesUnchecked(const std::wstring &slot)
     {
         RejectReparsePoint(slot, true);
         bool complete = true;
@@ -1435,43 +1439,115 @@ namespace
         return processId;
     }
 
-    struct ExplorerModuleObservation
+    struct ExplorerModuleInspection
     {
-        bool mapped = false;
-        std::wstring validatedSlot;
+        bool complete = false;
+        bool unknownA4SModule = false;
+        std::vector<std::wstring> modulePaths;
+        std::vector<std::wstring> validatedSlots;
+
+        bool RequiresRestartBoundary() const
+        {
+            return !complete || unknownA4SModule || !modulePaths.empty();
+        }
+
+        bool ProtectsSlot(const std::wstring &slot) const
+        {
+            return std::any_of(validatedSlots.begin(), validatedSlots.end(),
+                [&](const std::wstring &candidate) {
+                    return _wcsicmp(candidate.c_str(), slot.c_str()) == 0;
+                });
+        }
     };
 
-    ExplorerModuleObservation InspectExplorerA4SModule(DWORD processId)
+    constexpr bool CanPruneKnownSlot(bool enumerationComplete,
+        bool unknownA4SModule, bool slotMapped)
     {
+        return enumerationComplete && !unknownA4SModule && !slotMapped;
+    }
+
+    static_assert(CanPruneKnownSlot(true, false, false));
+    static_assert(!CanPruneKnownSlot(false, false, false));
+    static_assert(!CanPruneKnownSlot(true, true, false));
+    static_assert(!CanPruneKnownSlot(true, false, true));
+
+    void AddUniquePath(std::vector<std::wstring> &paths, const std::wstring &path)
+    {
+        if (std::none_of(paths.begin(), paths.end(), [&](const std::wstring &candidate) {
+                return _wcsicmp(candidate.c_str(), path.c_str()) == 0;
+            }))
+            paths.push_back(path);
+    }
+
+    ExplorerModuleInspection InspectExplorerA4SModules(DWORD processId)
+    {
+        ExplorerModuleInspection result;
         if (!processId)
-            return {};
+            return result;
         UniqueHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, processId));
         if (!snapshot)
-            return { true, L"" }; // Fail closed: an unknown live mapping requires a restart boundary.
+            return result;
         MODULEENTRY32W entry = {};
         entry.dwSize = sizeof(entry);
         if (!Module32FirstW(snapshot.get(), &entry))
-            return { true, L"" };
+        {
+            result.complete = GetLastError() == ERROR_NO_MORE_FILES;
+            return result;
+        }
         do
         {
             const wchar_t *filename = wcsrchr(entry.szExePath, L'\\');
             filename = filename ? filename + 1 : entry.szExePath;
-            if (_wcsicmp(filename, A4S_PRODUCT_DLL_FILENAME_W) == 0)
+            if (_wcsicmp(filename, A4S_PRODUCT_DLL_FILENAME_W) == 0 ||
+                _wcsicmp(entry.szModule, A4S_PRODUCT_DLL_FILENAME_W) == 0)
             {
-                const std::wstring modulePath = FullPath(entry.szExePath);
-                const size_t slash = modulePath.find_last_of(L"\\/");
-                const std::wstring slot = slash == std::wstring::npos ? L"" :
-                    modulePath.substr(0, slash);
-                return { true, ValidateSlotBasic(slot) ? slot : L"" };
+                // Preserve every matching observation. A path that cannot be
+                // canonicalized or tied to a validated immutable slot is an
+                // explicit unknown mapping and protects every slot from
+                // pruning rather than being mistaken for "not mapped".
+                if (!entry.szExePath[0])
+                {
+                    result.unknownA4SModule = true;
+                    continue;
+                }
+                AddUniquePath(result.modulePaths, entry.szExePath);
+                try
+                {
+                    const std::wstring modulePath = FullPath(entry.szExePath);
+                    AddUniquePath(result.modulePaths, modulePath);
+                    const size_t slash = modulePath.find_last_of(L"\\/");
+                    const std::wstring slot = slash == std::wstring::npos ? L"" :
+                        modulePath.substr(0, slash);
+                    if (!slot.empty() && ValidateSlotBasic(slot))
+                        AddUniquePath(result.validatedSlots, slot);
+                    else
+                        result.unknownA4SModule = true;
+                }
+                catch (const InstallerFailure &)
+                {
+                    result.unknownA4SModule = true;
+                }
             }
         }
         while (Module32NextW(snapshot.get(), &entry));
-        return {};
+        result.complete = GetLastError() == ERROR_NO_MORE_FILES;
+        return result;
     }
 
     bool ExplorerHasA4SModule(DWORD processId)
     {
-        return InspectExplorerA4SModule(processId).mapped;
+        return InspectExplorerA4SModules(processId).RequiresRestartBoundary();
+    }
+
+    bool RemoveKnownSlot(const std::wstring &slot)
+    {
+        const std::wstring canonicalSlot = FullPath(slot);
+        const ExplorerModuleInspection inspection =
+            InspectExplorerA4SModules(ExplorerProcessId());
+        if (!CanPruneKnownSlot(inspection.complete,
+                inspection.unknownA4SModule, inspection.ProtectsSlot(canonicalSlot)))
+            return false;
+        return RemoveKnownSlotFilesUnchecked(canonicalSlot);
     }
 
     bool StartHost(const std::wstring &slot)
@@ -1588,13 +1664,54 @@ namespace
         for (const auto &spec : kRegistrationValues)
         {
             if (_wcsicmp(spec.keyPath, kRunOnceKey) == 0 &&
-                (_wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0 ||
-                    _wcsicmp(spec.valueName, kRecoveryRunOnceValue) == 0))
+                _wcsicmp(spec.valueName, kCleanupRunOnceValue) == 0)
                 continue;
             if (ReadRawValue(spec).present)
                 return true;
         }
         return false;
+    }
+
+    constexpr bool CleanupMayReconcile(bool recoveryPresent,
+        bool exactValidRecoveryState)
+    {
+        return !recoveryPresent || exactValidRecoveryState;
+    }
+
+    static_assert(CleanupMayReconcile(false, false));
+    static_assert(CleanupMayReconcile(false, true));
+    static_assert(!CleanupMayReconcile(true, false));
+    static_assert(CleanupMayReconcile(true, true));
+
+    bool ServicingRecoveryStateAllowsReconcile()
+    {
+        const RegistryValueSpec recovery = { kRunOnceKey, kRecoveryRunOnceValue };
+        const RegistryValueSnapshot rawRecovery = ReadRawValue(recovery);
+        if (!rawRecovery.present)
+            return CleanupMayReconcile(false, false);
+        bool exact = false;
+        try
+        {
+            DWORD snapshotComplete = 0;
+            if (JournalExists() &&
+                ReadJournalDword(L"SnapshotComplete", snapshotComplete) &&
+                snapshotComplete == 1U)
+            {
+                const ServicingJournal journal = LoadJournal();
+                exact = journal.target == JournalTarget::Installed &&
+                    !journal.targetRecoveryCommand.empty() &&
+                    ValidateSlotBasic(journal.targetActive) &&
+                    (journal.targetPrevious.empty() ||
+                        ValidateSlotBasic(journal.targetPrevious)) &&
+                    StringValueEquals(kRunOnceKey, kRecoveryRunOnceValue,
+                        journal.targetRecoveryCommand);
+            }
+        }
+        catch (const InstallerFailure &)
+        {
+            exact = false;
+        }
+        return CleanupMayReconcile(true, exact);
     }
 
     enum class CleanupWaitResult
@@ -1646,6 +1763,11 @@ namespace
     {
         const std::wstring root = InstallRoot();
         const std::wstring versions = Join(root, kVersionsDirectory);
+        const ExplorerModuleInspection inspection =
+            InspectExplorerA4SModules(ExplorerProcessId());
+        if (!CanPruneKnownSlot(inspection.complete,
+                inspection.unknownA4SModule, !inspection.modulePaths.empty()))
+            return false;
         try
         {
             RejectReparsePoint(root, true);
@@ -1675,7 +1797,8 @@ namespace
                     (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                     continue;
                 const std::wstring slot = Join(versions, data.cFileName);
-                RemoveKnownSlot(slot);
+                if (!RemoveKnownSlot(slot))
+                    return false;
                 for (const wchar_t *name :
                     { A4S_PRODUCT_HOST_FILENAME_W, A4S_PRODUCT_DLL_FILENAME_W, kSetupFilename })
                 {
@@ -1724,6 +1847,13 @@ namespace
     {
         try
         {
+            const ExplorerModuleInspection inspection =
+                InspectExplorerA4SModules(ExplorerProcessId());
+            if (!inspection.complete || inspection.unknownA4SModule)
+                return;
+            std::vector<std::wstring> protectedSlots = retained;
+            for (const std::wstring &mappedSlot : inspection.validatedSlots)
+                AddUniquePath(protectedSlots, mappedSlot);
             const std::wstring versions = Join(InstallRoot(), kVersionsDirectory);
             RejectReparsePoint(versions, true);
             WIN32_FIND_DATAW data = {};
@@ -1737,12 +1867,12 @@ namespace
                     (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                     continue;
                 const std::wstring slot = FullPath(Join(versions, data.cFileName));
-                const bool keep = std::any_of(retained.begin(), retained.end(),
+                const bool keep = std::any_of(protectedSlots.begin(), protectedSlots.end(),
                     [&](const std::wstring &candidate) {
                         return !candidate.empty() && _wcsicmp(slot.c_str(), FullPath(candidate).c_str()) == 0;
                     });
-                if (!keep)
-                    RemoveKnownSlot(slot);
+                if (!keep && !RemoveKnownSlot(slot))
+                    return;
             }
             while (FindNextFileW(find.get(), &data));
         }
@@ -1893,11 +2023,12 @@ namespace
             // still maps the old DLL. The helper must cancel promptly, so keep
             // that exact validated slot as the registered rollback slot rather
             // than pruning it into an unregistered, partially locked orphan.
-            const ExplorerModuleObservation mapped =
-                InspectExplorerA4SModule(ExplorerProcessId());
-            if (!mapped.validatedSlot.empty() &&
-                _wcsicmp(mapped.validatedSlot.c_str(), newSlot.c_str()) != 0)
-                previous = mapped.validatedSlot;
+            const ExplorerModuleInspection mapped =
+                InspectExplorerA4SModules(ExplorerProcessId());
+            if (mapped.complete && !mapped.unknownA4SModule &&
+                mapped.validatedSlots.size() == 1U &&
+                _wcsicmp(mapped.validatedSlots.front().c_str(), newSlot.c_str()) != 0)
+                previous = mapped.validatedSlots.front();
         }
         const bool resetSafety = options.resetSafety;
         const std::wstring recoveryCommand = RecoveryCommand(Join(newSlot, kSetupFilename));
@@ -2046,7 +2177,16 @@ namespace
         // The wake-up registration may have been only a partially committed
         // transaction when the setup process crashed. Reconcile it under the
         // same servicing mutex before deciding whether reinstall really won.
+        // A recovery RunOnce entry is authoritative servicing state: it must
+        // either be absent or exactly match one complete installed-target
+        // journal. Stale/malformed recovery state blocks reconciliation and all
+        // deletion rather than being silently ignored by the cleanup helper.
+        if (!ServicingRecoveryStateAllowsReconcile())
+            return ERROR_INVALID_STATE;
         ReconcilePendingJournal();
+        const RegistryValueSpec recovery = { kRunOnceKey, kRecoveryRunOnceValue };
+        if (ReadRawValue(recovery).present)
+            return ERROR_INVALID_STATE;
         if (blocker == CleanupWaitResult::InstalledStateObserved || InstalledRegistrationPresent())
         {
             const InstalledState installed = ReadInstalledState();

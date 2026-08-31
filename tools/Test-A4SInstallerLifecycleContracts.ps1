@@ -3,10 +3,10 @@
 Validates the destructive lifecycle harness contract without executing it.
 
 .DESCRIPTION
-This gate parses Test-A4SInstallerLifecycle.ps1 as data, executes only two
-side-effect-free functions extracted from its AST, and inspects setup source.
-It never dot-sources the harness, launches a binary, writes product state, or
-touches the staged/live A4S product.
+This gate parses Test-A4SInstallerLifecycle.ps1 as data, executes selected
+read-only/pure functions extracted from its AST, and inspects setup source. It
+never dot-sources the harness, launches a binary, writes registry/product state,
+or touches the staged/live A4S product.
 #>
 [CmdletBinding()]
 param()
@@ -29,6 +29,17 @@ function Assert-ContainsOrdinal {
         [Parameter(Mandatory)][string] $Message
     )
     Assert-Contract ($Text.IndexOf($Marker, [StringComparison]::Ordinal) -ge 0) $Message
+}
+
+function Assert-ThrowsContract {
+    param(
+        [Parameter(Mandatory)][scriptblock] $Action,
+        [Parameter(Mandatory)][string] $Message
+    )
+    $threw = $false
+    try { & $Action }
+    catch { $threw = $true }
+    Assert-Contract $threw $Message
 }
 
 function Assert-OrderedMarkers {
@@ -123,6 +134,33 @@ foreach ($marker in @(
 Assert-Contract ($source.IndexOf('function Test-PathWithin',
         [StringComparison]::Ordinal) -lt 0) 'retired lexical-only overlap logic remains'
 
+# Compile the harness's actual native handle resolver and execute its real path
+# chain, including the nearest-existing-file rejection. This is intentionally
+# read-only and catches StrictMode defects (such as undefined local variables)
+# that source-string checks cannot detect.
+$typeDefinition = [regex]::Match($source,
+    "Add-Type -TypeDefinition @'\r?\n(?<code>[\s\S]*?)\r?\n'@")
+Assert-Contract $typeDefinition.Success 'embedded physical-path helper type is missing'
+if (-not ('A4SInstallerLifecycleNative' -as [type])) {
+    Add-Type -TypeDefinition $typeDefinition.Groups['code'].Value
+}
+foreach ($functionName in @('Assert-LocalAbsolutePath',
+        'Assert-NoReparsePointInExistingChain', 'Get-PhysicalPathRecord')) {
+    . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
+}
+Assert-NoReparsePointInExistingChain $repoRoot
+$nonexistentLeaf = '.a4s-offline-path-contract-' + [Guid]::NewGuid().ToString('N')
+$nonexistentProbe = Join-Path $repoRoot $nonexistentLeaf
+Assert-Contract (-not (Test-Path -LiteralPath $nonexistentProbe)) `
+    'read-only path probe unexpectedly exists'
+$realPathRecord = Get-PhysicalPathRecord $nonexistentProbe
+Assert-Contract (@($realPathRecord.NonExistingTail).Count -eq 1 -and
+    [string]$realPathRecord.NonExistingTail[0] -ceq $nonexistentLeaf) `
+    'real nearest-existing-ancestor path resolution returned the wrong tail'
+$fileAsAncestorProbe = $harnessPath + '\child-that-must-not-exist'
+Assert-ThrowsContract { Get-PhysicalPathRecord $fileAsAncestorProbe | Out-Null } `
+    'real path-chain helper accepted a non-directory nearest existing ancestor'
+
 $physicalFunction = Get-FunctionAst -Ast $ast -Name 'Test-CanonicalPhysicalOverlap'
 $physicalCommands = @($physicalFunction.FindAll({
     param($node) $node -is [Management.Automation.Language.CommandAst]
@@ -184,6 +222,44 @@ Assert-Contract ((Invoke-RecoveryModel $false $false $false $true $false) -ceq
 Assert-Contract ((Invoke-RecoveryModel $false $false $false $false $false) -ceq
     'RetainUnknownNoMutation') 'unknown state is not retained without mutation'
 
+# Execute the real SID naming seam and require both harness and product leases
+# to be Global/current-user scoped. The contract does not acquire either mutex.
+foreach ($functionName in @('Get-CurrentUserSidHashSuffix', 'Get-LifecycleMutexNames')) {
+    . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
+}
+$sidHashSource = (Get-FunctionAst -Ast $ast -Name 'Get-CurrentUserSidHashSuffix').Extent.Text
+foreach ($marker in @('.GetBinaryForm($bytes, 0)',
+        '[Security.Cryptography.SHA256]::Create()', '.Substring(0, 32)')) {
+    Assert-ContainsOrdinal $sidHashSource $marker `
+        "harness SID hash is incompatible with native setup: missing '$marker'"
+}
+foreach ($marker in @('GetLengthSid(tokenUser->User.Sid)',
+        'static_cast<const std::uint8_t *>(tokenUser->User.Sid), sidBytes',
+        'Hex(identity).substr(0, 32)')) {
+    Assert-ContainsOrdinal $setupSource $marker `
+        "native setup SID hash is incompatible with harness coordination: missing '$marker'"
+}
+$mutexNames = Get-LifecycleMutexNames
+Assert-Contract ([string]$mutexNames.Lifecycle -cmatch
+    '^Global\\A4SMenu\.LifecycleQualification\.v1\.[0-9A-F]{32}$') `
+    'lifecycle lease is not Global and SID scoped'
+Assert-Contract ([string]$mutexNames.ProductSetup -cmatch
+    '^Global\\A4SMenu\.Setup\.v1\.[0-9A-F]{32}$') `
+    'product setup coordination name is not the exact Global SID scope'
+Assert-ContainsOrdinal $setupSource 'kSetupMutexPrefix[] = L"Global\\A4SMenu.Setup.v1."' `
+    'native setup mutex prefix does not match the harness product-coordination name'
+$acquireSource = (Get-FunctionAst -Ast $ast -Name 'Acquire-LifecycleMutex').Extent.Text
+$productProbeSource = (Get-FunctionAst -Ast $ast `
+    -Name 'Assert-ProductSetupCoordinationAvailable').Extent.Text
+foreach ($leaseSource in @($acquireSource, $productProbeSource)) {
+    Assert-ContainsOrdinal $leaseSource '[Threading.Mutex]::new($false' `
+        'coordination lease does not open/create the named mutex explicitly'
+    Assert-ContainsOrdinal $leaseSource '.WaitOne(0)' `
+        'coordination lease can block instead of failing closed'
+    Assert-ContainsOrdinal $leaseSource 'catch' `
+        'coordination lease does not fail closed on ACL/access errors'
+}
+
 # One mutex spans clean preflight, every launch/evidence write, classification,
 # recovery, and final evidence. Release occurs only in the outermost finally.
 $mainOffset = $source.IndexOf('$failure = $null', [StringComparison]::Ordinal)
@@ -209,6 +285,11 @@ $releaseCalls = @($ast.FindAll({
 }, $true))
 Assert-Contract ($acquireCalls.Count -eq 1 -and $releaseCalls.Count -eq 1) `
     'lifecycle mutex must have one acquire and one release call site'
+$lastOwnedSource = (Get-FunctionAst -Ast $ast `
+    -Name 'Assert-LastOwnedAggregateImmediatelyBeforeSetup').Extent.Text
+Assert-OrderedMarkers $lastOwnedSource @('Assert-ProductSetupCoordinationAvailable',
+    'Assert-AggregateFingerprintImmediatelyBeforeMutation') `
+    'native product mutex preflight must precede the final stable ownership aggregate'
 
 # External process creation is centralized. For setup paths, the immediately
 # preceding command is the last-owned aggregate check.
@@ -286,7 +367,7 @@ Assert-Contract ([regex]::Matches($checkpointSource,
     'product checkpoint must bracket host-status observation with stable aggregates'
 $installedSource = (Get-FunctionAst -Ast $ast -Name 'Assert-InstalledCheckpoint').Extent.Text
 foreach ($marker in @('Assert-ExactUninstallMetadata', 'Assert-ExactVersionsInventory',
-        'Assert-NoTransientServicingState')) {
+        'Assert-ExactInstalledProcessSet', 'Assert-NoTransientServicingState')) {
     Assert-ContainsOrdinal $installedSource $marker "installed checkpoint omits '$marker'"
 }
 $uninstalledSource = (Get-FunctionAst -Ast $ast -Name 'Assert-UninstalledCheckpoint').Extent.Text
@@ -301,6 +382,134 @@ foreach ($marker in @("@('Config', 'Menu', 'Legacy')", 'HostSafety',
     Assert-ContainsOrdinal $invariantSource $marker "user/cache invariant omits '$marker'"
 }
 
+# Execute the real registry snapshot schema/merge/equality seams with valid and
+# adversarial in-memory states. No registry restore function is invoked.
+foreach ($functionName in @('Get-NamedMemberValue', 'Get-ObjectFingerprint',
+        'ConvertFrom-EncodedRegistryData', 'Get-ObjectFieldNames',
+        'Assert-ExactObjectFields', 'Assert-ValidRegistryTreeSnapshot',
+        'Test-RegistryTreeSnapshotsEqual', 'New-MergedInstalledStateSnapshot')) {
+    . ([scriptblock]::Create((Get-FunctionAst -Ast $ast -Name $functionName).Extent.Text))
+}
+$stateSubKey = 'Software\A4SContractOfflineOnly'
+$installerOwnedRootValues = @('ActiveSlot', 'PreviousSlot', 'InstallVersion')
+$validTree = [ordered]@{
+    SubKey = $stateSubKey
+    Exists = $true
+    Nodes = @(
+        [ordered]@{ RelativePath = ''; Values = @(
+            [ordered]@{ Name = 'UserValue'; Kind = 'DWord'; Data = '7' }
+        ) },
+        [ordered]@{ RelativePath = 'Config'; Values = @(
+            [ordered]@{ Name = 'Bytes'; Kind = 'Binary'; Data = 'AQID' },
+            [ordered]@{ Name = 'Names'; Kind = 'MultiString'; Data = @('one', 'two') }
+        ) }
+    )
+}
+Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey -Snapshot $validTree | Out-Null
+$validAbsentTree = [ordered]@{ SubKey = $stateSubKey; Exists = $false; Nodes = @() }
+Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+    -Snapshot $validAbsentTree | Out-Null
+$roundTrippedTree = $validTree | ConvertTo-Json -Depth 10 | ConvertFrom-Json
+Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+    -Snapshot $roundTrippedTree | Out-Null
+Assert-Contract (Test-RegistryTreeSnapshotsEqual $validTree $validTree) `
+    'real registry equality seam rejected identical snapshots'
+$finalRegistration = [ordered]@{
+    ActiveSlot = [ordered]@{ Present = $true; Name = 'ActiveSlot'; Kind = 'String'; Data = 'C:\A4S\v2' }
+    PreviousSlot = [ordered]@{ Present = $true; Name = 'PreviousSlot'; Kind = 'String'; Data = 'C:\A4S\v1' }
+    InstallVersion = [ordered]@{ Present = $true; Name = 'InstallVersion'; Kind = 'String'; Data = '1.1.0.0' }
+}
+$mergedTree = New-MergedInstalledStateSnapshot -OriginalProjection $validTree `
+    -FinalInstallerRegistration $finalRegistration
+Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey -Snapshot $mergedTree | Out-Null
+$mergedRootNames = @($mergedTree.Nodes[0].Values | ForEach-Object { [string]$_.Name })
+foreach ($requiredName in @('UserValue', 'ActiveSlot', 'PreviousSlot', 'InstallVersion')) {
+    Assert-Contract ($mergedRootNames -ccontains $requiredName) `
+        "real registry merge omitted $requiredName"
+}
+$badFinalRegistration = [ordered]@{
+    ActiveSlot = [ordered]@{ Present = $true; Name = 42; Kind = 'String'; Data = 'C:\A4S\v2' }
+    PreviousSlot = $finalRegistration.PreviousSlot
+    InstallVersion = $finalRegistration.InstallVersion
+}
+Assert-ThrowsContract {
+    New-MergedInstalledStateSnapshot -OriginalProjection $validTree `
+        -FinalInstallerRegistration $badFinalRegistration | Out-Null
+} 'registry merge accepted a non-string installer-owned value name'
+$duplicateNodeTree = [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @(
+    [ordered]@{ RelativePath = ''; Values = @() },
+    [ordered]@{ RelativePath = ''; Values = @() }) }
+Assert-ThrowsContract {
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $duplicateNodeTree | Out-Null
+} 'registry validator accepted duplicate nodes'
+$missingParentTree = [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @(
+    [ordered]@{ RelativePath = ''; Values = @() },
+    [ordered]@{ RelativePath = 'Missing\Child'; Values = @() }) }
+Assert-ThrowsContract {
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $missingParentTree | Out-Null
+} 'registry validator accepted a node without its parent'
+$badEncodedTree = [ordered]@{ SubKey = $stateSubKey; Exists = $true; Nodes = @(
+    [ordered]@{ RelativePath = ''; Values = @(
+        [ordered]@{ Name = 'Bad'; Kind = 'Binary'; Data = 'not-base64!' }) }) }
+Assert-ThrowsContract {
+    Assert-ValidRegistryTreeSnapshot -ExpectedSubKey $stateSubKey `
+        -Snapshot $badEncodedTree | Out-Null
+} 'registry validator accepted invalid encoded value data'
+
+$restoreTreeSource = (Get-FunctionAst -Ast $ast -Name 'Restore-RegistryTreeSnapshot').Extent.Text
+Assert-OrderedMarkers $restoreTreeSource @(
+    'Assert-ValidRegistryTreeSnapshot',
+    '$immediatePreState = Get-RegistryTreeSnapshot',
+    'if (Test-RegistryTreeSnapshotsEqual $immediatePreState $Snapshot)',
+    'Apply-ValidatedRegistryTreeSnapshot -ExpectedSubKey $ExpectedSubKey -Snapshot $Snapshot',
+    'catch',
+    '-Snapshot $immediatePreState') 'transactional registry validate/no-op/apply/rollback order'
+Assert-Contract ([regex]::Matches($source, 'DeleteSubKeyTree\(').Count -eq 1) `
+    'registry deletion escaped the sole validated apply primitive'
+Assert-Contract ([regex]::Matches($source,
+    'Apply-ValidatedRegistryTreeSnapshot').Count -eq 3) `
+    'validated registry apply primitive has a caller outside target apply/rollback'
+$applyTreeSource = (Get-FunctionAst -Ast $ast `
+    -Name 'Apply-ValidatedRegistryTreeSnapshot').Extent.Text
+Assert-ContainsOrdinal $applyTreeSource 'DeleteSubKeyTree($ExpectedSubKey, $false)' `
+    'validated registry apply primitive does not own the sole tree deletion'
+Assert-Contract ($source.IndexOf('function Restore-RegistryValueSnapshot',
+        [StringComparison]::Ordinal) -lt 0) `
+    'legacy per-value destructive restoration remains'
+
+# Execute the installed-process ownership model. Exact active-host records may
+# be empty or one matching process; Setup/Cleanup/duplicates/wrong sessions fail.
+$processFunction = Get-FunctionAst -Ast $ast -Name 'Test-ExactInstalledProcessSet'
+. ([scriptblock]::Create($processFunction.Extent.Text))
+$session = 17
+$hostIdentity = [ordered]@{ Path = 'C:\A4S\versions\v2\A4SMenuHost.exe'; Sha256 = ('A' * 64) }
+$hostProcess = [ordered]@{ Id = 101; SessionId = $session; Path = $hostIdentity.Path; Sha256 = $hostIdentity.Sha256 }
+$aggregateHost = [ordered]@{
+    Name = 'A4SMenuHost'; Id = 101; SessionId = $session; Path = $hostIdentity.Path
+    Sha256 = $hostIdentity.Sha256; StartTimeUtc = $null; PathError = $null
+}
+Assert-Contract (Test-ExactInstalledProcessSet @($aggregateHost) @($hostProcess) `
+    $hostIdentity $session) 'exact active-host process set was rejected'
+Assert-Contract (Test-ExactInstalledProcessSet @() @() $hostIdentity $session) `
+    'valid quiescent installed process set was rejected'
+foreach ($unexpectedName in @('A4SMenuSetup', 'A4SMenuCleanup')) {
+    $unexpected = [ordered]@{
+        Name = $unexpectedName; Id = 102; SessionId = $session; Path = 'C:\unknown.exe'
+        Sha256 = ('B' * 64); StartTimeUtc = $null; PathError = $null
+    }
+    Assert-Contract (-not (Test-ExactInstalledProcessSet @($aggregateHost, $unexpected) `
+        @($hostProcess) $hostIdentity $session)) `
+        "installed process model accepted $unexpectedName"
+}
+$wrongSession = [ordered]@{
+    Name = 'A4SMenuHost'; Id = 101; SessionId = $session + 1; Path = $hostIdentity.Path
+    Sha256 = $hostIdentity.Sha256; StartTimeUtc = $null; PathError = $null
+}
+Assert-Contract (-not (Test-ExactInstalledProcessSet @($wrongSession) @($hostProcess) `
+    $hostIdentity $session)) 'installed process model accepted a wrong-session host'
+
 Assert-OrderedMarkers $mainSource @(
     "-Label 'install-v1-silent'", "-Label 'upgrade-v1-to-v2-silent'",
     "-Label 'rollback-v2-to-v1-silent'", "-Label 'upgrade-v1-to-v2-again-silent'",
@@ -309,6 +518,18 @@ Assert-OrderedMarkers $mainSource @(
     'Stop-FinalHostQuiescent', 'Restore-UserStateProjection',
     'Start-Sleep -Milliseconds $finalQuiescenceVerificationMilliseconds') `
     'installer lifecycle sequence'
+$finalInstallSection = Get-SourceSection -Text $mainSource `
+    -StartMarker '$finalInstall = Invoke-RecordedSetupStep' `
+    -EndMarker '$script:evidence.FinalHostQuiescence'
+Assert-OrderedMarkers $finalInstallSection @(
+    '$finalInstallCheckpoint = Add-CheckpointToStep',
+    'Assert-InstalledCheckpoint',
+    'Assert-ExpectedHostState',
+    'Assert-UserStateAndCacheInvariant',
+    '-OriginalPartitions $uninstallCheckpoint.UserStatePartitions',
+    '-OriginalDataCache $uninstallCheckpoint.DataCache',
+    'Register-OwnedAggregate') `
+    'pre-restoration final-install user/cache validation'
 Assert-Contract ([regex]::Matches($mainSource,
     'Register-OwnedAggregate[\s\S]{0,240}?Write-Evidence').Count -ge 10) `
     'validated states are not registered before fallible evidence writes'
@@ -317,12 +538,30 @@ Assert-Contract ([regex]::Matches($mainSource,
 # and must retain an exact Explorer-mapped old slot as a coherent rollback slot.
 $installedRegistrationSource = Get-SourceSection -Text $setupSource `
     -StartMarker 'bool InstalledRegistrationPresent()' `
-    -EndMarker 'enum class CleanupWaitResult'
+    -EndMarker 'constexpr bool CleanupMayReconcile'
 Assert-ContainsOrdinal $installedRegistrationSource 'ReadRawValue(spec).present' `
     'cleanup does not fail closed on raw installer registration values'
 Assert-Contract ($installedRegistrationSource.IndexOf('ReadString(',
         [StringComparison]::Ordinal) -lt 0) `
     'cleanup mistakes malformed/empty installer registration for absence'
+Assert-Contract ($installedRegistrationSource.IndexOf('kRecoveryRunOnceValue',
+        [StringComparison]::Ordinal) -lt 0) `
+    'cleanup still excludes servicing recovery RunOnce from installed-state detection'
+$recoveryGateSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'constexpr bool CleanupMayReconcile' `
+    -EndMarker 'enum class CleanupWaitResult'
+foreach ($marker in @(
+        'static_assert(CleanupMayReconcile(false, false))',
+        'static_assert(!CleanupMayReconcile(true, false))',
+        'static_assert(CleanupMayReconcile(true, true))',
+        'bool ServicingRecoveryStateAllowsReconcile()',
+        'snapshotComplete == 1U',
+        'journal.target == JournalTarget::Installed',
+        'journal.targetRecoveryCommand',
+        'StringValueEquals(kRunOnceKey, kRecoveryRunOnceValue')) {
+    Assert-ContainsOrdinal $recoveryGateSource $marker `
+        "servicing recovery fail-closed model omits '$marker'"
+}
 $cleanupSource = Get-SourceSection -Text $setupSource -StartMarker 'int Cleanup(' `
     -EndMarker 'bool IsSwitch('
 Assert-OrderedMarkers $cleanupSource @(
@@ -330,7 +569,9 @@ Assert-OrderedMarkers $cleanupSource @(
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
     'AcquireSetupMutex()',
+    'ServicingRecoveryStateAllowsReconcile()',
     'ReconcilePendingJournal()',
+    'ReadRawValue(recovery).present',
     'InstalledRegistrationPresent()',
     'RegistrationMatchesCommittedSlot(',
     'RemoveCanonicalCleanupStateForHelper()',
@@ -345,12 +586,54 @@ $installSource = Get-SourceSection -Text $setupSource -StartMarker 'int InstallO
     -EndMarker 'int Rollback('
 Assert-OrderedMarkers $installSource @(
     'DeploySlot(payloads, oldState.activeSlot)',
-    'InspectExplorerA4SModule(ExplorerProcessId())',
-    'previous = mapped.validatedSlot',
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'mapped.complete && !mapped.unknownA4SModule',
+    'mapped.validatedSlots.size() == 1U',
+    'previous = mapped.validatedSlots.front()',
     'BeginJournal(',
     'PrepareSlotRegistration(newSlot, previous)',
     'CompleteJournal(journal)',
     'PruneObsoleteSlotsBestEffort') 'mapped rollback-slot retention'
+$moduleInspectionSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'struct ExplorerModuleInspection' `
+    -EndMarker 'bool StartHost('
+foreach ($marker in @(
+        'bool complete = false', 'bool unknownA4SModule = false',
+        'std::vector<std::wstring> modulePaths',
+        'std::vector<std::wstring> validatedSlots',
+        'static_assert(CanPruneKnownSlot(true, false, false))',
+        'static_assert(!CanPruneKnownSlot(false, false, false))',
+        'static_assert(!CanPruneKnownSlot(true, true, false))',
+        'static_assert(!CanPruneKnownSlot(true, false, true))',
+        'result.complete = GetLastError() == ERROR_NO_MORE_FILES',
+        'AddUniquePath(result.modulePaths',
+        'AddUniquePath(result.validatedSlots',
+        'result.unknownA4SModule = true',
+        'InspectExplorerA4SModules(ExplorerProcessId())',
+        'RemoveKnownSlotFilesUnchecked(canonicalSlot)')) {
+    Assert-ContainsOrdinal $moduleInspectionSource $marker `
+        "Explorer module fail-closed model omits '$marker'"
+}
+Assert-Contract ([regex]::Matches($setupSource,
+    'RemoveKnownSlotFilesUnchecked\(').Count -eq 2) `
+    'unchecked slot removal has a caller outside its checked wrapper'
+$cleanupTreeSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'bool CleanupKnownInstallTree()' `
+    -EndMarker 'void PruneObsoleteSlotsBestEffort('
+Assert-OrderedMarkers $cleanupTreeSource @(
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'CanPruneKnownSlot(inspection.complete',
+    '!inspection.modulePaths.empty()',
+    'RemoveKnownSlot(slot)') 'uninstall mapped/unknown module deletion guard'
+$pruneSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void PruneObsoleteSlotsBestEffort(' `
+    -EndMarker 'std::wstring CleanupHelperPath()'
+Assert-OrderedMarkers $pruneSource @(
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'if (!inspection.complete || inspection.unknownA4SModule)',
+    'for (const std::wstring &mappedSlot : inspection.validatedSlots)',
+    'AddUniquePath(protectedSlots, mappedSlot)',
+    'RemoveKnownSlot(slot)') 'pruning retains every validated mapped slot'
 $parseSource = Get-SourceSection -Text $setupSource -StartMarker 'Options ParseOptions(' `
     -EndMarker 'bool Confirm('
 Assert-OrderedMarkers $parseSource @('IsSwitch(argument, L"--repair")',
@@ -374,7 +657,7 @@ foreach ($forbiddenText in @('taskkill', 'TerminateProcess(', 'baseline-uninstal
 
 $preloadSource = [IO.File]::ReadAllText($itemManagerPath)
 $preloadMatch = [regex]::Match($preloadSource,
-    'WaitForSingleObject\(m_ExitEvent,(?<delay>[0-9]+)\)==WAIT_OBJECT_0')
+    'WaitForSingleObject\(m_ExitEvent,(?<delay>[0-9]+)\)')
 $harnessDebounce = [regex]::Match($source,
     '\$preloadDebounceMilliseconds\s*=\s*(?<delay>[0-9]+)')
 $harnessVerification = [regex]::Match($source,

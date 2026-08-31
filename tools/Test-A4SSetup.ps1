@@ -249,8 +249,10 @@ if ($setupSource.IndexOf('RestoreRegistrationBestEffort', [StringComparison]::Or
 $installSource = Get-SourceSection -Source $setupSource -StartMarker 'int InstallOrRepair(' -EndMarker 'int Rollback('
 Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSource -Markers @(
     'DeploySlot(payloads, oldState.activeSlot)',
-    'InspectExplorerA4SModule(ExplorerProcessId())',
-    'previous = mapped.validatedSlot',
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'mapped.complete && !mapped.unknownA4SModule',
+    'mapped.validatedSlots.size() == 1U',
+    'previous = mapped.validatedSlots.front()',
     'BeginJournal(',
     'QueueJournalRecovery(recoveryCommand)',
     'StopHost()',
@@ -280,7 +282,9 @@ Assert-SourceOrder -Description 'Deferred cleanup cancellation' -Source $cleanup
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
     'AcquireSetupMutex()',
+    'ServicingRecoveryStateAllowsReconcile()',
     'ReconcilePendingJournal()',
+    'ReadRawValue(recovery).present',
     'InstalledRegistrationPresent()',
     'RegistrationMatchesCommittedSlot(',
     'RemoveCanonicalCleanupStateForHelper()',
@@ -293,12 +297,47 @@ if ($cleanupSource.IndexOf('WaitForProcessId(options.waitExplorerId)',
 }
 
 $installedRegistrationSource = Get-SourceSection -Source $setupSource `
-    -StartMarker 'bool InstalledRegistrationPresent()' -EndMarker 'enum class CleanupWaitResult'
+    -StartMarker 'bool InstalledRegistrationPresent()' -EndMarker 'constexpr bool CleanupMayReconcile'
 if ($installedRegistrationSource.IndexOf('ReadRawValue(spec).present',
         [StringComparison]::Ordinal) -lt 0 -or
-    $installedRegistrationSource.IndexOf('ReadString(', [StringComparison]::Ordinal) -ge 0) {
+    $installedRegistrationSource.IndexOf('ReadString(', [StringComparison]::Ordinal) -ge 0 -or
+    $installedRegistrationSource.IndexOf('kRecoveryRunOnceValue', [StringComparison]::Ordinal) -ge 0) {
     throw 'Deferred cleanup no longer treats every raw installer registration type as authoritative.'
 }
+
+$moduleInspectionSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'struct ExplorerModuleInspection' -EndMarker 'bool StartHost('
+foreach ($requiredMarker in @(
+        'bool complete = false', 'bool unknownA4SModule = false',
+        'std::vector<std::wstring> modulePaths',
+        'std::vector<std::wstring> validatedSlots',
+        'static_assert(!CanPruneKnownSlot(false, false, false))',
+        'static_assert(!CanPruneKnownSlot(true, true, false))',
+        'static_assert(!CanPruneKnownSlot(true, false, true))',
+        'result.complete = GetLastError() == ERROR_NO_MORE_FILES',
+        'RemoveKnownSlotFilesUnchecked(canonicalSlot)')) {
+    if ($moduleInspectionSource.IndexOf($requiredMarker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Explorer module/pruning safety model is missing '$requiredMarker'."
+    }
+}
+if ([regex]::Matches($setupSource, 'RemoveKnownSlotFilesUnchecked\(').Count -ne 2) {
+    throw 'Unchecked known-slot deletion escaped its Explorer-inspecting wrapper.'
+}
+$cleanupTreeSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool CleanupKnownInstallTree()' -EndMarker 'void PruneObsoleteSlotsBestEffort('
+Assert-SourceOrder -Description 'Cleanup module protection' -Source $cleanupTreeSource -Markers @(
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'CanPruneKnownSlot(inspection.complete',
+    '!inspection.modulePaths.empty()',
+    'RemoveKnownSlot(slot)')
+$pruneSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void PruneObsoleteSlotsBestEffort(' -EndMarker 'std::wstring CleanupHelperPath()'
+Assert-SourceOrder -Description 'Mapped slot retention' -Source $pruneSource -Markers @(
+    'InspectExplorerA4SModules(ExplorerProcessId())',
+    'if (!inspection.complete || inspection.unknownA4SModule)',
+    'for (const std::wstring &mappedSlot : inspection.validatedSlots)',
+    'AddUniquePath(protectedSlots, mappedSlot)',
+    'RemoveKnownSlot(slot)')
 
 $parseSource = Get-SourceSection -Source $setupSource -StartMarker 'Options ParseOptions(' -EndMarker 'bool Confirm('
 Assert-SourceOrder -Description 'Explicit HostSafety reset parsing' -Source $parseSource -Markers @(
