@@ -1070,11 +1070,19 @@ private:
 	};
 
 	void SetMenuMode( TMenuMode mode, bool bKeyboard=false );
+#ifdef A4S_PRODUCT
+	void CompleteA4SProgramsNavigation( CProgramsTree *pTree );
+#endif
 	void OpenJumpList( int index, bool bKeyboard );
 	void OpenSearchList( void );
 	void AnimateBackground( void );
 
 	CProgramsTree *m_pProgramsTree;
+#ifdef A4S_PRODUCT
+	bool m_bA4SPendingProgramsNavigation;
+	bool m_bA4SPendingProgramsKeyboard;
+	bool m_bA4SProgramsTreeNeedsScrollRestore;
+#endif
 	int m_ProgramButtonIndex;
 	int m_ProgramTreeIndex;
 	int m_SubJumpItem; // the currently expanded embedded jumplist

@@ -1008,6 +1008,11 @@ CMenuContainer::CMenuContainer( CMenuContainer *pParent, int index, int options,
 	m_SearchState=SEARCH_NONE;
 	m_SearchCategoryHash=CSearchManager::CATEGORY_INVALID;
 	m_pProgramsTree=NULL;
+#ifdef A4S_PRODUCT
+	m_bA4SPendingProgramsNavigation=false;
+	m_bA4SPendingProgramsKeyboard=false;
+	m_bA4SProgramsTreeNeedsScrollRestore=false;
+#endif
 	m_ProgramButtonIndex=m_ProgramTreeIndex=-1;
 	m_OriginalCount=0;
 	m_OriginalScrollCount=-1;
@@ -9821,6 +9826,30 @@ bool CMenuContainer::ProcessMouseMessage( HWND hwnd, UINT uMsg, WPARAM wParam, L
 // Win7 stuff
 void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )
 {
+#ifdef A4S_PRODUCT
+	if (mode!=MODE_PROGRAMS)
+		m_bA4SPendingProgramsNavigation=false;
+	else if (mode!=s_MenuMode)
+	{
+		// Never replace the populated normal menu with an empty Programs tree.
+		// Creating the hidden child subscribes to an existing preload without
+		// superseding it; the completion callback retries this transition only
+		// after the complete text-and-icon snapshot has been merged.
+		if (m_bClosing || m_bDestroyed)
+			return;
+		if (!m_pProgramsTree)
+		{
+			m_pProgramsTree=new CProgramsTree();
+			m_pProgramsTree->Create(this);
+			m_bA4SProgramsTreeNeedsScrollRestore=true;
+		}
+		m_bA4SPendingProgramsNavigation=true;
+		m_bA4SPendingProgramsKeyboard=bKeyboard;
+		if (!m_pProgramsTree->CreateItems())
+			return;
+		m_bA4SPendingProgramsNavigation=false;
+	}
+#endif
 	if (mode==s_MenuMode) return;
 	InitializeOldState();
 
@@ -9925,6 +9954,9 @@ void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )
 			m_pProgramsTree->Create(this);
 			m_pProgramsTree->CreateItems();
 		}
+#ifdef A4S_PRODUCT
+		bNewTree=m_bA4SProgramsTreeNeedsScrollRestore;
+#endif
 		SetHotItem(m_ProgramTreeIndex);
 		RECT rc;
 		m_pProgramsTree->GetWindowRect(&rc);
@@ -9942,6 +9974,9 @@ void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )
 			for (int i=0;i<s_ProgramsScrollPos;i++)
 				m_pProgramsTree->SendMessage(WM_VSCROLL,SB_LINEDOWN); // using SetSrollPos doesn't quite work because the contents are not scrolled during WM_PRINT
 		}
+#ifdef A4S_PRODUCT
+		m_bA4SProgramsTreeNeedsScrollRestore=false;
+#endif
 
 		ULONGLONG curTime;
 		GetSystemTimeAsFileTime((FILETIME*)&curTime);
@@ -9999,6 +10034,19 @@ void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )
 		s_UserPicture.SetWindowPos(NULL,0,0,0,0,SWP_NOZORDER|SWP_NOSIZE|SWP_NOMOVE|SWP_SHOWWINDOW|SWP_NOACTIVATE);
 	ClearOldState();
 }
+
+#ifdef A4S_PRODUCT
+void CMenuContainer::CompleteA4SProgramsNavigation( CProgramsTree *pTree )
+{
+	if (pTree!=m_pProgramsTree || !m_bA4SPendingProgramsNavigation ||
+		m_bClosing || m_bDestroyed || !::IsWindow(m_hWnd))
+		return;
+
+	const bool bKeyboard=m_bA4SPendingProgramsKeyboard;
+	m_bA4SPendingProgramsNavigation=false;
+	SetMenuMode(MODE_PROGRAMS,bKeyboard);
+}
+#endif
 
 void CMenuContainer::AnimateBackground( void )
 {

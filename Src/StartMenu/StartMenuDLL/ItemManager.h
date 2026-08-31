@@ -470,11 +470,15 @@ public:
 	CShellItemEnumerator( IShellItem *pFolder );
 	bool IsValid( void ) const;
 	bool GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &childPidl );
+	// S_OK while enumeration is active, S_FALSE after a clean end, otherwise the
+	// constructor/enumeration failure that made GetNext return false.
+	HRESULT GetResult( void ) const { return m_Result; }
 
 private:
 	CComPtr<IEnumIDList> m_pEnumPidls;
 	CComPtr<IEnumShellItems> m_pEnumItems;
 	CAbsolutePidl m_Root;
+	HRESULT m_Result;
 };
 
 struct UserAssistData

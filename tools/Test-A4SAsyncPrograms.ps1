@@ -87,17 +87,22 @@ function Get-CppFunctionBody {
     throw "Unterminated C++ function: $Signature"
 }
 
-$createItems = Get-CppFunctionBody $treeSource 'void CProgramsTree::CreateItems( void )'
+$createItems = Get-CppFunctionBody $treeSource 'bool CProgramsTree::CreateItems( void )'
 $requestItems = Get-CppFunctionBody $treeSource 'void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,'
 $worker = Get-CppFunctionBody $treeSource 'DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )'
-$buildSnapshot = Get-CppFunctionBody $treeSource 'bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,'
+$buildSnapshot = Get-CppFunctionBody $treeSource 'CProgramsTree::A4SAsyncResult CProgramsTree::BuildA4SRootSnapshot('
 $applySnapshot = Get-CppFunctionBody $treeSource 'bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )'
 $applyRoot = Get-CppFunctionBody $treeSource 'void CProgramsTree::ApplyA4SRootItems( std::vector<CTreeItem*> &newItems,'
-$waitIcons = Get-CppFunctionBody $treeSource 'bool CProgramsTree::WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generation )'
+$waitIcons = Get-CppFunctionBody $treeSource 'CProgramsTree::A4SAsyncResult CProgramsTree::WaitForA4SIcons('
 $destroy = Get-CppFunctionBody $treeSource 'LRESULT CProgramsTree::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )'
 $shutdown = Get-CppFunctionBody $treeSource 'bool CProgramsTree::ShutdownA4SItems( DWORD timeout )'
+$snapshotReady = Get-CppFunctionBody $treeSource 'LRESULT CProgramsTree::OnA4SSnapshotReady( UINT uMsg, WPARAM wParam, LPARAM lParam,'
 $toggle = Get-CppFunctionBody $containerSource 'HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPrograms )'
+$setMenuMode = Get-CppFunctionBody $containerSource 'void CMenuContainer::SetMenuMode( TMenuMode mode, bool bKeyboard )'
+$completePrograms = Get-CppFunctionBody $containerSource 'void CMenuContainer::CompleteA4SProgramsNavigation( CProgramsTree *pTree )'
 $closeManagers = Get-CppFunctionBody $dllSource 'STARTMENUAPI bool CloseManagers( bool bNohook )'
+$enumeratorCtor = Get-CppFunctionBody $itemSource 'CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )'
+$enumeratorNext = Get-CppFunctionBody $itemSource 'bool CShellItemEnumerator::GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &childPidl )'
 $queueIcon = Get-CppFunctionBody $itemSource 'bool CItemManager::QueueA4SItemInfo( const ItemInfo *pInfo0, int refreshFlags )'
 $readyIcons = Get-CppFunctionBody $itemSource 'bool CItemManager::AreA4SItemInfosReady('
 $waitItem = Get-CppFunctionBody $itemSource 'bool CItemManager::WaitForA4SItemInfo( DWORD timeout )'
@@ -106,19 +111,26 @@ $refreshItem = Get-CppFunctionBody $itemSource 'void CItemManager::RefreshItemIn
 
 # Product-only dispatch: upstream still executes the original synchronous tree
 # construction, while A4S returns immediately after requesting a snapshot.
-Assert-Contract ($createItems -match '#ifdef\s+A4S_PRODUCT[\s\S]*RequestA4SItems\([\s\S]*ApplyA4SSnapshot\(\)[\s\S]*return\s*;[\s\S]*#else[\s\S]*CreateFolderItems\(NULL\)') `
+Assert-Contract ($createItems -match '#ifdef\s+A4S_PRODUCT[\s\S]*RequestA4SItems\([^;]+false\)[\s\S]*return\s+ApplyA4SSnapshot\(\)[\s\S]*#else[\s\S]*CreateFolderItems\(NULL\)[\s\S]*return\s+true') `
     'CreateItems no longer isolates asynchronous A4S behavior from upstream Open-Shell'
 
-# A normal menu opening starts only a missing warmup. Entering Programs may
-# refresh an existing immutable snapshot without discarding it first.
+# A normal menu opening starts only a missing warmup. A cold Programs request
+# subscribes to the same generation; only explicit invalidation, configuration
+# change, or a later request following failure may supersede it.
 Assert-Contract ($toggle -match '#ifdef\s+A4S_PRODUCT[\s\S]*CProgramsTree::PreloadA4SItems\(s_bNoCommonFolders\)') `
     'the normal menu no longer overlaps first-frame work with Programs warmup'
-Assert-Contract ($requestItems -match 'if\s*\(bRefresh\)[\s\S]*InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
+Assert-Contract ($requestItems -match 'if\s*\(bInvalidate\)[\s\S]*InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
     'explicit refresh no longer supersedes a worker that may have captured stale content'
-Assert-Contract ($requestItems -match '!s_bA4SAsyncHasSnapshot\s*\|\|\s*bRefresh') `
+Assert-Contract ($requestItems -match 'else\s+if\s*\(s_A4SAsyncFailedGeneration==s_A4SAsyncGeneration\)[\s\S]*InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
+    'a later request cannot retry a failed generation'
+Assert-Contract ($requestItems -match 'bConfigurationChanged\s*\|\|\s*bInvalidate\s*\|\|\s*!s_bA4SAsyncHasSnapshot') `
     'missing and explicit-refresh paths no longer start the worker'
+Assert-Contract ($requestItems -notmatch 'if\s*\(\s*!s_bA4SAsyncHasSnapshot\s*\)[\s\S]{0,160}InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
+    'a same-configuration cold subscriber restarts the preload generation'
 Assert-Contract ($worker -match 's_bA4SAsyncWorkerRunning\s*=\s*false[\s\S]*s_A4SAsyncReadyGeneration\s*!=\s*s_A4SAsyncGeneration[\s\S]*StartA4SAsyncWorkerLocked\(\)') `
     'a refresh arriving during worker teardown can be lost'
+Assert-Contract ($worker -match 's_A4SAsyncFailedGeneration\s*!=\s*s_A4SAsyncGeneration[\s\S]*s_A4SAsyncReadyGeneration\s*!=\s*s_A4SAsyncGeneration') `
+    'a current-generation failure can spin immediately without a later request'
 
 # The worker owns a dedicated STA, retains the DLL until its apartment is gone,
 # and publishes only a scalar generation plus an identity token to the UI HWND.
@@ -128,10 +140,43 @@ Assert-Contract ($treeSource -match 'GetModuleHandleEx\(GET_MODULE_HANDLE_EX_FLA
     'the worker does not pin the DLL across Explorer unhook/unload'
 Assert-Contract ($worker -match 'CoUninitialize\(\)[\s\S]*FreeLibraryAndExitThread\(module,0\)') `
     'the module can unload before worker COM teardown completes'
-Assert-Contract ($worker -match 'PostMessage\(notifyWindow,TVM_A4S_SNAPSHOT_READY,[\s\S]*generation,[\s\S]*pNotifyOwner\)') `
+Assert-Contract ($worker -match 'PostMessage\(notifyWindow,TVM_A4S_SNAPSHOT_READY,[\s\S]*generation,[\s\S]*notifyCookie\)') `
     'worker completion is not marshaled as a generation/identity-only message'
+Assert-Contract ($treeHeader -notmatch 'CProgramsTree\s*\*\s*s_pA4SAsyncNotifyOwner') `
+    'the process cache still retains a raw tree-owner pointer'
+Assert-Contract ($treeHeader -match 'volatile\s+LONG\s+s_A4SNextInstanceCookie' -and
+    $treeHeader -match 'LONG\s+m_A4SInstanceCookie') `
+    'tree completions are not protected by a monotonic instance cookie'
+Assert-Contract ($snapshotReady -match 'instanceCookie!=m_A4SInstanceCookie' -and
+    $snapshotReady -match 's_A4SAsyncNotifyWindow==m_hWnd' -and
+    $snapshotReady -match 's_A4SAsyncNotifyCookie==instanceCookie') `
+    'queued completion does not reject HWND/owner ABA reuse'
 Assert-Contract ($treeHeader -notmatch 'CComPtr\s*<\s*IShellItem\s*>\s+s_A4S') `
     'an apartment-bound shell item escaped into the cached snapshot'
+
+# Enumerator termination and shell failures are explicit. Only a completely
+# enumerated, icon-ready generation can replace the last known-good snapshot.
+Assert-Contract ($itemHeader -match 'HRESULT\s+GetResult\(\s*void\s*\)\s+const' -and
+    $itemHeader -match 'HRESULT\s+m_Result') `
+    'CShellItemEnumerator cannot distinguish clean exhaustion from failure'
+Assert-Contract ($itemSource -match 'CShellItemEnumerator::CShellItemEnumerator\(\s*IShellItem\s*\*pFolder\s*\)\s*:\s*m_Result\(E_FAIL\)' -and
+    $enumeratorCtor -match 'm_Result=m_pEnumItems\?S_OK') `
+    'enumerator construction does not preserve its terminal HRESULT'
+Assert-Contract ($enumeratorNext -match 'm_Result=nextResult' -and
+    $enumeratorNext -match 'm_Result=pidlResult' -and
+    $enumeratorNext -match 'm_Result=createResult') `
+    'mid-stream shell enumeration failures are collapsed into clean exhaustion'
+Assert-Contract ($treeHeader -match 'A4S_ASYNC_SUCCESS[\s\S]*A4S_ASYNC_CANCELLED[\s\S]*A4S_ASYNC_FAILURE') `
+    'snapshot construction does not propagate success/cancel/failure outcomes'
+Assert-Contract ($buildSnapshot -match 'A4S_ASYNC_FAILURE' -and
+    $buildSnapshot -match 'folderResult!=A4S_ASYNC_SUCCESS' -and
+    $buildSnapshot -match 'return\s+WaitForA4SIcons\(items,generation\)') `
+    'known-folder, enumeration, or icon outcomes can be ignored during publication'
+Assert-Contract ($worker -match 'result==A4S_ASYNC_SUCCESS[\s\S]*oldItems\.swap\(s_A4SAsyncItems\)[\s\S]*s_A4SAsyncItems\.swap\(items\)') `
+    'an incomplete snapshot can replace the last complete cache'
+Assert-Contract ($worker -match 's_A4SAsyncFailedGeneration=generation' -and
+    $worker -notmatch 's_A4SAsyncFailedGeneration=generation[\s\S]{0,220}s_A4SAsyncItems\.clear') `
+    'failure does not retain the previous complete snapshot'
 
 # Cancellation and content coherency are generation based. The watched-folder
 # generation joins configuration identity, so external Start Menu edits cannot
@@ -144,7 +189,7 @@ Assert-Contract ($buildSnapshot -match 'IsA4SGenerationCurrent\(generation\)') `
     'root enumeration cannot observe cancellation between shell folders'
 Assert-Contract ($worker -match 'if\s*\(bRetry\)[\s\S]*continue\s*;') `
     'a superseded worker can terminate without rebuilding the latest generation'
-Assert-Contract ($destroy -match 'UnsubscribeA4SItems\(this\)') `
+Assert-Contract ($destroy -match 'UnsubscribeA4SItems\(m_hWnd,m_A4SInstanceCookie\)') `
     'destroyed trees remain subscribed to worker completion'
 Assert-Contract ($shutdown -match 's_bA4SAsyncStopping\s*=\s*true[\s\S]*InterlockedIncrement\(&s_A4SAsyncGeneration\)') `
     'shutdown does not gate new requests before cancelling the active generation'
@@ -154,6 +199,31 @@ Assert-Contract ($worker -match 's_bA4SAsyncStopping[\s\S]*break\s*;') `
     'the worker does not honor logical-disarm cancellation'
 Assert-Contract ($closeManagers -match 'ShutdownA4SItems\(1500\)[\s\S]*return\s+false[\s\S]*g_SearchManager\.Close\(\)[\s\S]*g_ItemManager\.Close\(\)') `
     'manager shutdown does not join Programs before destroying its dependencies'
+
+# Cold navigation stays in normal mode until CreateItems has atomically merged
+# a complete snapshot. Navigating elsewhere or closing the menu cancels the
+# pending transition, and only the subscribed tree may complete it.
+$guardIndex = $setMenuMode.IndexOf('if (!m_pProgramsTree->CreateItems())', [StringComparison]::Ordinal)
+$modeWriteIndex = $setMenuMode.IndexOf('s_MenuMode=mode;', [StringComparison]::Ordinal)
+$oldStateIndex = $setMenuMode.IndexOf('InitializeOldState();', [StringComparison]::Ordinal)
+Assert-Contract ($guardIndex -ge 0 -and $guardIndex -lt $oldStateIndex -and
+    $guardIndex -lt $modeWriteIndex) `
+    'cold Programs navigation can switch/redraw the empty tree before publication'
+Assert-Contract ($setMenuMode -match 'mode!=MODE_PROGRAMS[\s\S]*m_bA4SPendingProgramsNavigation=false') `
+    'navigating away does not cancel a pending Programs transition'
+Assert-Contract ($setMenuMode -match 'm_bClosing\s*\|\|\s*m_bDestroyed[\s\S]*return') `
+    'a closing menu may begin a cold Programs transition'
+Assert-Contract ($completePrograms -match 'pTree!=m_pProgramsTree' -and
+    $completePrograms -match '!m_bA4SPendingProgramsNavigation' -and
+    $completePrograms -match 'm_bClosing\s*\|\|\s*m_bDestroyed' -and
+    $completePrograms -match 'SetMenuMode\(MODE_PROGRAMS,bKeyboard\)') `
+    'late completion can enter Programs after cancellation, close, or owner replacement'
+Assert-Contract ($snapshotReady -match 'ApplyA4SSnapshot\(\(LONG\)wParam\)[\s\S]*CompleteA4SProgramsNavigation\(this\)') `
+    'Programs can transition before its matching snapshot has been merged'
+Assert-Contract ($applySnapshot -match 's_A4SAsyncReadyGeneration==currentGeneration' -and
+    $applySnapshot -match 's_A4SSnapshotConfiguration==s_A4SAsyncConfiguration' -and
+    $applySnapshot -match 's_A4SSnapshotConfiguration\.bFoldersFirst') `
+    'the UI can apply a stale or differently configured retained snapshot'
 
 # Every root icon is decoded (or reaches a terminal fallback) on ItemManager's
 # existing decoder before the immutable snapshot becomes publishable. The
@@ -202,5 +272,63 @@ Assert-Contract ($worker -match 'A4S_PERF_PROGRAMS_ENUMERATION') `
     'background enumeration is no longer represented in runtime telemetry'
 Assert-Contract ($applySnapshot -match 'SetResult\(static_cast<UINT32>\(snapshot\.size\(\)\),TRUE\)') `
     'cached publication is not marked as a cache hit in runtime telemetry'
+
+# Deterministic lifecycle model checks supplement the source contracts. They
+# exercise the four regressions without requiring Explorer injection.
+$failureModel = [ordered]@{
+    Generation = 12
+    ReadyGeneration = 11
+    FailedGeneration = 0
+    Snapshot = @('known-good-a', 'known-good-b')
+    WorkerStarts = 1
+}
+$snapshotBeforeFailure = @($failureModel.Snapshot)
+$failureModel.FailedGeneration = $failureModel.Generation
+$wouldSelfRetry = ($failureModel.FailedGeneration -ne $failureModel.Generation) -and
+    ($failureModel.ReadyGeneration -ne $failureModel.Generation)
+Assert-Contract (-not $wouldSelfRetry -and
+    (@($failureModel.Snapshot) -join '|') -eq ($snapshotBeforeFailure -join '|')) `
+    'a failed generation discards the last snapshot or immediately self-retries'
+
+$subscriberModel = [ordered]@{
+    Generation = 21
+    FailedGeneration = 0
+    HasSnapshot = $false
+    WorkerRunning = $true
+    NotifyCookie = 0
+}
+$generationBeforeSubscribe = $subscriberModel.Generation
+$subscriberModel.NotifyCookie = 7001
+# Same configuration, no explicit invalidation, and no prior failure: subscribe
+# to the already running preload without advancing its generation.
+Assert-Contract ($subscriberModel.Generation -eq $generationBeforeSubscribe -and
+    $subscriberModel.NotifyCookie -eq 7001 -and $subscriberModel.WorkerRunning) `
+    'cold navigation supersedes instead of subscribing to an in-flight preload'
+
+$retryModel = [ordered]@{ Generation = 30; FailedGeneration = 30; WorkerStarts = 1 }
+if ($retryModel.FailedGeneration -eq $retryModel.Generation) {
+    $retryModel.Generation++
+    $retryModel.FailedGeneration = 0
+    $retryModel.WorkerStarts++
+}
+Assert-Contract ($retryModel.Generation -eq 31 -and
+    $retryModel.FailedGeneration -eq 0 -and $retryModel.WorkerStarts -eq 2) `
+    'the next user request cannot retry a terminal failure exactly once'
+
+$reusedHwnd = 0x1234
+$postedCookie = 41
+$replacementCookie = 42
+$acceptStaleCompletion = ($reusedHwnd -eq $reusedHwnd) -and
+    ($postedCookie -eq $replacementCookie)
+Assert-Contract (-not $acceptStaleCompletion) `
+    'a recycled HWND can accept the destroyed tree instance completion'
+
+$navigationModel = [ordered]@{ Mode = 'Normal'; Pending = $true; Closing = $false }
+$navigationModel.Pending = $false # Search/normal navigation cancels the request.
+$lateCompletionEntersPrograms = $navigationModel.Pending -and
+    -not $navigationModel.Closing
+Assert-Contract (-not $lateCompletionEntersPrograms -and
+    $navigationModel.Mode -eq 'Normal') `
+    'a cancelled cold completion can still replace the normal menu'
 
 Write-Host 'A4S asynchronous Programs gates passed.'

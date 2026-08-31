@@ -113,7 +113,9 @@ public:
 	static LRESULT CALLBACK CustomWindowProc(HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam);
 
 	void DeleteAllItems( void );
-	void CreateItems( void );
+	// A4S returns false until a complete current-generation root snapshot has
+	// been merged. Upstream construction is synchronous and always returns true.
+	bool CreateItems( void );
 	void SelectItem( int y );
 	void SelectFirst( void );
 	void SelectLast( void );
@@ -199,6 +201,7 @@ private:
 	DWORD m_A4SScrollbarInputCount;
 #ifdef A4S_PRODUCT
 	const CItemManager::ItemInfo *m_pA4SPendingSelectItem;
+	LONG m_A4SInstanceCookie;
 #endif
 	POINT m_LastMousePos;
 	int m_RootX;
@@ -240,6 +243,13 @@ private:
 	void SyncA4SScrollbarProperties( void );
 
 #ifdef A4S_PRODUCT
+	enum A4SAsyncResult
+	{
+		A4S_ASYNC_SUCCESS,
+		A4S_ASYNC_CANCELLED,
+		A4S_ASYNC_FAILURE,
+	};
+
 	struct A4SAsyncConfiguration
 	{
 		int pinnedPrograms;
@@ -264,31 +274,37 @@ private:
 
 	static SRWLOCK s_A4SAsyncLock;
 	static A4SAsyncConfiguration s_A4SAsyncConfiguration;
+	static A4SAsyncConfiguration s_A4SSnapshotConfiguration;
 	static std::vector<CTreeItem> s_A4SAsyncItems;
 	static volatile LONG s_A4SAsyncGeneration;
 	static LONG s_A4SAsyncReadyGeneration;
+	static LONG s_A4SAsyncFailedGeneration;
+	static volatile LONG s_A4SNextInstanceCookie;
 	static bool s_bA4SAsyncHasSnapshot;
 	static bool s_bA4SAsyncAutoSort;
 	static bool s_bA4SAsyncWorkerRunning;
 	static bool s_bA4SAsyncStopping;
 	static HANDLE s_A4SAsyncWorker;
 	static HWND s_A4SAsyncNotifyWindow;
-	static CProgramsTree *s_pA4SAsyncNotifyOwner;
+	static LONG s_A4SAsyncNotifyCookie;
 
 	static A4SAsyncConfiguration CaptureA4SConfiguration( bool bNoCommonFolders );
 	static bool StartA4SAsyncWorkerLocked( void );
 	static DWORD CALLBACK A4SAsyncWorkerProc( void *param );
-	static bool BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
+	static A4SAsyncResult BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
 		LONG generation, std::vector<CTreeItem> &items, bool &bAutoSort );
-	static bool WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generation );
+	static A4SAsyncResult WaitForA4SIcons( std::vector<CTreeItem> &items,
+		LONG generation );
 	static bool IsA4SGenerationCurrent( LONG generation );
-	static void AddA4SFirstFolder( std::vector<CTreeItem> &items, IShellItem *pParent,
+	static A4SAsyncResult AddA4SFirstFolder( std::vector<CTreeItem> &items,
+		IShellItem *pParent,
 		bool bPrograms, bool bHideProgramsMetro, LONG generation );
-	static void AddA4SSecondFolder( std::vector<CTreeItem> &items, IShellItem *pParent,
+	static A4SAsyncResult AddA4SSecondFolder( std::vector<CTreeItem> &items,
+		IShellItem *pParent,
 		bool bPrograms, bool bHideProgramsMetro, LONG generation );
 	static void RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
-		bool bNoCommonFolders, bool bRefresh );
-	static void UnsubscribeA4SItems( CProgramsTree *pOwner );
+		bool bNoCommonFolders, bool bInvalidate );
+	static void UnsubscribeA4SItems( HWND notifyWindow, LONG instanceCookie );
 	bool ApplyA4SSnapshot( LONG expectedGeneration=0 );
 	void ApplyA4SRootItems( std::vector<CTreeItem*> &items,
 		const CItemManager::ItemInfo *pSelectItem );

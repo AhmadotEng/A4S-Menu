@@ -25,16 +25,19 @@ bool CProgramsTree::s_bFoldersFirst;
 #ifdef A4S_PRODUCT
 SRWLOCK CProgramsTree::s_A4SAsyncLock=SRWLOCK_INIT;
 CProgramsTree::A4SAsyncConfiguration CProgramsTree::s_A4SAsyncConfiguration={};
+CProgramsTree::A4SAsyncConfiguration CProgramsTree::s_A4SSnapshotConfiguration={};
 std::vector<CProgramsTree::CTreeItem> CProgramsTree::s_A4SAsyncItems;
 volatile LONG CProgramsTree::s_A4SAsyncGeneration=1;
 LONG CProgramsTree::s_A4SAsyncReadyGeneration=0;
+LONG CProgramsTree::s_A4SAsyncFailedGeneration=0;
+volatile LONG CProgramsTree::s_A4SNextInstanceCookie=0;
 bool CProgramsTree::s_bA4SAsyncHasSnapshot=false;
 bool CProgramsTree::s_bA4SAsyncAutoSort=false;
 bool CProgramsTree::s_bA4SAsyncWorkerRunning=false;
 bool CProgramsTree::s_bA4SAsyncStopping=false;
 HANDLE CProgramsTree::s_A4SAsyncWorker=NULL;
 HWND CProgramsTree::s_A4SAsyncNotifyWindow=NULL;
-CProgramsTree *CProgramsTree::s_pA4SAsyncNotifyOwner=NULL;
+LONG CProgramsTree::s_A4SAsyncNotifyCookie=0;
 #endif
 
 const wchar_t *ORDER_PREFIX=L"#";
@@ -82,6 +85,9 @@ CProgramsTree::CProgramsTree( void )
 	m_A4SScrollbarInputCount=0;
 #ifdef A4S_PRODUCT
 	m_pA4SPendingSelectItem=NULL;
+	m_A4SInstanceCookie=InterlockedIncrement(&s_A4SNextInstanceCookie);
+	if (!m_A4SInstanceCookie)
+		m_A4SInstanceCookie=InterlockedIncrement(&s_A4SNextInstanceCookie);
 #endif
 	m_LastMousePos.x=m_LastMousePos.y=0;
 	m_MinX=m_MaxX=m_RootX=0;
@@ -283,7 +289,7 @@ void CProgramsTree::SyncA4SScrollbarProperties( void )
 LRESULT CProgramsTree::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
 #ifdef A4S_PRODUCT
-	UnsubscribeA4SItems(this);
+	UnsubscribeA4SItems(m_hWnd,m_A4SInstanceCookie);
 	m_pA4SPendingSelectItem=NULL;
 #endif
 	if (A4SMenuProfile::IsEnabled())
@@ -421,7 +427,7 @@ bool CProgramsTree::StartA4SAsyncWorkerLocked( void )
 }
 
 void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
-	bool bNoCommonFolders, bool bRefresh )
+	bool bNoCommonFolders, bool bInvalidate )
 {
 	const A4SAsyncConfiguration configuration=CaptureA4SConfiguration(bNoCommonFolders);
 
@@ -431,27 +437,37 @@ void CProgramsTree::RequestA4SItems( CProgramsTree *pOwner, HWND notifyWindow,
 		ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 		return;
 	}
-	if (!(configuration==s_A4SAsyncConfiguration))
+	const bool bConfigurationChanged=!(configuration==s_A4SAsyncConfiguration);
+	if (bConfigurationChanged)
 	{
 		s_A4SAsyncConfiguration=configuration;
 		InterlockedIncrement(&s_A4SAsyncGeneration);
-		s_A4SAsyncReadyGeneration=0;
-		s_bA4SAsyncHasSnapshot=false;
-		s_A4SAsyncItems.clear();
+		s_A4SAsyncFailedGeneration=0;
 	}
 
 	if (pOwner)
 	{
-		s_pA4SAsyncNotifyOwner=pOwner;
 		s_A4SAsyncNotifyWindow=notifyWindow;
+		s_A4SAsyncNotifyCookie=pOwner->m_A4SInstanceCookie;
 	}
 
-	// Entering Programs presents the last complete snapshot immediately and
-	// refreshes it in the background. Normal menu openings merely warm a missing
-	// snapshot, which keeps repeated warm toggles free of enumeration I/O.
-	if (bRefresh)
+	// Creating the cold Programs tree while the matching preload is running only
+	// subscribes its completion HWND/cookie. Explicit invalidations supersede an
+	// in-flight generation. A current-generation failure retries only when a
+	// later request arrives, never from the worker teardown path itself.
+	if (bInvalidate)
+	{
 		InterlockedIncrement(&s_A4SAsyncGeneration);
-	if (!s_bA4SAsyncHasSnapshot || bRefresh)
+		s_A4SAsyncFailedGeneration=0;
+	}
+	else if (s_A4SAsyncFailedGeneration==s_A4SAsyncGeneration)
+	{
+		InterlockedIncrement(&s_A4SAsyncGeneration);
+		s_A4SAsyncFailedGeneration=0;
+	}
+
+	if (bConfigurationChanged || bInvalidate || !s_bA4SAsyncHasSnapshot ||
+		s_A4SAsyncReadyGeneration!=s_A4SAsyncGeneration)
 		StartA4SAsyncWorkerLocked();
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 }
@@ -467,8 +483,8 @@ bool CProgramsTree::ShutdownA4SItems( DWORD timeout )
 	AcquireSRWLockExclusive(&s_A4SAsyncLock);
 	s_bA4SAsyncStopping=true;
 	InterlockedIncrement(&s_A4SAsyncGeneration);
-	s_pA4SAsyncNotifyOwner=NULL;
 	s_A4SAsyncNotifyWindow=NULL;
+	s_A4SAsyncNotifyCookie=0;
 	worker=s_A4SAsyncWorker;
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 
@@ -484,38 +500,44 @@ bool CProgramsTree::ShutdownA4SItems( DWORD timeout )
 	s_bA4SAsyncWorkerRunning=false;
 	s_bA4SAsyncHasSnapshot=false;
 	s_A4SAsyncReadyGeneration=0;
+	s_A4SAsyncFailedGeneration=0;
 	s_A4SAsyncItems.clear();
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 	return true;
 }
 
-void CProgramsTree::UnsubscribeA4SItems( CProgramsTree *pOwner )
+void CProgramsTree::UnsubscribeA4SItems( HWND notifyWindow, LONG instanceCookie )
 {
 	AcquireSRWLockExclusive(&s_A4SAsyncLock);
-	if (s_pA4SAsyncNotifyOwner==pOwner)
+	if (s_A4SAsyncNotifyWindow==notifyWindow &&
+		s_A4SAsyncNotifyCookie==instanceCookie)
 	{
-		s_pA4SAsyncNotifyOwner=NULL;
 		s_A4SAsyncNotifyWindow=NULL;
+		s_A4SAsyncNotifyCookie=0;
 	}
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
 }
 
-void CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
+CProgramsTree::A4SAsyncResult CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
 	IShellItem *pParent, bool bPrograms, bool bHideProgramsMetro, LONG generation )
 {
 	const unsigned int hash0Prog=CalcFNVHash(L"\\",FNV_HASH0);
 	const unsigned int hash0=FNV_HASH0;
 	CShellItemEnumerator enumerator(pParent);
 	if (!enumerator.IsValid())
-		return;
+		return enumerator.GetResult()==S_FALSE?A4S_ASYNC_SUCCESS:A4S_ASYNC_FAILURE;
 
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
-	while (IsA4SGenerationCurrent(generation) && enumerator.GetNext(pChild,childPidl))
+	while (IsA4SGenerationCurrent(generation))
 	{
+		if (!enumerator.GetNext(pChild,childPidl))
+			return enumerator.GetResult()==S_FALSE?
+				A4S_ASYNC_SUCCESS:A4S_ASYNC_FAILURE;
 		SFGAOF itemFlags=0;
-		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)) ||
-			(itemFlags&SFGAO_HIDDEN))
+		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)))
+			return A4S_ASYNC_FAILURE;
+		if (itemFlags&SFGAO_HIDDEN)
 			continue;
 
 		CTreeItem item;
@@ -523,7 +545,7 @@ void CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
 		item.pItemInfo1=g_ItemManager.GetItemInfo(pChild,childPidl,
 			CItemManager::INFO_LINK|CItemManager::INFO_METRO);
 		if (!item.pItemInfo1)
-			continue;
+			return A4S_ASYNC_FAILURE;
 
 		{
 			CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
@@ -544,21 +566,14 @@ void CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
 		{
 			CComString pName;
 			if (FAILED(pChild->GetDisplayName(SIGDN_NORMALDISPLAY,&pName)))
-				continue;
+				return A4S_ASYNC_FAILURE;
 			item.SetName(pName,false);
 			CComString pName2;
-			if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
-			{
-				pName2.MakeUpper();
-				item.nameHash=CalcFNVHash(pName2,hash0);
-				item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
-			}
-			else
-			{
-				pName.MakeUpper();
-				item.nameHash=CalcFNVHash(pName,hash0);
-				item.nameHashProg=CalcFNVHash(pName,hash0Prog);
-			}
+			if (FAILED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
+				return A4S_ASYNC_FAILURE;
+			pName2.MakeUpper();
+			item.nameHash=CalcFNVHash(pName2,hash0);
+			item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
 		}
 
 		if (bPrograms && IsA4SHiddenProgramsRootItem(item.name))
@@ -570,24 +585,29 @@ void CProgramsTree::AddA4SFirstFolder( std::vector<CTreeItem> &items,
 		item.bNew=false; // IsNewProgram is intentionally evaluated on the UI thread.
 		items.push_back(item);
 	}
+	return A4S_ASYNC_CANCELLED;
 }
 
-void CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
+CProgramsTree::A4SAsyncResult CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
 	IShellItem *pParent, bool bPrograms, bool bHideProgramsMetro, LONG generation )
 {
 	const unsigned int hash0Prog=CalcFNVHash(L"\\",FNV_HASH0);
 	const unsigned int hash0=FNV_HASH0;
 	CShellItemEnumerator enumerator(pParent);
 	if (!enumerator.IsValid())
-		return;
+		return enumerator.GetResult()==S_FALSE?A4S_ASYNC_SUCCESS:A4S_ASYNC_FAILURE;
 
 	CComPtr<IShellItem> pChild;
 	CAbsolutePidl childPidl;
-	while (IsA4SGenerationCurrent(generation) && enumerator.GetNext(pChild,childPidl))
+	while (IsA4SGenerationCurrent(generation))
 	{
+		if (!enumerator.GetNext(pChild,childPidl))
+			return enumerator.GetResult()==S_FALSE?
+				A4S_ASYNC_SUCCESS:A4S_ASYNC_FAILURE;
 		SFGAOF itemFlags=0;
-		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)) ||
-			(itemFlags&SFGAO_HIDDEN))
+		if (FAILED(pChild->GetAttributes(SFGAO_FOLDER|SFGAO_HIDDEN,&itemFlags)))
+			return A4S_ASYNC_FAILURE;
+		if (itemFlags&SFGAO_HIDDEN)
 			continue;
 
 		CTreeItem item;
@@ -595,7 +615,7 @@ void CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
 		item.pItemInfo1=g_ItemManager.GetItemInfo(pChild,childPidl,
 			CItemManager::INFO_LINK|CItemManager::INFO_METRO);
 		if (!item.pItemInfo1)
-			continue;
+			return A4S_ASYNC_FAILURE;
 
 		{
 			CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
@@ -616,21 +636,14 @@ void CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
 		{
 			CComString pName;
 			if (FAILED(pChild->GetDisplayName(SIGDN_NORMALDISPLAY,&pName)))
-				continue;
+				return A4S_ASYNC_FAILURE;
 			item.SetName(pName,false);
 			CComString pName2;
-			if (SUCCEEDED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
-			{
-				pName2.MakeUpper();
-				item.nameHash=CalcFNVHash(pName2,hash0);
-				item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
-			}
-			else
-			{
-				pName.MakeUpper();
-				item.nameHash=CalcFNVHash(pName,hash0);
-				item.nameHashProg=CalcFNVHash(pName,hash0Prog);
-			}
+			if (FAILED(pChild->GetDisplayName(SIGDN_PARENTRELATIVEPARSING,&pName2)))
+				return A4S_ASYNC_FAILURE;
+			pName2.MakeUpper();
+			item.nameHash=CalcFNVHash(pName2,hash0);
+			item.nameHashProg=CalcFNVHash(pName2,hash0Prog);
 		}
 
 		if (bPrograms && IsA4SHiddenProgramsRootItem(item.name))
@@ -655,39 +668,58 @@ void CProgramsTree::AddA4SSecondFolder( std::vector<CTreeItem> &items,
 		if (!bMerged)
 			items.push_back(item);
 	}
+	return A4S_ASYNC_CANCELLED;
 }
 
-bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configuration,
+CProgramsTree::A4SAsyncResult CProgramsTree::BuildA4SRootSnapshot(
+	const A4SAsyncConfiguration &configuration,
 	LONG generation, std::vector<CTreeItem> &items, bool &bAutoSort )
 {
 	CComPtr<IShellItem> pRoot;
 	CAbsolutePidl pidl;
 	if (configuration.pinnedPrograms==PINNED_PROGRAMS_PINNED)
 	{
-		if (SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_StartMenu,&pidl)) &&
-			SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
-		{
-			AddA4SFirstFolder(items,pRoot,false,configuration.bHideProgramsMetro,generation);
-			pRoot=NULL;
-		}
+		if (!IsA4SGenerationCurrent(generation))
+			return A4S_ASYNC_CANCELLED;
+		if (FAILED(ShGetKnownFolderIDList(FOLDERID_StartMenu,&pidl)) || !pidl)
+			return A4S_ASYNC_FAILURE;
+		if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) || !pRoot)
+			return A4S_ASYNC_FAILURE;
+		A4SAsyncResult folderResult=AddA4SFirstFolder(items,pRoot,false,
+			configuration.bHideProgramsMetro,generation);
+		if (folderResult!=A4S_ASYNC_SUCCESS)
+			return folderResult;
+		pRoot=NULL;
 		pidl.Clear();
-		if (!configuration.bNoCommonFolders && IsA4SGenerationCurrent(generation) &&
-			SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_CommonStartMenu,&pidl)) &&
-			SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+		if (!configuration.bNoCommonFolders)
 		{
-			AddA4SSecondFolder(items,pRoot,false,configuration.bHideProgramsMetro,generation);
+			if (!IsA4SGenerationCurrent(generation))
+				return A4S_ASYNC_CANCELLED;
+			if (FAILED(ShGetKnownFolderIDList(FOLDERID_CommonStartMenu,&pidl)) || !pidl)
+				return A4S_ASYNC_FAILURE;
+			if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) || !pRoot)
+				return A4S_ASYNC_FAILURE;
+			folderResult=AddA4SSecondFolder(items,pRoot,false,
+				configuration.bHideProgramsMetro,generation);
+			if (folderResult!=A4S_ASYNC_SUCCESS)
+				return folderResult;
 			pRoot=NULL;
+			pidl.Clear();
 		}
-		pidl.Clear();
 	}
 
 	if (!IsA4SGenerationCurrent(generation))
-		return false;
-	if (SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_Programs,&pidl)) &&
-		SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+		return A4S_ASYNC_CANCELLED;
+	if (FAILED(ShGetKnownFolderIDList(FOLDERID_Programs,&pidl)) || !pidl)
+		return A4S_ASYNC_FAILURE;
+	if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) || !pRoot)
+		return A4S_ASYNC_FAILURE;
+	A4SAsyncResult folderResult=AddA4SFirstFolder(items,pRoot,true,
+		configuration.bHideProgramsMetro,generation);
+	if (folderResult!=A4S_ASYNC_SUCCESS)
+		return folderResult;
+	pRoot=NULL;
 	{
-		AddA4SFirstFolder(items,pRoot,true,configuration.bHideProgramsMetro,generation);
-		pRoot=NULL;
 		CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
 		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
 		{
@@ -700,26 +732,35 @@ bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configura
 	}
 	pidl.Clear();
 
-	if (!configuration.bNoCommonFolders && IsA4SGenerationCurrent(generation) &&
-		SUCCEEDED(ShGetKnownFolderIDList(FOLDERID_CommonPrograms,&pidl)) &&
-		SUCCEEDED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) && pRoot)
+	if (!configuration.bNoCommonFolders)
 	{
-		AddA4SSecondFolder(items,pRoot,true,configuration.bHideProgramsMetro,generation);
+		if (!IsA4SGenerationCurrent(generation))
+			return A4S_ASYNC_CANCELLED;
+		if (FAILED(ShGetKnownFolderIDList(FOLDERID_CommonPrograms,&pidl)) || !pidl)
+			return A4S_ASYNC_FAILURE;
+		if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pRoot)) || !pRoot)
+			return A4S_ASYNC_FAILURE;
+		folderResult=AddA4SSecondFolder(items,pRoot,true,
+			configuration.bHideProgramsMetro,generation);
+		if (folderResult!=A4S_ASYNC_SUCCESS)
+			return folderResult;
 		pRoot=NULL;
-		CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
-		for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
 		{
-			if (it->pItemInfo1 && ILIsEqual(it->pItemInfo1->GetPidl(),pidl))
+			CItemManager::RWLock lock(&g_ItemManager,false,CItemManager::RWLOCK_ITEMS);
+			for (std::vector<CTreeItem>::iterator it=items.begin();it!=items.end();++it)
 			{
-				items.erase(it);
-				break;
+				if (it->pItemInfo1 && ILIsEqual(it->pItemInfo1->GetPidl(),pidl))
+				{
+					items.erase(it);
+					break;
+				}
 			}
 		}
+		pidl.Clear();
 	}
-	pidl.Clear();
 
 	if (!IsA4SGenerationCurrent(generation))
-		return false;
+		return A4S_ASYNC_CANCELLED;
 	if (configuration.bAllProgramsMetro)
 	{
 		CTreeItem item;
@@ -728,6 +769,8 @@ bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configura
 		item.SetName(configuration.appsName,false);
 		item.pItemInfo1=g_ItemManager.GetA4SCustomIcon(L",2",
 			CItemManager::ICON_SIZE_TYPE_SMALL);
+		if (!item.pItemInfo1)
+			return A4S_ASYNC_FAILURE;
 		item.folderHash=CalcFNVHash(L"?Apps",CalcFNVHash(ORDER_PREFIX));
 		item.order=-1;
 		items.push_back(item);
@@ -775,7 +818,8 @@ bool CProgramsTree::BuildA4SRootSnapshot( const A4SAsyncConfiguration &configura
 	return WaitForA4SIcons(items,generation);
 }
 
-bool CProgramsTree::WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generation )
+CProgramsTree::A4SAsyncResult CProgramsTree::WaitForA4SIcons(
+	std::vector<CTreeItem> &items, LONG generation )
 {
 	std::vector<const CItemManager::ItemInfo*> itemInfos;
 	itemInfos.reserve(items.size()*2);
@@ -788,7 +832,8 @@ bool CProgramsTree::WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generat
 				continue;
 			itemInfos.push_back(infos[i]);
 			if (!g_ItemManager.QueueA4SItemInfo(infos[i],CItemManager::INFO_SMALL_ICON))
-				return false;
+				return IsA4SGenerationCurrent(generation)?
+					A4S_ASYNC_FAILURE:A4S_ASYNC_CANCELLED;
 		}
 	}
 
@@ -796,13 +841,14 @@ bool CProgramsTree::WaitForA4SIcons( std::vector<CTreeItem> &items, LONG generat
 	{
 		if (g_ItemManager.AreA4SItemInfosReady(itemInfos,
 			CItemManager::INFO_SMALL_ICON))
-			return true;
+			return A4S_ASYNC_SUCCESS;
 		// The completion event is only a wake-up hint. Recheck the complete set
 		// after every item or timeout so coalesced signals cannot publish early.
 		if (!g_ItemManager.WaitForA4SItemInfo(100))
-			return false;
+			return IsA4SGenerationCurrent(generation)?
+				A4S_ASYNC_FAILURE:A4S_ASYNC_CANCELLED;
 	}
-	return false;
+	return A4S_ASYNC_CANCELLED;
 }
 
 DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
@@ -827,13 +873,14 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		std::vector<CTreeItem> items;
 		bool bAutoSort=false;
 		A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
-		const bool bBuilt=BuildA4SRootSnapshot(configuration,generation,items,bAutoSort);
+		const A4SAsyncResult result=BuildA4SRootSnapshot(configuration,generation,
+			items,bAutoSort);
 		programsScope.SetResult(static_cast<UINT32>(items.size()),FALSE);
-		if (!bBuilt && !IsA4SGenerationCurrent(generation))
+		if (result==A4S_ASYNC_CANCELLED && !IsA4SGenerationCurrent(generation))
 			continue;
 
 		HWND notifyWindow=NULL;
-		CProgramsTree *pNotifyOwner=NULL;
+		LONG notifyCookie=0;
 		std::vector<CTreeItem> oldItems;
 		bool bRetry=false;
 		AcquireSRWLockExclusive(&s_A4SAsyncLock);
@@ -841,16 +888,26 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		{
 			// Cancellation is complete once this iteration drops its local snapshot.
 		}
-		else if (bBuilt && generation==s_A4SAsyncGeneration &&
+		else if (result==A4S_ASYNC_SUCCESS && generation==s_A4SAsyncGeneration &&
 			configuration==s_A4SAsyncConfiguration)
 		{
 			oldItems.swap(s_A4SAsyncItems);
 			s_A4SAsyncItems.swap(items);
+			s_A4SSnapshotConfiguration=configuration;
 			s_A4SAsyncReadyGeneration=generation;
+			s_A4SAsyncFailedGeneration=0;
 			s_bA4SAsyncHasSnapshot=true;
 			s_bA4SAsyncAutoSort=bAutoSort;
 			notifyWindow=s_A4SAsyncNotifyWindow;
-			pNotifyOwner=s_pA4SAsyncNotifyOwner;
+			notifyCookie=s_A4SAsyncNotifyCookie;
+		}
+		else if (generation==s_A4SAsyncGeneration &&
+			configuration==s_A4SAsyncConfiguration)
+		{
+			// A failed or unexpectedly cancelled current generation retains the
+			// previous complete cache. The worker exits and only a later request
+			// advances the generation/retries.
+			s_A4SAsyncFailedGeneration=generation;
 		}
 		else if (!s_bA4SAsyncStopping && (generation!=s_A4SAsyncGeneration ||
 			!(configuration==s_A4SAsyncConfiguration)))
@@ -859,9 +916,9 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		if (bRetry)
 			continue;
 
-		if (bBuilt && notifyWindow && pNotifyOwner)
+		if (result==A4S_ASYNC_SUCCESS && notifyWindow && notifyCookie)
 			::PostMessage(notifyWindow,TVM_A4S_SNAPSHOT_READY,
-				(WPARAM)generation,(LPARAM)pNotifyOwner);
+				(WPARAM)generation,(LPARAM)notifyCookie);
 		break;
 	}
 
@@ -869,11 +926,14 @@ DWORD CALLBACK CProgramsTree::A4SAsyncWorkerProc( void *param )
 		CoUninitialize();
 	AcquireSRWLockExclusive(&s_A4SAsyncLock);
 	s_bA4SAsyncWorkerRunning=false;
+	if (!bComInitialized && !s_bA4SAsyncStopping)
+		s_A4SAsyncFailedGeneration=s_A4SAsyncGeneration;
 	// A refresh can arrive after this worker publishes but before its COM
 	// apartment finishes tearing down. The request and this transition share the
 	// same lock, so either this worker starts the successor or the requester sees
 	// running=false and does so; no refresh generation can be lost in between.
 	if (bComInitialized && !s_bA4SAsyncStopping &&
+		s_A4SAsyncFailedGeneration!=s_A4SAsyncGeneration &&
 		s_A4SAsyncReadyGeneration!=s_A4SAsyncGeneration)
 		StartA4SAsyncWorkerLocked();
 	ReleaseSRWLockExclusive(&s_A4SAsyncLock);
@@ -1263,10 +1323,22 @@ LRESULT CProgramsTree::OnA4SSnapshotReady( UINT uMsg, WPARAM wParam, LPARAM lPar
 {
 	UNREFERENCED_PARAMETER(uMsg);
 	UNREFERENCED_PARAMETER(bHandled);
-	if ((CProgramsTree*)lParam!=this || !::IsWindow(m_hWnd) ||
+	const LONG instanceCookie=(LONG)lParam;
+	if (instanceCookie!=m_A4SInstanceCookie || !::IsWindow(m_hWnd) ||
 		!m_pOwner || m_pOwner->m_bDestroyed)
 		return 0;
-	ApplyA4SSnapshot((LONG)wParam);
+
+	// HWND values can be reused after a tree is destroyed. Validate both the
+	// current subscription and its monotonic instance cookie before consuming a
+	// completion that may have spent time in the UI queue.
+	AcquireSRWLockShared(&s_A4SAsyncLock);
+	const bool bSubscribed=s_A4SAsyncNotifyWindow==m_hWnd &&
+		s_A4SAsyncNotifyCookie==instanceCookie;
+	ReleaseSRWLockShared(&s_A4SAsyncLock);
+	if (!bSubscribed || !ApplyA4SSnapshot((LONG)wParam))
+		return 0;
+
+	m_pOwner->CompleteA4SProgramsNavigation(this);
 	return 0;
 }
 #endif
@@ -1836,20 +1908,21 @@ void CProgramsTree::CreateFolderItems( HTREEITEM hParent )
 	}
 }
 
-void CProgramsTree::CreateItems( void )
+bool CProgramsTree::CreateItems( void )
 {
 #ifdef A4S_PRODUCT
-	TreeView_DeleteAllItems(m_hWnd);
-	m_RootX=0;
-	RequestA4SItems(this,m_hWnd,CMenuContainer::s_bNoCommonFolders,true);
-	ApplyA4SSnapshot();
-	return;
+	// Do not erase the last complete tree while a refresh is in flight. A cold
+	// tree stays hidden until this call or its completion message can atomically
+	// merge a fully enumerated, icon-ready snapshot.
+	RequestA4SItems(this,m_hWnd,CMenuContainer::s_bNoCommonFolders,false);
+	return ApplyA4SSnapshot();
 #else
 	TreeView_DeleteAllItems(m_hWnd);
 	CreateFolderItems(NULL);
 	RECT rc;
 	TreeView_GetItemRect(m_hWnd,TreeView_GetRoot(m_hWnd),&rc,TRUE);
 	m_RootX=rc.left;
+	return true;
 #endif
 }
 
@@ -1928,16 +2001,20 @@ bool CProgramsTree::ApplyA4SSnapshot( LONG expectedGeneration )
 {
 	std::vector<CTreeItem> snapshot;
 	LONG readyGeneration=0;
+	LONG currentGeneration=0;
 	bool bAutoSort=false;
 	bool bFoldersFirst=false;
 	AcquireSRWLockShared(&s_A4SAsyncLock);
+	currentGeneration=InterlockedCompareExchange(&s_A4SAsyncGeneration,0,0);
 	if (s_bA4SAsyncHasSnapshot &&
+		s_A4SAsyncReadyGeneration==currentGeneration &&
+		s_A4SSnapshotConfiguration==s_A4SAsyncConfiguration &&
 		(!expectedGeneration || s_A4SAsyncReadyGeneration==expectedGeneration))
 	{
 		snapshot=s_A4SAsyncItems;
 		readyGeneration=s_A4SAsyncReadyGeneration;
 		bAutoSort=s_bA4SAsyncAutoSort;
-		bFoldersFirst=s_A4SAsyncConfiguration.bFoldersFirst;
+		bFoldersFirst=s_A4SSnapshotConfiguration.bFoldersFirst;
 	}
 	ReleaseSRWLockShared(&s_A4SAsyncLock);
 	if (!readyGeneration)

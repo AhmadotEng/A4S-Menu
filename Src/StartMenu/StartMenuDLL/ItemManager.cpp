@@ -4162,7 +4162,13 @@ STDAPI ShGetKnownFolderItem(REFKNOWNFOLDERID rfid, IShellItem **ppItem )
 ///////////////////////////////////////////////////////////////////////////////
 
 CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )
+	: m_Result(E_FAIL)
 {
+	if (!pFolder)
+	{
+		m_Result=E_INVALIDARG;
+		return;
+	}
 	int compat=GetSettingInt(L"CompatibilityFixes");
 	if (!(compat&COMPATIBILITY_ENUM_SHELLITEM))
 	{
@@ -4177,12 +4183,25 @@ CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )
 				pFolder2->Update(NULL);
 				hr=pFolder->BindToHandler(NULL,BHID_SFObject,IID_IShellFolder,(void**)&pFolder0);
 				if (FAILED(hr))
+				{
+					m_Result=hr;
 					return;
+				}
+			}
+			else
+			{
+				m_Result=hr;
+				return;
 			}
 		}
-		if (FAILED(SHGetIDListFromObject(pFolder,&m_Root)))
+		hr=SHGetIDListFromObject(pFolder,&m_Root);
+		if (FAILED(hr))
+		{
+			m_Result=hr;
 			return;
+		}
 		hr=pFolder0->EnumObjects(NULL,SHCONTF_FOLDERS|SHCONTF_NONFOLDERS,(IEnumIDList**)&m_pEnumPidls);
+		m_Result=(hr==S_OK && !m_pEnumPidls)?E_UNEXPECTED:hr;
 	}
 	else
 	{
@@ -4199,12 +4218,19 @@ CShellItemEnumerator::CShellItemEnumerator( IShellItem *pFolder )
 				if (FAILED(hr))
 				{
 					m_pEnumItems=NULL;
+					m_Result=hr;
 					return;
 				}
+			}
+			else
+			{
+				m_Result=hr;
+				return;
 			}
 		}
 		if (compat&COMPATIBILITY_ENUM_FIX_PIDLS)
 			SHGetIDListFromObject(pFolder,&m_Root);
+		m_Result=m_pEnumItems?S_OK:(FAILED(hr)?hr:E_UNEXPECTED);
 	}
 }
 
@@ -4217,28 +4243,52 @@ bool CShellItemEnumerator::GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &
 {
 	pChild=NULL;
 	childPidl.Clear();
+	if (m_Result!=S_OK)
+		return false;
 	if (m_pEnumPidls)
 	{
 		CAbsolutePidl child;
-		if (m_pEnumPidls->Next(1,(PITEMID_CHILD*)&child,NULL)!=S_OK)
+		const HRESULT nextResult=m_pEnumPidls->Next(1,(PITEMID_CHILD*)&child,NULL);
+		if (nextResult!=S_OK)
+		{
+			m_Result=nextResult;
 			return false;
+		}
 
 		CAbsolutePidl pidl;
 		pidl.Attach(ILCombine(m_Root,child));
-		if (FAILED(SHCreateItemFromIDList(pidl,IID_IShellItem,(void**)&pChild)))
+		if (!pidl)
+		{
+			m_Result=E_OUTOFMEMORY;
 			return false;
+		}
+		const HRESULT createResult=SHCreateItemFromIDList(pidl,IID_IShellItem,
+			(void**)&pChild);
+		if (FAILED(createResult))
+		{
+			m_Result=createResult;
+			return false;
+		}
 		childPidl.Swap(pidl);
 		return true;
 	}
-	else
+	else if (m_pEnumItems)
 	{
 		CComPtr<IShellItem> pChild0;
-		if (m_pEnumItems->Next(1,&pChild0,NULL)!=S_OK)
+		const HRESULT nextResult=m_pEnumItems->Next(1,&pChild0,NULL);
+		if (nextResult!=S_OK)
+		{
+			m_Result=nextResult;
 			return false;
+		}
 
 		CAbsolutePidl pidl0;
-		if (FAILED(SHGetIDListFromObject(pChild0,&pidl0)))
+		const HRESULT pidlResult=SHGetIDListFromObject(pChild0,&pidl0);
+		if (FAILED(pidlResult))
+		{
+			m_Result=pidlResult;
 			return false;
+		}
 
 		if (m_Root)
 		{
@@ -4255,4 +4305,6 @@ bool CShellItemEnumerator::GetNext( CComPtr<IShellItem> &pChild, CAbsolutePidl &
 		pChild=pChild0;
 		return true;
 	}
+	m_Result=E_UNEXPECTED;
+	return false;
 }
