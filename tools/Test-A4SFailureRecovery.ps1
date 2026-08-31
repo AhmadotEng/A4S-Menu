@@ -2580,8 +2580,9 @@ function Invoke-A4SRegistrySnapshotTransaction {
         [ValidatePattern('\A[A-Fa-f0-9]{64}\z')][string] $RollbackManifestSha256,
         [object] $ExistingDescriptorRecord,
         [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0,
-        [ValidateSet('none', 'prepared', 'before-primitive', 'after-primitive',
-            'committed', 'before-rollback', 'after-rollback', 'rolled-back')]
+        [ValidateSet('none', 'prepared', 'recovery-prepared', 'before-primitive',
+            'after-primitive', 'committed', 'before-rollback', 'after-rollback',
+            'rolled-back')]
         [string] $InjectHardInterruptionPhase = 'none'
     )
 
@@ -2786,8 +2787,9 @@ function Invoke-A4SRegistryTransactionRecovery {
         [object] $ProductBoundary,
         [scriptblock] $ValidateBoundary,
         [switch] $ContractRegistrySandbox,
-        [ValidateSet('none', 'prepared', 'before-primitive', 'after-primitive',
-            'committed', 'before-rollback', 'after-rollback', 'rolled-back')]
+        [ValidateSet('none', 'prepared', 'recovery-prepared', 'before-primitive',
+            'after-primitive', 'committed', 'before-rollback', 'after-rollback',
+            'rolled-back')]
         [string] $InjectHardInterruptionPhase = 'none'
     )
 
@@ -2908,6 +2910,9 @@ function Invoke-A4SRegistryTransactionRecovery {
             authorizedBeforeSnapshot=$null; authorizedBeforeSha256=$null
             authorizedAfterSnapshot=$null; authorizedAfterSha256=$null
         }
+    Throw-A4SSimulatedHardInterruption `
+        -ConfiguredPhase $InjectHardInterruptionPhase `
+        -CurrentPhase 'recovery-prepared'
     $result = Invoke-A4SRegistrySnapshotTransaction `
         -RegistrySubKey $RegistrySubKey -DesiredSnapshot $goal.snapshot `
         -ExpectedCurrent $current -ProductBoundary $ProductBoundary `

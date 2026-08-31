@@ -187,6 +187,7 @@ try {
     Assert-Contract ($treeValidator -match 'subkeys are forbidden') `
         'HostSafety schema does not explicitly forbid subkeys'
     $transaction = Get-FunctionText 'Invoke-A4SRegistrySnapshotTransaction'
+    $transactionRecovery = Get-FunctionText 'Invoke-A4SRegistryTransactionRecovery'
     $journalStep = Get-FunctionText 'Invoke-A4SRegistryJournaledStep'
     $undoJournal = Get-FunctionText 'Undo-A4SRegistryJournal'
     $primitive = Get-FunctionText 'Invoke-A4SRegistryPrimitive'
@@ -216,6 +217,10 @@ try {
     Assert-InOrder -Text $primitive -Markers @('Assert-A4SProductMutationMode',
         'ValidateMutationContext', 'OpenBaseKey') `
         -Message 'ContractLibrary can reach product registry before mode/context validation'
+    Assert-InOrder -Text $transactionRecovery -Markers @(
+        "phase='recovery-prepared'", 'Throw-A4SSimulatedHardInterruption',
+        "CurrentPhase 'recovery-prepared'", 'Invoke-A4SRegistrySnapshotTransaction') `
+        -Message 'recovery-prepared is not durable and interruptible before replay mutation'
 
     $binaryBinding = Get-FunctionText 'Get-BinaryBinding'
     foreach ($required in @('FileShare]::Read', 'Assert-StaticPeImageBytes',
@@ -681,6 +686,106 @@ try {
         Assert-Contract ($sandboxAuthorized.sha256 -ceq $expectedRecovered.sha256) `
             "hard interruption $hardPhase did not deterministically resume or exact-CAS rollback"
     }
+
+    # Exercise the recovery-only descriptor phase, then interrupt the resumed
+    # rollback twice more. This proves replay is repeatable rather than merely
+    # able to recover from one interrupted initial transaction.
+    [void](Invoke-SandboxTransition -Desired $absent)
+    $beforeRepeatedRecovery = $sandboxAuthorized
+    $repeatedAssets = New-ContractTransactionAssets `
+        -ExpectedAggregate $beforeRepeatedRecovery
+    Assert-Throws {
+        & $library {
+            param($key, $desired, $expected, $validator, $assets)
+            Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
+                -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                -ValidateBoundary $validator -ContractRegistrySandbox `
+                -TransactionDescriptorPath $assets.descriptorPath `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                -InjectHardInterruptionPhase after-primitive
+        } $sandboxSubKey $desiredState $beforeRepeatedRecovery $boundary `
+            $repeatedAssets
+    } 'repeated-recovery fixture did not interrupt its initial apply' `
+        'A4S_SIMULATED_HARD_INTERRUPTION:after-primitive'
+    $repeatedDescriptor = & $library {
+        param($key, $assets)
+        Read-A4SRegistryTransactionDescriptor -Path $assets.descriptorPath `
+            -RegistrySubKey $key -TargetKind contract-sandbox `
+            -RollbackBundle $assets.bundle `
+            -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+            -CaptureSha256
+    } $sandboxSubKey $repeatedAssets
+    Assert-Contract ([string]$repeatedDescriptor.value.phase -ceq 'after-primitive') `
+        'repeated-recovery fixture did not durably retain its initial interruption'
+
+    Assert-Throws {
+        & $library {
+            param($key, $validator, $assets, $descriptorSha256)
+            Invoke-A4SRegistryTransactionRecovery -RegistrySubKey $key `
+                -TransactionDescriptorPath $assets.descriptorPath `
+                -ExpectedTransactionDescriptorSha256 $descriptorSha256 `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                -ValidateBoundary $validator -ContractRegistrySandbox `
+                -InjectHardInterruptionPhase recovery-prepared
+        } $sandboxSubKey $boundary $repeatedAssets $repeatedDescriptor.sha256
+    } 'recovery-prepared did not interrupt before replay mutation' `
+        'A4S_SIMULATED_HARD_INTERRUPTION:recovery-prepared'
+    $repeatedDescriptor = & $library {
+        param($key, $assets)
+        Read-A4SRegistryTransactionDescriptor -Path $assets.descriptorPath `
+            -RegistrySubKey $key -TargetKind contract-sandbox `
+            -RollbackBundle $assets.bundle `
+            -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+            -CaptureSha256
+    } $sandboxSubKey $repeatedAssets
+    Assert-Contract ([string]$repeatedDescriptor.value.phase -ceq 'recovery-prepared') `
+        'recovery-prepared was not durably phase-marked before interruption'
+
+    foreach ($recoveryHardPhase in @('before-primitive', 'after-primitive')) {
+        Assert-Throws {
+            & $library {
+                param($key, $validator, $assets, $descriptorSha256, $hardPhase)
+                Invoke-A4SRegistryTransactionRecovery -RegistrySubKey $key `
+                    -TransactionDescriptorPath $assets.descriptorPath `
+                    -ExpectedTransactionDescriptorSha256 $descriptorSha256 `
+                    -RollbackBundle $assets.bundle `
+                    -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                    -ValidateBoundary $validator -ContractRegistrySandbox `
+                    -InjectHardInterruptionPhase $hardPhase
+            } $sandboxSubKey $boundary $repeatedAssets `
+                $repeatedDescriptor.sha256 $recoveryHardPhase
+        } "recovery replay did not interrupt at $recoveryHardPhase" `
+            "A4S_SIMULATED_HARD_INTERRUPTION:$recoveryHardPhase"
+        $repeatedDescriptor = & $library {
+            param($key, $assets)
+            Read-A4SRegistryTransactionDescriptor -Path $assets.descriptorPath `
+                -RegistrySubKey $key -TargetKind contract-sandbox `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                -CaptureSha256
+        } $sandboxSubKey $repeatedAssets
+        Assert-Contract ([string]$repeatedDescriptor.value.phase -ceq $recoveryHardPhase) `
+            "recovery replay interruption $recoveryHardPhase was not durable"
+    }
+
+    $repeatedRecovery = & $library {
+        param($key, $validator, $assets, $descriptorSha256)
+        Invoke-A4SRegistryTransactionRecovery -RegistrySubKey $key `
+            -TransactionDescriptorPath $assets.descriptorPath `
+            -ExpectedTransactionDescriptorSha256 $descriptorSha256 `
+            -RollbackBundle $assets.bundle `
+            -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+            -ValidateBoundary $validator -ContractRegistrySandbox
+    } $sandboxSubKey $boundary $repeatedAssets $repeatedDescriptor.sha256
+    $sandboxAuthorized = [pscustomobject][ordered]@{
+        snapshot=$repeatedRecovery.snapshot; sha256=$repeatedRecovery.snapshotSha256
+    }
+    Assert-Contract (-not [bool]$sandboxAuthorized.snapshot.exists -and
+        $sandboxAuthorized.sha256 -ceq $beforeRepeatedRecovery.sha256) `
+        'repeated recovery interruptions did not exact-CAS back to the locked prestate'
+
     [void](Invoke-SandboxTransition -Desired $absent)
     $sandboxFinal = & $library {
         param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
@@ -867,7 +972,8 @@ try {
     Write-Host ('A4S failure/recovery offline contracts passed: locked static PE/manifest ' +
         'ordering, exact crash schema, retained Explorer identity predicates, opaque ' +
         'mutation capabilities, stale-CAS rejection, every journal failure point, all ' +
-        'durable hard-interruption phases, deterministic recovery/rollback, and ' +
+        'durable hard-interruption phases, repeated recovery interruptions, ' +
+        'deterministic recovery/rollback, and ' +
         'non-recursive cleanup were executed.')
 }
 catch {
