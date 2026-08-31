@@ -526,6 +526,9 @@ CItemManager::CItemManager( void )
 	m_DefaultSmallIcon=m_DefaultLargeIcon=m_DefaultExtraLargeIcon=NULL;
 	m_bHasNewPrograms[0]=m_bHasNewPrograms[1]=m_bHasNewApps[0]=m_bHasNewApps[1]=m_bPreloadIcons=m_bPreloadFavorites=false;
 	m_LoadingStage=LOAD_STOPPED;
+#ifdef A4S_PRODUCT
+	m_PendingPidlRefresh=0;
+#endif
 	m_LastCacheSave=0;
 	m_TransientHash=1;
 }
@@ -961,7 +964,12 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 			if (CompareFileTime(&pInfo->writestamp,&writeTime)!=0)
 			{
 				if (!PATH.IsEmpty() && !ComparePidls(pInfo->pidl,pidl) && !ComparePidls(pInfo->newPidl,pidl))
+				{
 					pInfo->newPidl.Clone(pidl);
+#ifdef A4S_PRODUCT
+					InterlockedExchange(&m_PendingPidlRefresh,1);
+#endif
+				}
 				pInfo->writestamp=writeTime;
 				pInfo->validFlags=0;
 			}
@@ -1058,7 +1066,12 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 				if (!PATH.IsEmpty())
 					MenuParseDisplayName(PATH,&pidl,NULL,NULL);
 				if (!ComparePidls(pInfo->pidl,pidl) && !ComparePidls(pInfo->newPidl,pidl))
+				{
 					pInfo->newPidl.Swap(pidl);
+#ifdef A4S_PRODUCT
+					InterlockedExchange(&m_PendingPidlRefresh,1);
+#endif
+				}
 				pInfo->writestamp=writeTime;
 				pInfo->validFlags=0;
 			}
@@ -2183,6 +2196,12 @@ void CItemManager::RefreshItemInfo( ItemInfo *pInfo, int refreshFlags, IShellIte
 void CItemManager::RefreshInfos( void )
 {
 	Assert(GetCurrentThreadId()==m_MainThreadId);
+#ifdef A4S_PRODUCT
+	// Most toggles have no PIDL replacement pending. Avoid an exclusive scan of
+	// the complete metadata cache unless a watcher actually published one.
+	if (InterlockedCompareExchange(&m_PendingPidlRefresh,0,0)==0)
+		return;
+#endif
 	RWLock lock(this,true,RWLOCK_ITEMS);
 	for (std::multimap<unsigned int,ItemInfo>::iterator it=m_ItemInfos.begin();it!=m_ItemInfos.end();++it)
 	{
@@ -2193,6 +2212,9 @@ void CItemManager::RefreshInfos( void )
 			it->second.validFlags=0;
 		}
 	}
+#ifdef A4S_PRODUCT
+	InterlockedExchange(&m_PendingPidlRefresh,0);
+#endif
 }
 
 HBITMAP CItemManager::BitmapFromIcon( HICON hIcon, int iconSize, bool bDestroyIcon )
@@ -2926,6 +2948,16 @@ const int NUM_WATCHED_DIRS=7;
 
 void CItemManager::PreloadItemsThread( void )
 {
+#ifdef A4S_PRODUCT
+	// Injection must become ready before background shell enumeration begins.
+	// A waitable delay keeps this dormant and immediately cancellable during
+	// unload; it also keeps cold Explorer startup I/O out of the hook path.
+	if (WaitForSingleObject(m_ExitEvent,2000)==WAIT_OBJECT_0)
+	{
+		SetEvent(m_DoneEvent);
+		return;
+	}
+#endif
 	int dirCount=0;
 	HANDLE handles[NUM_WATCHED_DIRS+1];
 	DWORD dirMasks[NUM_WATCHED_DIRS]={0};
@@ -3017,6 +3049,12 @@ void CItemManager::PreloadItemsThread( void )
 			}
 #endif
 		}
+#ifdef A4S_PRODUCT
+		// Persist refreshed metadata from the idle worker, never from menu close.
+		// SaveCacheFile supplies the existing five-minute debounce and atomic
+		// DataCache.tmp replacement.
+		SaveCacheFile();
+#endif
 		if (dirCount==0)
 			break;
 		handles[dirCount]=m_ExitEvent;

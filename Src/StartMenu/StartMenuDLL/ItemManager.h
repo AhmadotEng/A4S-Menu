@@ -370,6 +370,9 @@ private:
 		LOAD_LOADING, // the loading threads are running
 	};
 	volatile TLoadingStage m_LoadingStage;
+#ifdef A4S_PRODUCT
+	volatile LONG m_PendingPidlRefresh;
+#endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;
 	bool m_bOldInvertIcons;

@@ -3071,9 +3071,19 @@ bool MenuSkin::LoadMenuSkin( const wchar_t *fname, const wchar_t *variation, con
 		// This product has no skin-selection surface. The DLL's embedded default
 		// record is only a bootstrap for A4SMenuProfile::ApplyPresentation.
 		// Never inspect or load an external .skin/.skin7 module.
+		// The source-owned profile is immutable for a given type/DPI/resource
+		// tuple. Keep its fonts, bitmaps and parsed presentation graph warm across
+		// menu toggles; system/profile invalidation already clears Hash.
+		const unsigned int profileKey[]={
+			0x41345317U,static_cast<unsigned int>(skinType),flags,
+			static_cast<unsigned int>(dpi)
+		};
+		const unsigned int profileHash=CalcFNVHash(profileKey,sizeof(profileKey));
+		if (Hash==profileHash && Dpi==dpi)
+			return true;
 		Reset();
 		bool loaded=LoadSkin(g_Instance,NULL,L"",skinType,flags,dpi);
-		Hash=0;
+		Hash=loaded?profileHash:0;
 		return loaded;
 	}
 	wchar_t path[_MAX_PATH];

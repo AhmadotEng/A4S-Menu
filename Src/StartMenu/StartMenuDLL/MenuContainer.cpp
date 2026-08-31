@@ -877,8 +877,10 @@ CMenuContainer::CMenuContainer( CMenuContainer *pParent, int index, int options,
 	m_InputCookie=0;
 	m_ScrollTheme=NULL;
 
+#ifndef A4S_PRODUCT
 	CoCreateInstance(CLSID_DragDropHelper,NULL,CLSCTX_INPROC_SERVER,IID_IDropTargetHelper,(void**)&m_pDropTargetHelper);
 	m_pDragSourceHelper=CComQIPtr<IDragSourceHelper2>(m_pDropTargetHelper);
+#endif
 	LOG_MENU(LOG_OPEN,L"Open Menu, ptr=%p, index=%d, options=%08X",this,index,options);
 }
 
@@ -5666,14 +5668,14 @@ void CMenuContainer::UpdateSearchResults( bool bForceShowAll )
 		pText[len]=0;
 		CharUpper(pText);
 		s_SearchResults.currentString=pText;
-		g_SearchManager.BeginSearch(s_SearchResults.currentString);
-		s_SearchResults.bSearching=true;
+		const bool searchStarted=g_SearchManager.BeginSearch(s_SearchResults.currentString);
+		s_SearchResults.bSearching=searchStarted;
 		s_bPendingSearchEnter=false;
 		if (s_bWin7Style)
 		{
 			MenuItem &item=m_Items[m_SearchIndex-m_SearchItemCount+1];
 			item.id=MENU_SEARCH_EMPTY;
-			item.name=FindTranslation(L"Menu.Searching",L"Searching...");
+			item.name=searchStarted?FindTranslation(L"Menu.Searching",L"Searching..."):FindTranslation(L"Menu.NoMatch",L"No items match your search.");
 			item.pItemInfo=g_ItemManager.GetCustomIcon(L"imageres.dll,8",CItemManager::ICON_SIZE_TYPE_SMALL);
 		}
 		if (m_Submenu!=m_SearchIndex && s_MenuMode!=MODE_SEARCH)
@@ -6810,13 +6812,13 @@ LRESULT CMenuContainer::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 		m_pAccessibleContext=NULL;
 		m_pAccessible=NULL;
 	}
+#ifndef A4S_PRODUCT
 	if (m_pDropTargetHelper && m_pDragObject)
 	{
 		m_pDropTargetHelper->DragLeave();
 	}
 	m_pDragObject=NULL;
 	m_pDropTargetHelper=NULL;
-#ifndef A4S_PRODUCT
 	if (m_pDropTargetProxy)
 		m_pDropTargetProxy->Reset();
 	m_pDropTargetProxy=NULL;
@@ -6899,7 +6901,9 @@ LRESULT CMenuContainer::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 		}
 		s_TaskBar=s_StartButton=NULL;
 		s_TaskBarId=-1;
+#ifndef A4S_PRODUCT
 		g_ItemManager.SaveCacheFile();
+#endif
 		if (s_ArrowsBitmap) DeleteObject(s_ArrowsBitmap);
 		s_ArrowsBitmap=NULL;
 		CloseLog();
@@ -8222,6 +8226,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	BeginA4SOpenPath();
 #endif
 
+#ifndef A4S_PRODUCT
 	{
 		CRegKey regKey;
 		if (regKey.Open(HKEY_CURRENT_USER,GetSettingsRegPath())!=ERROR_SUCCESS)
@@ -8244,6 +8249,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 			}
 		}
 	}
+#endif
 
 	if (GetSettingInt(L"CompatibilityFixes")&COMPATIBILITY_CRASH_TEST)
 		*(int*)0=0;
@@ -8269,6 +8275,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_JumplistWidth=GetSettingInt(L"JumplistWidth");
 	s_BackgroundW1=s_BackgroundW2=s_BackgroundH1=s_BackgroundH2=0;
 	ClearOldState();
+#ifndef A4S_PRODUCT
 	int categories=0;
 	{
 		CRegKey regKey;
@@ -8290,11 +8297,14 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		Strcat(path,_countof(path),L"\\StartMenuLog.txt");
 		InitLog(categories,path);
 	}
+#endif
 
+#ifndef A4S_PRODUCT
 	{
 		CSettingsLockWrite lock;
 		UpdateDefaultSettings();
 	}
+#endif
 	// initialize all settings
 	bool bErr=false;
 	HMONITOR initialMonitor=MonitorFromWindow(s_TaskBar,MONITOR_DEFAULTTONEAREST);
@@ -8337,8 +8347,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_DescriptorFormat=RegisterClipboardFormat(CFSTR_FILEDESCRIPTOR);
 	s_ContentsFormat=RegisterClipboardFormat(CFSTR_FILECONTENTS);
 	s_MetroLinkFormat=RegisterClipboardFormat(A4S_MENU_METRO_CLIPBOARD);
+#ifndef A4S_PRODUCT
 	s_PreferredEffectFormat=RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT);
 	s_DropDescriptionFormat=RegisterClipboardFormat(CFSTR_DROPDESCRIPTION);
+#endif
 	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
 	s_bNoRun=(SHRestricted(REST_NORUN)!=0);
 	s_bNoClose=(SHRestricted(REST_NOCLOSE)!=0);
@@ -8352,6 +8364,13 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #endif
 
 	bool bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
+#ifdef A4S_PRODUCT
+	// The product profile never exposes the legacy People or Active Directory
+	// search commands. Avoid probing Windows Mail or a domain controller on the
+	// latency-sensitive menu-opening path.
+	bool bPeople=false;
+	s_bActiveDirectory=0;
+#else
 	wchar_t wabPath[_MAX_PATH]=L"%ProgramFiles%\\Windows Mail\\wab.exe";
 	DoEnvironmentSubst(wabPath,_countof(wabPath));
 	HANDLE hWab=CreateFile(wabPath,0,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
@@ -8394,11 +8413,14 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		else
 			s_bActiveDirectory=0;
 	}
+#endif
 
+#ifndef A4S_PRODUCT
 	if (GetWinVersion()>=WIN_VER_WIN8 && !s_pFrameworkInputPane && !(GetSettingInt(L"CompatibilityFixes")&COMPATIBILITY_NO_TOUCH_KBD))
 	{
 		s_pFrameworkInputPane.CoCreateInstance(CLSID_FrameworkInputPane);
 	}
+#endif
 
 	s_bHasUpdates=(!bRemote || GetSettingBool(L"RemoteShutdown")) && GetSettingBool(L"CheckWinUpdates") && CheckForUpdates();
 
@@ -8693,7 +8715,11 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		LOG_MENU(LOG_OPEN,L"ItemOptions[%d]=%d",i,g_StdOptions[i].options);
 	}	
 
+#ifdef A4S_PRODUCT
+	s_bNoDragDrop=true;
+#else
 	s_bNoDragDrop=!GetSettingBool(L"EnableDragDrop");
+#endif
 	s_bNoContextMenu=!GetSettingBool(L"EnableContextMenu");
 	s_bKeyboardCues=bKeyboard&&GetSettingBool(L"EnableAccelerators")&&!GetSettingBool(L"AltAccelerators");
 	s_RecentPrograms=(TRecentPrograms)GetSettingInt(L"RecentPrograms");
@@ -8724,6 +8750,7 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		s_PinFolder=path;
 		SHParseDisplayName(path,NULL,&path1,0,NULL);
 	}
+#ifndef A4S_PRODUCT
 #ifndef STARTSCREEN_WIN7
 	if (GetWinVersion()>=WIN_VER_WIN8)
 #endif
@@ -8754,8 +8781,16 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		else if (bPinned || !bShortcut)
 			DeleteFile(path);
 	}
+#endif
 
+#ifdef A4S_PRODUCT
+	// Pinning is handled by the product context commands. The product has no
+	// drag/drop customization surface, so do not create drag helpers or touch
+	// the legacy order registry on each toggle.
+	int options=CONTAINER_PROGRAMS;
+#else
 	int options=CONTAINER_PROGRAMS|CONTAINER_DRAG|CONTAINER_DROP;
+#endif
 	unsigned int rootSettings=0;
 	const StdMenuItem *pRoot=NULL;
 	if (bAllPrograms)
