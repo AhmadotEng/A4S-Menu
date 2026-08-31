@@ -38,6 +38,7 @@ if (-not $SkipStage) {
 }
 
 if (-not $SkipValidation) {
+    & (Join-Path $PSScriptRoot 'Test-A4SNativeLifecycle.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SProduct.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SSetup.ps1')
 }

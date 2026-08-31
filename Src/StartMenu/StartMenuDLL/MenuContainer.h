@@ -330,6 +330,9 @@ public:
 	END_MSG_MAP()
 
 	static bool CloseStartMenu( void );
+#ifdef A4S_PRODUCT
+	static void ForceCloseA4STransients( void );
+#endif
 	static bool IsMenuOpened( void ) { return !s_Menus.empty(); }
 	static bool HasInputHandler( void ) { return s_pFrameworkInputPane!=NULL; }
 	static bool CanShowMenu( void ) { return s_Menus.empty() || !s_bPreventClosing; }

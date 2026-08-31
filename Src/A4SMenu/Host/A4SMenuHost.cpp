@@ -3,6 +3,7 @@
 #include <wtsapi32.h>
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cwchar>
 #include <string>
@@ -26,6 +27,7 @@ namespace
 	constexpr wchar_t kSafetyDisabledValue[] = L"InjectionDisabled";
 	constexpr wchar_t kCrashCountValue[] = L"AbnormalExplorerExitCount";
 	constexpr wchar_t kCrashWindowValue[] = L"AbnormalExplorerWindowStart";
+	constexpr wchar_t kCrashTimesValue[] = L"AbnormalExplorerExitTimes";
 	constexpr wchar_t kLastExitCodeValue[] = L"LastExplorerExitCode";
 
 	using WTSRegisterSessionNotificationFn = BOOL (WINAPI *)(HWND,DWORD);
@@ -33,46 +35,59 @@ namespace
 
 	struct CrashGuardState
 	{
+		std::array<ULONGLONG,kCrashLoopThreshold> abnormalExitTimes;
 		DWORD abnormalExitCount;
-		ULONGLONG windowStart;
 		bool disabled;
 	};
 
 	constexpr CrashGuardState AdvanceCrashGuard(CrashGuardState state,
-		bool attemptedActivation, DWORD exitCode, ULONGLONG now)
+		bool countAbnormalExit, ULONGLONG now)
 	{
-		if (!attemptedActivation || state.disabled)
+		if (state.disabled)
 			return state;
-		if (exitCode==ERROR_SUCCESS)
+		std::array<ULONGLONG,kCrashLoopThreshold> retained={};
+		DWORD retainedCount=0;
+		for (DWORD index=0;index<state.abnormalExitCount &&
+			index<state.abnormalExitTimes.size();index++)
 		{
-			state.abnormalExitCount=0;
-			state.windowStart=0;
-			return state;
+			const ULONGLONG timestamp=state.abnormalExitTimes[index];
+			if (timestamp && (now<timestamp || now-timestamp<=kCrashLoopWindow100ns))
+				retained[retainedCount++]=timestamp;
 		}
-		const bool sameWindow=state.windowStart && now>=state.windowStart &&
-			now-state.windowStart<=kCrashLoopWindow100ns;
-		if (!sameWindow)
+		state.abnormalExitTimes=retained;
+		state.abnormalExitCount=retainedCount;
+		if (countAbnormalExit)
 		{
-			state.windowStart=now;
-			state.abnormalExitCount=1;
+			if (state.abnormalExitCount<state.abnormalExitTimes.size())
+				state.abnormalExitTimes[state.abnormalExitCount++]=now;
+			else
+			{
+				for (size_t index=1;index<state.abnormalExitTimes.size();index++)
+					state.abnormalExitTimes[index-1]=state.abnormalExitTimes[index];
+				state.abnormalExitTimes.back()=now;
+			}
 		}
-		else if (state.abnormalExitCount<MAXDWORD)
-			state.abnormalExitCount++;
 		if (state.abnormalExitCount>=kCrashLoopThreshold)
 			state.disabled=true;
 		return state;
 	}
 
-	constexpr CrashGuardState A4S_EMPTY_CRASH_GUARD={0,0,false};
-	constexpr CrashGuardState A4S_CRASH_ONE=AdvanceCrashGuard(A4S_EMPTY_CRASH_GUARD,true,1,100);
-	constexpr CrashGuardState A4S_CRASH_TWO=AdvanceCrashGuard(A4S_CRASH_ONE,true,2,101);
-	constexpr CrashGuardState A4S_CRASH_THREE=AdvanceCrashGuard(A4S_CRASH_TWO,true,3,102);
+	constexpr CrashGuardState A4S_EMPTY_CRASH_GUARD={{},0,false};
+	constexpr CrashGuardState A4S_CRASH_ONE=AdvanceCrashGuard(A4S_EMPTY_CRASH_GUARD,true,100);
+	constexpr CrashGuardState A4S_CRASH_TWO=AdvanceCrashGuard(A4S_CRASH_ONE,true,101);
+	constexpr CrashGuardState A4S_CRASH_THREE=AdvanceCrashGuard(A4S_CRASH_TWO,true,102);
 	static_assert(!A4S_CRASH_TWO.disabled && A4S_CRASH_THREE.disabled,
 		"three abnormal Explorer exits inside the guard window must disable injection");
-	constexpr CrashGuardState A4S_CRASH_EXPIRED=AdvanceCrashGuard(A4S_CRASH_TWO,true,3,
+	constexpr CrashGuardState A4S_CRASH_EXPIRED=AdvanceCrashGuard(A4S_CRASH_TWO,true,
 		101+kCrashLoopWindow100ns+1);
 	static_assert(!A4S_CRASH_EXPIRED.disabled && A4S_CRASH_EXPIRED.abnormalExitCount==1,
-		"an expired Explorer failure window must restart at one");
+		"expired Explorer failures must be pruned before appending the new one");
+	constexpr CrashGuardState A4S_CRASH_WITH_CLEAN_EXIT=
+		AdvanceCrashGuard(A4S_CRASH_TWO,false,101);
+	static_assert(AdvanceCrashGuard(A4S_CRASH_WITH_CLEAN_EXIT,true,102).disabled,
+		"a clean maintenance exit must not erase earlier abnormal timestamps");
+	static_assert(AdvanceCrashGuard(A4S_CRASH_ONE,false,99).abnormalExitCount==1,
+		"a backward wall-clock correction must not weaken the crash guard");
 
 	class UniqueHandle
 	{
@@ -148,8 +163,17 @@ namespace
 		bool replacementPending = false;
 		bool targetInvalidated = false;
 		bool safetyDisabled = false;
+		std::array<ULONGLONG,kCrashLoopThreshold> abnormalExplorerExitTimes = {};
 		DWORD abnormalExplorerExitCount = 0;
-		ULONGLONG abnormalExplorerWindowStart = 0;
+		bool sessionInputInteractive = true;
+		bool powerInputInteractive = true;
+		bool interactiveInput = true;
+		ULONGLONG inputGeneration = 0;
+		ULONGLONG injectionInputGeneration = 0;
+		ULONGLONG appliedInputGeneration = 0;
+		bool inputStateApplied = false;
+		bool sessionEnding = false;
+		bool authenticatedDisarmed = false;
 		HMODULE wtsApi = nullptr;
 		WTSRegisterSessionNotificationFn registerSessionNotification = nullptr;
 		WTSUnregisterSessionNotificationFn unregisterSessionNotification = nullptr;
@@ -180,8 +204,8 @@ namespace
 	void LoadSafetyState()
 	{
 		g_runtime.safetyDisabled = false;
+		g_runtime.abnormalExplorerExitTimes.fill(0);
 		g_runtime.abnormalExplorerExitCount = 0;
-		g_runtime.abnormalExplorerWindowStart = 0;
 		HKEY key = nullptr;
 		if (RegOpenKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)
 			return;
@@ -192,18 +216,45 @@ namespace
 		if (RegQueryValueExW(key,kSafetyDisabledValue,nullptr,&type,
 			reinterpret_cast<BYTE*>(&value),&size)==ERROR_SUCCESS && type==REG_DWORD && size==sizeof(value))
 			g_runtime.safetyDisabled=value!=0;
+		std::array<ULONGLONG,kCrashLoopThreshold> timestamps={};
 		type=0;
-		size=sizeof(value);
-		if (RegQueryValueExW(key,kCrashCountValue,nullptr,&type,
-			reinterpret_cast<BYTE*>(&value),&size)==ERROR_SUCCESS && type==REG_DWORD && size==sizeof(value))
-			g_runtime.abnormalExplorerExitCount=value;
-		ULONGLONG windowStart = 0;
-		type=0;
-		size=sizeof(windowStart);
-		if (RegQueryValueExW(key,kCrashWindowValue,nullptr,&type,
-			reinterpret_cast<BYTE*>(&windowStart),&size)==ERROR_SUCCESS && type==REG_QWORD && size==sizeof(windowStart))
-			g_runtime.abnormalExplorerWindowStart=windowStart;
+		size=static_cast<DWORD>(sizeof(timestamps));
+		const bool loadedRollingTimes=RegQueryValueExW(key,kCrashTimesValue,nullptr,&type,
+			reinterpret_cast<BYTE*>(timestamps.data()),&size)==ERROR_SUCCESS &&
+			type==REG_BINARY && size==sizeof(timestamps);
+		if (loadedRollingTimes)
+		{
+			for (ULONGLONG timestamp:timestamps)
+				if (timestamp)
+					g_runtime.abnormalExplorerExitTimes[
+						g_runtime.abnormalExplorerExitCount++]=timestamp;
+		}
+		else
+		{
+			// Migrate the ABI4 fixed-window values conservatively. Their exact event
+			// times were not retained, so use the recorded window start for each
+			// count; this preserves, rather than weakens, an existing safety streak.
+			DWORD legacyCount=0;
+			type=0;
+			size=sizeof(legacyCount);
+			RegQueryValueExW(key,kCrashCountValue,nullptr,&type,
+				reinterpret_cast<BYTE*>(&legacyCount),&size);
+			ULONGLONG legacyWindowStart=0;
+			type=0;
+			size=sizeof(legacyWindowStart);
+			RegQueryValueExW(key,kCrashWindowValue,nullptr,&type,
+				reinterpret_cast<BYTE*>(&legacyWindowStart),&size);
+			g_runtime.abnormalExplorerExitCount=(std::min)(legacyCount,kCrashLoopThreshold);
+			for (DWORD index=0;index<g_runtime.abnormalExplorerExitCount;index++)
+				g_runtime.abnormalExplorerExitTimes[index]=legacyWindowStart;
+		}
 		RegCloseKey(key);
+
+		CrashGuardState state={g_runtime.abnormalExplorerExitTimes,
+			g_runtime.abnormalExplorerExitCount,g_runtime.safetyDisabled};
+		state=AdvanceCrashGuard(state,false,CurrentUtcFileTime());
+		g_runtime.abnormalExplorerExitTimes=state.abnormalExitTimes;
+		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
 	}
 
 	bool PersistSafetyState(DWORD lastExitCode)
@@ -219,14 +270,18 @@ namespace
 		const LONG result2=RegSetValueExW(key,kCrashCountValue,0,REG_DWORD,
 			reinterpret_cast<const BYTE*>(&g_runtime.abnormalExplorerExitCount),
 			sizeof(g_runtime.abnormalExplorerExitCount));
+		const ULONGLONG windowStart=g_runtime.abnormalExplorerExitCount?
+			g_runtime.abnormalExplorerExitTimes[0]:0;
 		const LONG result3=RegSetValueExW(key,kCrashWindowValue,0,REG_QWORD,
-			reinterpret_cast<const BYTE*>(&g_runtime.abnormalExplorerWindowStart),
-			sizeof(g_runtime.abnormalExplorerWindowStart));
+			reinterpret_cast<const BYTE*>(&windowStart),sizeof(windowStart));
 		const LONG result4=RegSetValueExW(key,kLastExitCodeValue,0,REG_DWORD,
 			reinterpret_cast<const BYTE*>(&lastExitCode),sizeof(lastExitCode));
+		const LONG result5=RegSetValueExW(key,kCrashTimesValue,0,REG_BINARY,
+			reinterpret_cast<const BYTE*>(g_runtime.abnormalExplorerExitTimes.data()),
+			static_cast<DWORD>(sizeof(g_runtime.abnormalExplorerExitTimes)));
 		RegCloseKey(key);
 		return result1==ERROR_SUCCESS && result2==ERROR_SUCCESS &&
-			result3==ERROR_SUCCESS && result4==ERROR_SUCCESS;
+			result3==ERROR_SUCCESS && result4==ERROR_SUCCESS && result5==ERROR_SUCCESS;
 	}
 
 	bool ResetSafetyState()
@@ -235,26 +290,26 @@ namespace
 		if (result!=ERROR_SUCCESS && result!=ERROR_FILE_NOT_FOUND && result!=ERROR_PATH_NOT_FOUND)
 			return false;
 		g_runtime.safetyDisabled=false;
+		g_runtime.abnormalExplorerExitTimes.fill(0);
 		g_runtime.abnormalExplorerExitCount=0;
-		g_runtime.abnormalExplorerWindowStart=0;
 		return true;
 	}
 
-	bool RecordExplorerExitForCrashGuard(bool attemptedActivation, DWORD exitCode)
+	bool RecordExplorerExitForCrashGuard(bool countAbnormalExit, DWORD exitCode)
 	{
 		const ULONGLONG now=CurrentUtcFileTime();
-		CrashGuardState state={g_runtime.abnormalExplorerExitCount,
-			g_runtime.abnormalExplorerWindowStart,g_runtime.safetyDisabled};
-		state=AdvanceCrashGuard(state,attemptedActivation,exitCode,now);
+		CrashGuardState state={g_runtime.abnormalExplorerExitTimes,
+			g_runtime.abnormalExplorerExitCount,g_runtime.safetyDisabled};
+		state=AdvanceCrashGuard(state,countAbnormalExit,now);
+		g_runtime.abnormalExplorerExitTimes=state.abnormalExitTimes;
 		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
-		g_runtime.abnormalExplorerWindowStart=state.windowStart;
 		const bool newlyDisabled=!g_runtime.safetyDisabled && state.disabled;
 		g_runtime.safetyDisabled=state.disabled;
 		if (newlyDisabled)
 		{
 			DebugLog(L"Explorer crash-loop guard disabled injection; native Start remains available");
 		}
-		if (attemptedActivation && !PersistSafetyState(exitCode))
+		if (!PersistSafetyState(exitCode))
 			DebugLog(L"could not persist Explorer crash-loop safety state");
 		return g_runtime.safetyDisabled;
 	}
@@ -709,6 +764,8 @@ namespace
 			g_runtime.explorer.clear();
 			return false;
 		}
+		g_runtime.injectionInputGeneration=g_runtime.inputGeneration;
+		g_runtime.inputStateApplied=false;
 		g_runtime.bootstrapHook = SetWindowsHookExW(WH_GETMESSAGE, g_runtime.hookInject,
 			g_runtime.menuDll, g_runtime.explorer.threadId);
 		if (!g_runtime.bootstrapHook)
@@ -740,6 +797,7 @@ namespace
 	void BeginConnection(bool immediate)
 	{
 		g_runtime.exitPending = false;
+		g_runtime.authenticatedDisarmed = false;
 		g_runtime.activationCommitted = false;
 		g_runtime.replacementPending = false;
 		g_runtime.targetInvalidated = false;
@@ -788,6 +846,65 @@ namespace
 			DebugLog(L"foreground authorization could not be delegated to Explorer");
 		return PostMessageW(g_runtime.explorer.taskbar, g_runtime.menuCommandMessage,
 			static_cast<WPARAM>(command), 0) != FALSE;
+	}
+
+	bool ReconcileInteractiveInput()
+	{
+		const bool transitionMissedDuringInjection=
+			g_runtime.inputGeneration!=g_runtime.injectionInputGeneration;
+		const bool commandRequired=g_runtime.inputStateApplied?
+			g_runtime.appliedInputGeneration!=g_runtime.inputGeneration:
+			(!g_runtime.interactiveInput || transitionMissedDuringInjection);
+		if (!commandRequired)
+		{
+			g_runtime.appliedInputGeneration=g_runtime.inputGeneration;
+			g_runtime.inputStateApplied=true;
+			return true;
+		}
+
+		const A4SMenuCommand command=g_runtime.interactiveInput?
+			A4S_MENU_COMMAND_REFRESH_INPUT:A4S_MENU_COMMAND_SUSPEND_INPUT;
+		if (!SendMenuCommand(command))
+		{
+			g_runtime.targetInvalidated=ExplorerProcessStillAlive();
+			g_runtime.status=A4S_MENU_HOST_STATUS_FAILED;
+			DebugLog(L"latched session/power input transition could not be reconciled");
+			return false;
+		}
+		g_runtime.appliedInputGeneration=g_runtime.inputGeneration;
+		g_runtime.inputStateApplied=true;
+		return true;
+	}
+
+	void AdvanceInteractiveInputGeneration()
+	{
+		g_runtime.interactiveInput=g_runtime.sessionInputInteractive &&
+			g_runtime.powerInputInteractive && !g_runtime.sessionEnding;
+		if (++g_runtime.inputGeneration==0)
+		{
+			// A practically unreachable wrap still cannot alias an applied state.
+			g_runtime.inputGeneration=1;
+			g_runtime.appliedInputGeneration=0;
+			g_runtime.injectionInputGeneration=0;
+			g_runtime.inputStateApplied=false;
+		}
+		if (!g_runtime.interactiveInput)
+			g_runtime.pendingToggle=false;
+		if (g_runtime.status==A4S_MENU_HOST_STATUS_READY &&
+			g_runtime.activationCommitted)
+			ReconcileInteractiveInput();
+	}
+
+	void LatchSessionInput(bool interactive)
+	{
+		g_runtime.sessionInputInteractive=interactive;
+		AdvanceInteractiveInputGeneration();
+	}
+
+	void LatchPowerInput(bool interactive)
+	{
+		g_runtime.powerInputInteractive=interactive;
+		AdvanceInteractiveInputGeneration();
 	}
 
 	void IssueShutdownRequest(bool preserveReplacementIntent = false)
@@ -878,6 +995,7 @@ namespace
 		KillTimer(g_runtime.window, kInjectionTimer);
 		KillTimer(g_runtime.window, kRetryTimer);
 		g_runtime.activationCommitted = true;
+		g_runtime.authenticatedDisarmed = false;
 		if (g_runtime.targetInvalidated)
 		{
 			// Same-process taskbar recreation is a terminal first-half condition.
@@ -903,6 +1021,8 @@ namespace
 			IssueShutdownRequest();
 			return;
 		}
+		if (!ReconcileInteractiveInput())
+			return;
 		if (g_runtime.pendingToggle)
 		{
 			if (SendMenuCommand(A4S_MENU_COMMAND_TOGGLE))
@@ -956,6 +1076,7 @@ namespace
 			}
 			break;
 		case A4S_MENU_DLL_STATUS_DISARMED:
+			g_runtime.authenticatedDisarmed=true;
 			if (g_runtime.initializationPending && !g_runtime.activationCommitted)
 			{
 				// A new host can encounter a product mapping that an earlier host
@@ -1021,9 +1142,14 @@ namespace
 		DWORD exitCode=ERROR_GEN_FAILURE;
 		GetExitCodeProcess(g_runtime.explorer.process.get(),&exitCode);
 		const bool attemptedActivation=g_runtime.initializationPending || g_runtime.activationCommitted;
-		const bool safetyTripped=RecordExplorerExitForCrashGuard(attemptedActivation,exitCode);
+		const bool abnormalExit=attemptedActivation && exitCode!=ERROR_SUCCESS &&
+			!g_runtime.sessionEnding && !g_runtime.authenticatedDisarmed;
+		if (attemptedActivation && exitCode!=ERROR_SUCCESS && !abnormalExit)
+			DebugLog(L"Explorer exit excluded from crash guard by explicit shutdown state");
+		const bool safetyTripped=RecordExplorerExitForCrashGuard(abnormalExit,exitCode);
 		g_runtime.initializationPending = false;
 		g_runtime.activationCommitted = false;
+		g_runtime.inputStateApplied = false;
 		g_runtime.replacementPending = false;
 		g_runtime.targetInvalidated = false;
 		if (g_runtime.exitPending)
@@ -1031,6 +1157,11 @@ namespace
 			ResetConnection();
 			if (g_runtime.window && IsWindow(g_runtime.window))
 				DestroyWindow(g_runtime.window);
+		}
+		else if (g_runtime.sessionEnding)
+		{
+			ResetConnection();
+			g_runtime.status=A4S_MENU_HOST_STATUS_STOPPING;
 		}
 		else if (safetyTripped)
 		{
@@ -1048,6 +1179,8 @@ namespace
 			switch (static_cast<A4SMenuHostControl>(wParam))
 			{
 			case A4S_MENU_HOST_CONTROL_TOGGLE:
+				if (!g_runtime.interactiveInput)
+					return FALSE;
 				if (g_runtime.status == A4S_MENU_HOST_STATUS_READY)
 				{
 					if (SendMenuCommand(A4S_MENU_COMMAND_TOGGLE))
@@ -1180,25 +1313,23 @@ namespace
 		switch (message)
 		{
 		case WM_WTSSESSION_CHANGE:
-			if (g_runtime.status==A4S_MENU_HOST_STATUS_READY)
-			{
-				if (wParam==WTS_SESSION_LOCK || wParam==WTS_SESSION_LOGOFF ||
-					wParam==WTS_REMOTE_DISCONNECT)
-					SendMenuCommand(A4S_MENU_COMMAND_SUSPEND_INPUT);
-				else if (wParam==WTS_SESSION_UNLOCK || wParam==WTS_SESSION_LOGON ||
-					wParam==WTS_REMOTE_CONNECT)
-					SendMenuCommand(A4S_MENU_COMMAND_REFRESH_INPUT);
-			}
+			if (wParam==WTS_SESSION_LOGOFF)
+				g_runtime.sessionEnding=true;
+			else if (wParam==WTS_SESSION_LOGON)
+				g_runtime.sessionEnding=false;
+			if (wParam==WTS_SESSION_LOCK || wParam==WTS_SESSION_LOGOFF ||
+				wParam==WTS_REMOTE_DISCONNECT)
+				LatchSessionInput(false);
+			else if (wParam==WTS_SESSION_UNLOCK || wParam==WTS_SESSION_LOGON ||
+				wParam==WTS_REMOTE_CONNECT)
+				LatchSessionInput(true);
 			return 0;
 		case WM_POWERBROADCAST:
-			if (g_runtime.status==A4S_MENU_HOST_STATUS_READY)
-			{
-				if (wParam==PBT_APMSUSPEND)
-					SendMenuCommand(A4S_MENU_COMMAND_SUSPEND_INPUT);
-				else if (wParam==PBT_APMRESUMEAUTOMATIC ||
-					wParam==PBT_APMRESUMESUSPEND || wParam==PBT_APMRESUMECRITICAL)
-					SendMenuCommand(A4S_MENU_COMMAND_REFRESH_INPUT);
-			}
+			if (wParam==PBT_APMSUSPEND)
+				LatchPowerInput(false);
+			else if (wParam==PBT_APMRESUMEAUTOMATIC ||
+				wParam==PBT_APMRESUMESUSPEND || wParam==PBT_APMRESUMECRITICAL)
+				LatchPowerInput(true);
 			return TRUE;
 		case WM_TIMER:
 			if (wParam == kRetryTimer)
@@ -1265,10 +1396,20 @@ namespace
 				RequestStop();
 			return 0;
 		case WM_QUERYENDSESSION:
+			g_runtime.sessionEnding=true;
+			AdvanceInteractiveInputGeneration();
 			return TRUE;
 		case WM_ENDSESSION:
 			if (wParam)
 				DestroyWindow(window);
+			else
+			{
+				g_runtime.sessionEnding=false;
+				AdvanceInteractiveInputGeneration();
+				if (!ExplorerProcessStillAlive() &&
+					g_runtime.status==A4S_MENU_HOST_STATUS_STOPPING)
+					BeginConnection(true);
+			}
 			return 0;
 		case WM_DESTROY:
 			UnregisterSessionNotifications();

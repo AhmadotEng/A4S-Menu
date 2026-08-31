@@ -7960,6 +7960,34 @@ bool CMenuContainer::CloseStartMenu( void )
 	return true;
 }
 
+#ifdef A4S_PRODUCT
+void CMenuContainer::ForceCloseA4STransients( void )
+{
+	// Lock, logoff, disconnect, and suspend are not ordinary focus changes. Do
+	// not activate the taskbar or restore the previous foreground application;
+	// synchronously hide every product popup and queue its normal close path on
+	// the owning UI thread. Posting avoids deleting a container re-entrantly
+	// while a context-flyout activation is still using it on the current stack.
+	HWND capture=GetCapture();
+	if (capture && IsMenuWindow(capture))
+		ReleaseCapture();
+	CMenuFader::ClearAll();
+	for (std::vector<CMenuContainer*>::reverse_iterator it=s_Menus.rbegin();
+		it!=s_Menus.rend();++it)
+	{
+		CMenuContainer *menu=*it;
+		if (menu->m_pA4SContextResult)
+			*menu->m_pA4SContextResult=0;
+		if (::IsWindow(menu->m_hWnd))
+		{
+			menu->ShowWindow(SW_HIDE);
+			menu->m_bClosing=true;
+			menu->PostMessage(WM_CLOSE);
+		}
+	}
+}
+#endif
+
 void CMenuContainer::HideStartMenu( void )
 {
 	for (std::vector<CMenuContainer*>::iterator it=s_Menus.begin();it!=s_Menus.end();++it)
