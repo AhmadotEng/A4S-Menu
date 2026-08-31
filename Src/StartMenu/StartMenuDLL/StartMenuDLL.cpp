@@ -17,6 +17,7 @@
 #include "IatHookHelper.h"
 #include "dllmain.h"
 #include "A4SMenuProfile.h"
+#include "A4SPerformance.h"
 #ifdef A4S_PRODUCT
 #define A4S_MENU_API_EXPORTS
 #include "../../A4SMenu/Shared/A4SProductApi.h"
@@ -71,6 +72,7 @@ static DWORD g_TaskbarThreadId;
 static bool g_bA4SStartLeftCapture;
 static bool g_bA4SQueuedStartLeftCapture;
 static const LPARAM A4S_MOUSE_TOGGLE=0x4134534D; // "A4SM"
+static const LPARAM A4S_KEYBOARD_TOGGLE=0x4134534B; // "A4SK"
 #ifdef A4S_PRODUCT
 static HHOOK g_A4SKeyboardHook;
 
@@ -3320,6 +3322,7 @@ static void AbortA4SInitialization( HWND hookWindow )
 	// mapping inert; only a fresh mapping in a new Explorer may initialize again.
 	g_TaskBar=NULL;
 	g_WinStartButton=NULL;
+	CloseA4SPerformance();
 	InterlockedExchange(&g_A4SInitializationState,A4S_INIT_FAILED);
 	NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
 #else
@@ -3354,6 +3357,7 @@ static void InitStartMenuDLL( void )
 		NotifyA4SHost(A4S_MENU_DLL_STATUS_FAILED);
 		return;
 	}
+	InitializeA4SPerformance();
 
 	LogToFile(STARTUP_LOG,L"A4SMenu DLL: InitStartMenuDLL");
 #else
@@ -3775,6 +3779,7 @@ static void CleanStartMenuDLL( void )
 			ClearIatHooks();
 		else
 			LogToFile(STARTUP_LOG,L"A4S logical disarm retained manager and IAT state after the bounded worker-stop budget");
+		CloseA4SPerformance();
 #else
 		CloseManagers(false);
 		ClearIatHooks();
@@ -4126,10 +4131,10 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 	return CallNextHookEx(NULL,code,wParam,lParam);
 }
 
-static bool QueueA4SToggle( TaskbarInfo *taskBar, bool mouseGesture )
+static bool QueueA4SToggle( TaskbarInfo *taskBar, LPARAM activationData )
 {
 	return taskBar && PostMessage(taskBar->taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,
-		mouseGesture?A4S_MOUSE_TOGGLE:0)!=FALSE;
+		activationData)!=FALSE;
 }
 
 #ifdef A4S_PRODUCT
@@ -4165,7 +4170,7 @@ static LRESULT CALLBACK HookA4SKeyboard(int code, WPARAM wParam, LPARAM lParam)
 	if (route.claimLoneRelease)
 	{
 		TaskbarInfo *taskBar=FindTaskBarInfoBar(g_TaskBar);
-		if (QueueA4SToggle(taskBar,false))
+		if (QueueA4SToggle(taskBar,A4S_KEYBOARD_TOGGLE))
 			return 1; // Claim only after A4S owns a queued toggle transaction.
 	}
 	return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
@@ -4204,7 +4209,7 @@ static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM l
 			{
 				if (wParam==WM_LBUTTONDOWN || wParam==WM_NCLBUTTONDOWN)
 				{
-					if (QueueA4SToggle(taskBar,true))
+					if (QueueA4SToggle(taskBar,A4S_MOUSE_TOGGLE))
 					{
 						g_bA4SStartLeftCapture=true;
 						return 1;
@@ -4272,7 +4277,15 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 					|| (command==MSG_OPEN && !CMenuContainer::IsMenuOpened())
 #endif
 					))
+				{
+					if (commandData==A4S_MOUSE_TOGGLE)
+						SetA4SActivationSource(A4S_ACTIVATION_START_BUTTON);
+					else if (commandData==A4S_KEYBOARD_TOGGLE)
+						SetA4SActivationSource(A4S_ACTIVATION_WINDOWS_KEY);
+					else
+						SetA4SActivationSource(A4S_ACTIVATION_HOST);
 					ToggleStartMenu(taskBar->taskbarId,commandData!=A4S_MOUSE_TOGGLE);
+				}
 				else if (command==A4S_COMMAND_EXIT
 #ifndef A4S_PRODUCT
 					&& CMenuContainer::CanShowMenu()
@@ -4346,7 +4359,7 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 					{
 						// Queue the same command consumed by the Windows-key and host
 						// paths. If queuing fails, leave the native click untouched.
-						if (QueueA4SToggle(taskBar,true))
+						if (QueueA4SToggle(taskBar,A4S_MOUSE_TOGGLE))
 						{
 							g_bA4SQueuedStartLeftCapture=true;
 							msg->message=WM_NULL;

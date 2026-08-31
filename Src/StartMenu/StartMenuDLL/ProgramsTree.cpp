@@ -16,6 +16,7 @@
 #include "StartMenuDLL.h"
 #include "SettingsUI.h"
 #include "A4SMenuProfile.h"
+#include "A4SPerformance.h"
 #include <uxtheme.h>
 #include <algorithm>
 
@@ -1278,11 +1279,17 @@ void CProgramsTree::CreateFolderItems( HTREEITEM hParent )
 
 void CProgramsTree::CreateItems( void )
 {
+#ifdef A4S_PRODUCT
+	A4SPerformanceScope programsScope(A4S_PERF_PROGRAMS_ENUMERATION);
+#endif
 	TreeView_DeleteAllItems(m_hWnd);
 	CreateFolderItems(NULL);
 	RECT rc;
 	TreeView_GetItemRect(m_hWnd,TreeView_GetRoot(m_hWnd),&rc,TRUE);
 	m_RootX=rc.left;
+#ifdef A4S_PRODUCT
+	programsScope.SetResult(static_cast<UINT32>(TreeView_GetCount(m_hWnd)));
+#endif
 }
 
 void CProgramsTree::RefreshTree( HTREEITEM hParent, const CItemManager::ItemInfo *pSelectItem )

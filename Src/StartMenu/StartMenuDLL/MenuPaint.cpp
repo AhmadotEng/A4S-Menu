@@ -16,6 +16,7 @@
 #include "ProgramsTree.h"
 #include "SettingsUI.h"
 #include "A4SMenuProfile.h"
+#include "A4SPerformance.h"
 #include <vsstyle.h>
 #include <dwmapi.h>
 #include <algorithm>
@@ -3777,7 +3778,13 @@ LRESULT CMenuContainer::OnPaint( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& 
 	}
 
 	if (uMsg!=WM_PRINTCLIENT)
+	{
 		EndPaint(&ps);
+#ifdef A4S_PRODUCT
+		if (!m_bSubMenu)
+			MarkA4SFirstPaint(m_hWnd);
+#endif
+	}
 
 	return 0;
 }

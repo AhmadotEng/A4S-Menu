@@ -59,6 +59,7 @@
 
   <ItemGroup>
     <ClCompile Include="A4SDisabledFeatures.cpp" />
+    <ClCompile Include="..\..\StartMenu\StartMenuDLL\A4SPerformance.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\A4SMenuProfile.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\Accessibility.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\StartButton.cpp" />
@@ -85,6 +86,7 @@
     <ClInclude Include="..\Shared\A4SProductIdentity.h" />
     <ClInclude Include="..\..\StartMenu\StartMenuDLL\A4SProductRuntime.h" />
     <ClInclude Include="..\..\StartMenu\StartMenuDLL\A4SMenuProfile.h" />
+    <ClInclude Include="..\..\StartMenu\StartMenuDLL\A4SPerformance.h" />
     <ClInclude Include="..\..\StartMenu\StartMenuDLL\Accessibility.h" />
     <ClInclude Include="..\..\StartMenu\StartMenuDLL\StartButton.h" />
     <ClInclude Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.h" />

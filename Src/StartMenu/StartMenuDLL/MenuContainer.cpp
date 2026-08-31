@@ -20,6 +20,7 @@
 #endif
 #include "SettingsUI.h"
 #include "A4SMenuProfile.h"
+#include "A4SPerformance.h"
 #include "MetroLinkManager.h"
 #include "ProgramsTree.h"
 #include "dllmain.h"
@@ -2439,6 +2440,10 @@ void CMenuContainer::AddJumpListItems( std::vector<MenuItem> &items )
 // Initialize the m_Items list
 void CMenuContainer::InitItems( void )
 {
+#ifdef A4S_PRODUCT
+	const bool measurePinned=!m_bSubMenu && (m_Options&CONTAINER_PROGRAMS)!=0;
+	A4SPerformanceScope pinnedScope(A4S_PERF_PINNED_ENUMERATION,measurePinned);
+#endif
 	ClearItems(m_Items.begin(),m_Items.end());
 	m_pShellView=NULL;
 	m_RefreshPosted=0;
@@ -2797,6 +2802,9 @@ void CMenuContainer::InitItems( void )
 	m_OriginalCount=(int)m_Items.size();
 	m_OriginalScrollCount=m_ScrollCount;
 	UpdateAccelerators(0,m_OriginalCount);
+#ifdef A4S_PRODUCT
+	pinnedScope.SetResult(measurePinned?static_cast<UINT32>(m_OriginalCount):0U);
+#endif
 }
 
 int CMenuContainer::AddSearchItems( const std::vector<SearchItem> &items, const CString &categoryName, unsigned int categoryHash, int originalCount )
@@ -4852,6 +4860,9 @@ LRESULT CMenuContainer::OnCreate( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 	MenuSkin::TOpacity opacity=(m_bSubMenu?s_Skin.Submenu_opacity:s_Skin.Main_opacity);
 	if (A4SMenuProfile::IsEnabled())
 	{
+#ifdef A4S_PRODUCT
+		A4SPerformanceScope backdropScope(A4S_PERF_BACKDROP_PREPARE);
+#endif
 		SetA4SWindowChrome(m_hWnd,m_bSubMenu,true);
 		ApplyA4SAcrylicMaterial(m_hWnd);
 	}
@@ -4995,6 +5006,9 @@ void CMenuContainer::PrepareA4SFlyoutBackdrop( const RECT &flyoutRect )
 {
 	if (!IsA4SShutdownFlyout() && !IsA4SContextFlyout())
 		return;
+#ifdef A4S_PRODUCT
+	A4SPerformanceScope backdropScope(A4S_PERF_BACKDROP_PREPARE);
+#endif
 
 	DestroyA4SFlyoutBackdrop();
 	CMenuContainer *root=m_pParent;
@@ -6900,6 +6914,10 @@ LRESULT CMenuContainer::OnShowWindow( UINT uMsg, WPARAM wParam, LPARAM lParam, B
 {
 	if (!wParam && !m_bSubMenu && s_UserPicture)
 		s_UserPicture.ShowWindow(SW_HIDE);
+#ifdef A4S_PRODUCT
+	if (!wParam && !m_bSubMenu)
+		MarkA4SWindowHidden(m_hWnd);
+#endif
 	bHandled=FALSE;
 	return 0;
 }
@@ -7919,6 +7937,9 @@ bool CMenuContainer::CloseStartMenu( void )
 {
 	if (s_Menus.empty()) return false;
 	if (!CMenuContainer::CanShowMenu()) return false;
+#ifdef A4S_PRODUCT
+	BeginA4SClosePath();
+#endif
  
 	HWND taskBar=s_TaskBar?s_TaskBar:g_TaskBar;
 	::SetActiveWindow(s_StartButton?s_StartButton:taskBar);
@@ -8231,6 +8252,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		CSettingsLockWrite lock;
 		UpdateDefaultSettings();
 	}
+
+#ifdef A4S_PRODUCT
+	BeginA4SOpenPath();
+#endif
 
 	// initialize all settings
 	bool bErr=false;
@@ -8792,6 +8817,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		if (!pStartMenu->Create(owner,&rc,bAllPrograms?s_SubmenuStyle:dwStyle,WS_EX_TOOLWINDOW|((!bA4SNormalZOrder && (bTopMost || !s_bBehindTaskbar))?WS_EX_TOPMOST:0)|(s_bRTL?WS_EX_LAYOUTRTL:0)))
 		{
 			delete pStartMenu;
+#ifdef A4S_PRODUCT
+			MarkA4SWindowHidden(NULL);
+#endif
 			return NULL;
 		}
 		dummyRc=rc;
@@ -9282,6 +9310,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		pStartMenu->GetWindowRect(&rc);
 		pStartMenu->AnimateMenu(animFlags,speed,rc);
 	}
+#ifdef A4S_PRODUCT
+	MarkA4SWindowVisible(pStartMenu->m_hWnd);
+#endif
 
 	s_bOverrideFirstDown=false;
 	if (pStartMenu->m_SearchIndex>=0 && GetSettingInt(L"SearchBox")==SEARCHBOX_NORMAL && GetSettingBool(L"SearchSelect"))
