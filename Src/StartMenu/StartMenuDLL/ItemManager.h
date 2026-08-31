@@ -185,6 +185,9 @@ public:
 	bool HasNewPrograms( bool bReal ) { return m_bHasNewPrograms[bReal?0:1]; }
 	bool HasNewApps( bool bReal ) { return m_bHasNewApps[bReal?0:1]; }
 	void RefreshInfos( void );
+#ifdef A4S_PRODUCT
+	ULONGLONG GetFolderContentGeneration( void ) const;
+#endif
 
 	void RemoveNewItem( PIDLIST_ABSOLUTE pItem1, PIDLIST_ABSOLUTE pItem2, bool bFolder );
 	void RemoveNewItems( bool bPrograms, bool bMetro );
@@ -286,6 +289,9 @@ private:
 
 	LoadIconData m_LoadIconData[3]; // one for each thread (main, preload, refresh)
 	LoadIconData &GetLoadIconData( void );
+#ifdef A4S_PRODUCT
+	bool TryGetCachedFileMetadata( unsigned int hash, const CString &PATH, int refreshFlags, FILETIME &writeTime, FILETIME &createTime );
+#endif
 
 	class Lock
 	{
@@ -372,6 +378,8 @@ private:
 	volatile TLoadingStage m_LoadingStage;
 #ifdef A4S_PRODUCT
 	volatile LONG m_PendingPidlRefresh;
+	volatile LONGLONG m_FolderContentGeneration;
+	void AdvanceFolderContentGeneration( void );
 #endif
 	int m_LastCacheSave;
 	COLORREF m_OldSysAccentColor;

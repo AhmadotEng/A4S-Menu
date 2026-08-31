@@ -528,6 +528,7 @@ CItemManager::CItemManager( void )
 	m_LoadingStage=LOAD_STOPPED;
 #ifdef A4S_PRODUCT
 	m_PendingPidlRefresh=0;
+	m_FolderContentGeneration=1;
 #endif
 	m_LastCacheSave=0;
 	m_TransientHash=1;
@@ -892,6 +893,41 @@ static bool ComparePidls( PIDLIST_ABSOLUTE pidl1, PIDLIST_ABSOLUTE pidl2 )
 	return memcmp(pidl1,pidl2,size1)==0;
 }
 
+#ifdef A4S_PRODUCT
+bool CItemManager::TryGetCachedFileMetadata( unsigned int hash, const CString &PATH, int refreshFlags, FILETIME &writeTime, FILETIME &createTime )
+{
+	// Only the UI thread is allowed to take the cache-first path. The preload
+	// and directory-watcher thread must continue validating the filesystem so a
+	// changed shortcut eventually invalidates the cached shell metadata.
+	if (GetCurrentThreadId()!=m_MainThreadId || PATH.IsEmpty() ||
+		(refreshFlags&(INFO_VALIDATE_FILE|INFO_REFRESH_NOW)))
+		return false;
+
+	const int requiredFlags=refreshFlags&(INFO_DATA|INFO_ICON);
+	RWLock lock(this,false,RWLOCK_ITEMS);
+	std::multimap<unsigned int,ItemInfo>::const_iterator it=m_ItemInfos.find(hash);
+	for (;it!=m_ItemInfos.end() && it->first==hash;++it)
+	{
+		const ItemInfo &info=it->second;
+		if (wcscmp(PATH,info.PATH)!=0)
+			continue;
+
+		// Fail closed whenever another path is already refreshing this entry, a
+		// replacement PIDL awaits publication, or the requested data is not fully
+		// cached. New and explicitly invalidated entries therefore retain the
+		// original synchronous validation behavior.
+		if (info.bTemp || info.refreshFlags || info.newPidl ||
+			(info.validFlags&requiredFlags)!=requiredFlags)
+			return false;
+
+		writeTime=info.writestamp;
+		createTime=info.createstamp;
+		return true;
+	}
+	return false;
+}
+#endif
+
 const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDLIST_ABSOLUTE pidl, int refreshFlags, TLocation location )
 {
 	Assert(!RWLock::ThreadHasReadLock(RWLOCK_ITEMS));
@@ -921,8 +957,14 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 	}
 
 	FILETIME writeTime={0}, createTime={0};
+#ifdef A4S_PRODUCT
+	const bool bUseCachedFileMetadata=TryGetCachedFileMetadata(hash,PATH,refreshFlags,writeTime,createTime);
+#endif
 	if (!path.IsEmpty())
 	{
+#ifdef A4S_PRODUCT
+		if (!bUseCachedFileMetadata)
+#endif
 		if (!MenuGetFileTimestamp(path,&writeTime,&createTime))
 		{
 			if (refreshFlags&INFO_VALIDATE_FILE)
@@ -959,7 +1001,11 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( IShellItem *pItem, PIDL
 		}
 		else
 		{
+#ifdef A4S_PRODUCT
+			if (!bUseCachedFileMetadata && !pInfo->packagePath.IsEmpty())
+#else
 			if (!pInfo->packagePath.IsEmpty())
+#endif
 				MenuGetFileTimestamp(pInfo->packagePath,&writeTime,&createTime);
 			if (CompareFileTime(&pInfo->writestamp,&writeTime)!=0)
 			{
@@ -1021,6 +1067,10 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 	unsigned int hash=CalcFNVHash(PATH);
 
 	FILETIME writeTime={0}, createTime={0};
+#ifdef A4S_PRODUCT
+	const bool bUseCachedFileMetadata=TryGetCachedFileMetadata(hash,PATH,refreshFlags,writeTime,createTime);
+	if (!bUseCachedFileMetadata)
+#endif
 	if (!MenuGetFileTimestamp(path,&writeTime,&createTime))
 	{
 		if (refreshFlags&INFO_VALIDATE_FILE)
@@ -1058,7 +1108,11 @@ const CItemManager::ItemInfo *CItemManager::GetItemInfo( CString path, int refre
 		}
 		else
 		{
+#ifdef A4S_PRODUCT
+			if (!bUseCachedFileMetadata && !pInfo->packagePath.IsEmpty())
+#else
 			if (!pInfo->packagePath.IsEmpty())
+#endif
 				MenuGetFileTimestamp(pInfo->packagePath,&writeTime,&createTime);
 			if (CompareFileTime(&pInfo->writestamp,&writeTime)!=0)
 			{
@@ -2217,6 +2271,30 @@ void CItemManager::RefreshInfos( void )
 #endif
 }
 
+#ifdef A4S_PRODUCT
+ULONGLONG CItemManager::GetFolderContentGeneration( void ) const
+{
+	return static_cast<ULONGLONG>(InterlockedCompareExchange64(
+		const_cast<volatile LONGLONG*>(&m_FolderContentGeneration),0,0));
+}
+
+void CItemManager::AdvanceFolderContentGeneration( void )
+{
+	LONGLONG current=InterlockedCompareExchange64(&m_FolderContentGeneration,0,0);
+	while (1)
+	{
+		// Zero is reserved for an uninitialized snapshot. Advance monotonically
+		// for the practical lifetime of Explorer and skip zero on counter wrap.
+		const ULONGLONG value=static_cast<ULONGLONG>(current);
+		const LONGLONG next=static_cast<LONGLONG>(value==~0ULL?1:value+1);
+		const LONGLONG observed=InterlockedCompareExchange64(&m_FolderContentGeneration,next,current);
+		if (observed==current)
+			return;
+		current=observed;
+	}
+}
+#endif
+
 HBITMAP CItemManager::BitmapFromIcon( HICON hIcon, int iconSize, bool bDestroyIcon )
 {
 	if (!hIcon) return NULL;
@@ -2945,6 +3023,11 @@ static struct
 };
 
 const int NUM_WATCHED_DIRS=7;
+#ifdef A4S_PRODUCT
+// Recursive notifications for both Start Menu roots, the classic pinned root,
+// and the packaged-app link root can change rows in the A4S popup.
+const DWORD A4S_MENU_CONTENT_DIR_MASK=(1U<<0)|(1U<<1)|(1U<<5)|(1U<<6);
+#endif
 
 void CItemManager::PreloadItemsThread( void )
 {
@@ -3064,6 +3147,10 @@ void CItemManager::PreloadItemsThread( void )
 
 		int dir=wait-WAIT_OBJECT_0;
 		dirMask=dirMasks[dir];
+#ifdef A4S_PRODUCT
+		if (dirMask&A4S_MENU_CONTENT_DIR_MASK)
+			AdvanceFolderContentGeneration();
+#endif
 
 		if (!FindNextChangeNotification(handles[dir]))
 			ResetEvent(handles[dir]); // so we don't wake on this event again
