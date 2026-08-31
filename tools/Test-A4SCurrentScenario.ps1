@@ -14,6 +14,8 @@ param(
     [int] $ExpectedPrimaryScalePercent,
     [ValidateSet('fullscreen', 'windowed')]
     [string] $ExpectedForegroundMode,
+    [ValidateRange(0, 60)]
+    [int] $ForegroundObservationDelaySeconds = 0,
     [ValidateSet('absent', 'resident')]
     [string] $ExpectedHostPresence,
     [ValidateRange(0, 65535)]
@@ -117,17 +119,23 @@ public static class A4SScenarioNative
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out RECT rect);
 
+    [DllImport("user32.dll", SetLastError = true)]
+    public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+
+    [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFOEX info);
 
     [DllImport("user32.dll")]
     private static extern uint GetDpiForWindow(IntPtr window);
 
     [DllImport("dwmapi.dll")]
-    public static extern int DwmFlush();
+    private static extern int DwmFlush();
 
     public static IntPtr HostWindow()
     {
@@ -159,7 +167,7 @@ public static class A4SScenarioNative
         return value;
     }
 
-    public static IntPtr[] VisibleMenuWindows()
+    public static IntPtr[] VisibleMenuWindows(uint ownerProcessId)
     {
         List<IntPtr> matches = new List<IntPtr>();
         if (!EnumWindows(delegate(IntPtr window, IntPtr parameter)
@@ -168,7 +176,12 @@ public static class A4SScenarioNative
             StringBuilder name = new StringBuilder(256);
             if (GetClassNameW(window, name, name.Capacity) > 0 &&
                 String.Equals(name.ToString(), "A4SMenu.CMenuContainer", StringComparison.Ordinal))
-                matches.Add(window);
+            {
+                uint processId;
+                GetWindowThreadProcessId(window, out processId);
+                if (processId == ownerProcessId)
+                    matches.Add(window);
+            }
             return true;
         }, IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumWindows failed");
@@ -185,7 +198,7 @@ public static class A4SScenarioNative
         info.Size = (uint)Marshal.SizeOf(typeof(MONITORINFOEX));
         if (monitor == IntPtr.Zero || !GetMonitorInfoW(monitor, ref info))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "GetMonitorInfo failed");
-        uint dpi = 96;
+        uint dpi = 0;
         try { dpi = GetDpiForWindow(window); }
         catch (EntryPointNotFoundException) { }
         return new WindowRecord {
@@ -202,15 +215,22 @@ public static class A4SScenarioNative
             Dpi = dpi
         };
     }
+
+    public static void FlushDwmChecked()
+    {
+        int result = DwmFlush();
+        if (result < 0)
+            Marshal.ThrowExceptionForHR(result);
+    }
 }
 '@
 }
 
 function Wait-MenuState {
-    param([bool] $Visible, [int] $TimeoutMilliseconds = 5000)
+    param([bool] $Visible, [Parameter(Mandatory)][uint32] $OwnerProcessId, [int] $TimeoutMilliseconds = 5000)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
-        $windows = @([A4SScenarioNative]::VisibleMenuWindows())
+        $windows = @([A4SScenarioNative]::VisibleMenuWindows($OwnerProcessId))
         if (($Visible -and $windows.Count -gt 0) -or (-not $Visible -and $windows.Count -eq 0)) {
             return $windows
         }
@@ -235,6 +255,10 @@ if ($CompareWithScenario) {
     $comparisonEntry = $comparisonEntry[0]
 }
 
+if ($ForegroundObservationDelaySeconds -gt 0) {
+    Write-Host "Foreground observation begins in $ForegroundObservationDelaySeconds seconds. Activate the application state that this scenario should record."
+    Start-Sleep -Seconds $ForegroundObservationDelaySeconds
+}
 $snapshotJson = & (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1')
 $snapshot = $snapshotJson | ConvertFrom-Json
 $assertions = [Collections.Generic.List[object]]::new()
@@ -248,7 +272,7 @@ if ($PSBoundParameters.ContainsKey('ExpectedMonitorCount')) {
     Add-Assertion 'monitor-count' $ExpectedMonitorCount @($snapshot.desktop.monitors).Count (@($snapshot.desktop.monitors).Count -eq $ExpectedMonitorCount)
 }
 if ($ExpectedTaskbarAlignment) {
-    Add-Assertion 'taskbar-alignment' $ExpectedTaskbarAlignment $snapshot.desktop.taskbar.alignmentRegistryHint ($snapshot.desktop.taskbar.alignmentRegistryHint -eq $ExpectedTaskbarAlignment)
+    Add-Assertion 'taskbar-alignment-registry-hint' $ExpectedTaskbarAlignment $snapshot.desktop.taskbar.alignmentRegistryHint ($snapshot.desktop.taskbar.alignmentRegistryHint -eq $ExpectedTaskbarAlignment)
 }
 if ($ExpectedTaskbarEdge) {
     Add-Assertion 'taskbar-edge' $ExpectedTaskbarEdge $snapshot.desktop.taskbar.edge ($snapshot.desktop.taskbar.edge -eq $ExpectedTaskbarEdge)
@@ -258,8 +282,16 @@ if ($PSBoundParameters.ContainsKey('ExpectedPrimaryScalePercent')) {
     Add-Assertion 'primary-scale-percent' $ExpectedPrimaryScalePercent $primaryMonitor.scalePercent ([Math]::Abs([double]$primaryMonitor.scalePercent - $ExpectedPrimaryScalePercent) -lt 0.01)
 }
 if ($ExpectedForegroundMode) {
-    $actualForegroundMode = if ($snapshot.desktop.foreground.coversMonitorBounds) { 'fullscreen' } else { 'windowed' }
-    Add-Assertion 'foreground-mode' $ExpectedForegroundMode $actualForegroundMode ($actualForegroundMode -eq $ExpectedForegroundMode)
+    $actualForegroundMode = if (-not $snapshot.desktop.foreground) {
+        'unavailable'
+    } elseif ($null -eq $snapshot.desktop.foreground.fullscreenGeometryCandidate) {
+        'unavailable'
+    } elseif ($snapshot.desktop.foreground.fullscreenGeometryCandidate) {
+        'fullscreen'
+    } else {
+        'windowed'
+    }
+    Add-Assertion 'foreground-mode-geometry-heuristic' $ExpectedForegroundMode $actualForegroundMode ($actualForegroundMode -eq $ExpectedForegroundMode)
 }
 if ($ExpectedHostPresence) {
     $actualHostPresence = if ($snapshot.product.residentHost) { 'resident' } else { 'absent' }
@@ -269,8 +301,10 @@ if ($PSBoundParameters.ContainsKey('ExpectedSessionId')) {
     Add-Assertion 'explorer-session-id' $ExpectedSessionId $snapshot.explorer.sessionId ($snapshot.explorer.sessionId -eq $ExpectedSessionId)
 }
 if ($ExpectedExplorerRelationship) {
-    $actualExplorerRelationship = if ($snapshot.explorer.pid -eq $comparisonEntry.environment.explorer.pid) { 'same' } else { 'changed' }
-    Add-Assertion 'explorer-pid-relationship' $ExpectedExplorerRelationship $actualExplorerRelationship ($actualExplorerRelationship -eq $ExpectedExplorerRelationship)
+    $sameExplorerIdentity = $snapshot.explorer.pid -eq $comparisonEntry.environment.explorer.pid -and
+        $snapshot.explorer.startTimeUtc -eq $comparisonEntry.environment.explorer.startTimeUtc
+    $actualExplorerRelationship = if ($sameExplorerIdentity) { 'same' } else { 'changed' }
+    Add-Assertion 'explorer-process-identity-relationship' $ExpectedExplorerRelationship $actualExplorerRelationship ($actualExplorerRelationship -eq $ExpectedExplorerRelationship)
 }
 if ($ExpectedSessionRelationship) {
     $actualSessionRelationship = if ($snapshot.explorer.sessionId -eq $comparisonEntry.environment.explorer.sessionId) { 'same' } else { 'changed' }
@@ -279,36 +313,73 @@ if ($ExpectedSessionRelationship) {
 
 $automation = $null
 if ($AllowMenuAutomation) {
+    [uint32]$explorerProcessId = $snapshot.explorer.pid
+    if (-not $explorerProcessId) { throw 'The snapshot did not identify the taskbar Explorer process.' }
     $hostWindow = [A4SScenarioNative]::HostWindow()
     if ($hostWindow -eq [IntPtr]::Zero) { throw 'No resident A4SMenuHost was found. The scenario tool never starts or injects it.' }
-    if ([A4SScenarioNative]::HostStatus($hostWindow) -ne 3) { throw 'A4SMenuHost is not READY.' }
-    if (@([A4SScenarioNative]::VisibleMenuWindows()).Count -ne 0) { throw 'Close the menu before running scenario automation.' }
-
-    [A4SScenarioNative]::Toggle($hostWindow)
-    $visibleWindows = @(Wait-MenuState -Visible $true)
-    [void][A4SScenarioNative]::DwmFlush()
-    $menu = [A4SScenarioNative]::Describe([IntPtr]$visibleWindows[0])
-    $dismissedManually = $false
-    if ($ObserveManualFocusDismissal) {
-        Write-Host "A4S menu is open. Focus another application within $DismissalTimeoutSeconds seconds; this tool will only observe whether the menu dismisses."
-        try {
-            [void](Wait-MenuState -Visible $false -TimeoutMilliseconds ($DismissalTimeoutSeconds * 1000))
-            $dismissedManually = $true
-        } catch {
-            if (@([A4SScenarioNative]::VisibleMenuWindows()).Count -gt 0) {
-                [A4SScenarioNative]::Toggle($hostWindow)
-                [void](Wait-MenuState -Visible $false)
-            }
-            throw
+    [uint32]$residentHostProcessId = 0
+    [void][A4SScenarioNative]::GetWindowThreadProcessId($hostWindow, [ref]$residentHostProcessId)
+    if (-not $residentHostProcessId) { throw 'Could not resolve the resident A4S host process.' }
+    $residentHostProcess = [Diagnostics.Process]::GetProcessById([int]$residentHostProcessId)
+    try {
+        if ($residentHostProcess.SessionId -ne $snapshot.observerSessionId -or $snapshot.explorer.sessionId -ne $snapshot.observerSessionId) {
+            throw "The observer, Explorer, and A4S host must share one interactive session. observer=$($snapshot.observerSessionId) explorer=$($snapshot.explorer.sessionId) host=$($residentHostProcess.SessionId)."
         }
-    } else {
+    } finally {
+        $residentHostProcess.Dispose()
+    }
+    if ([A4SScenarioNative]::HostStatus($hostWindow) -ne 3) { throw 'A4SMenuHost is not READY.' }
+    if (@($snapshot.product.mappedDllPaths).Count -ne 1) { throw "Expected exactly one A4SMenu.dll mapping in taskbar Explorer PID $explorerProcessId." }
+    if (@([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId)).Count -ne 0) { throw 'Close the menu before running scenario automation.' }
+
+    $menu = $null
+    $dismissedManually = $false
+    $focusAfterDismissal = $null
+    try {
         [A4SScenarioNative]::Toggle($hostWindow)
-        [void](Wait-MenuState -Visible $false)
+        $visibleWindows = @(Wait-MenuState -Visible $true -OwnerProcessId $explorerProcessId)
+        if ($visibleWindows.Count -ne 1) { throw "Open/close automation found $($visibleWindows.Count) visible A4S menu windows; expected one." }
+        [A4SScenarioNative]::FlushDwmChecked()
+        $menuWindow = [IntPtr]$visibleWindows[0]
+        if ([A4SScenarioNative]::GetForegroundWindow() -ne $menuWindow) { throw 'The opened A4S menu was not the foreground top-level window.' }
+        $menu = [A4SScenarioNative]::Describe($menuWindow)
+        if ($menu.Dpi -eq 0) { throw 'GetDpiForWindow returned zero for the A4S menu; DPI evidence is unavailable.' }
+        if ($ObserveManualFocusDismissal) {
+            Write-Host "A4S menu is open. Focus another application within $DismissalTimeoutSeconds seconds; this tool will only observe whether the menu dismisses."
+            [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId -TimeoutMilliseconds ($DismissalTimeoutSeconds * 1000))
+            $newForeground = [A4SScenarioNative]::GetForegroundWindow()
+            [uint32]$newForegroundProcessId = 0
+            if ($newForeground -ne [IntPtr]::Zero) { [void][A4SScenarioNative]::GetWindowThreadProcessId($newForeground, [ref]$newForegroundProcessId) }
+            $focusAfterDismissal = [ordered]@{
+                hwnd = if ($newForeground -ne [IntPtr]::Zero) { '0x{0:X}' -f $newForeground.ToInt64() } else { $null }
+                pid = $newForegroundProcessId
+                changedFromMenu = $newForeground -ne [IntPtr]::Zero -and $newForeground -ne $menuWindow
+                changedToAnotherProcess = $newForegroundProcessId -ne 0 -and $newForegroundProcessId -ne $explorerProcessId
+            }
+            if (-not $focusAfterDismissal.changedFromMenu -or -not $focusAfterDismissal.changedToAnotherProcess) {
+                throw 'The menu disappeared, but focus in a non-Explorer application was not observed; manual application-focus dismissal was not proved.'
+            }
+            $dismissedManually = $true
+        } else {
+            [A4SScenarioNative]::Toggle($hostWindow)
+            [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId)
+        }
+    } finally {
+        $leftVisible = @([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId))
+        if ($leftVisible.Count -gt 0) {
+            try {
+                [A4SScenarioNative]::Toggle($hostWindow)
+                [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId)
+            } catch {
+                Write-Warning "Could not confirm menu cleanup after scenario automation: $($_.Exception.Message)"
+            }
+        }
     }
     $automation = [ordered]@{
         openClosePassed = $true
         manualFocusDismissalRequested = [bool]$ObserveManualFocusDismissal
         manualFocusDismissalPassed = if ($ObserveManualFocusDismissal) { $dismissedManually } else { $null }
+        focusAfterDismissal = $focusAfterDismissal
         menuWindow = [ordered]@{
             hwnd = ('0x{0:X}' -f $menu.Handle)
             rect = [ordered]@{ left = $menu.Left; top = $menu.Top; width = $menu.Width; height = $menu.Height }

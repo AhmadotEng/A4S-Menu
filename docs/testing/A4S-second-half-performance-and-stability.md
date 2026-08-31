@@ -11,7 +11,10 @@ or sign the user out.
 `Get-A4SPerformanceSnapshot.ps1` is read-only. The two tools that visibly open
 the menu refuse to run without `-AllowMenuAutomation`, require an already
 resident host in `READY`, and send commands directly to that host. They cannot
-start a missing host and therefore cannot inject Explorer accidentally.
+start a missing host and therefore cannot inject Explorer accidentally. Their
+window observations are restricted to `A4SMenu.CMenuContainer` windows owned
+by the taskbar Explorer process, and failure cleanup uses the normal toggle
+path to close a menu that the test opened.
 
 Environment transitions remain manual:
 
@@ -33,17 +36,21 @@ Immediately after a fresh Explorer start, before launching A4SMenuHost, run:
     -OutputPath .\build\test-results\A4S-pre-injection.json
 ```
 
-The clean-state switch proves that the snapshot has neither a mapped
-`A4SMenu.dll` nor a resident A4S host. After starting the exact staged host and
+The clean-state switch rejects a snapshot if it observes either a mapped
+`A4SMenu.dll` or a resident A4S host at capture time. After starting the exact staged host and
 waiting for `READY`, supply that file to the performance probe. It requires the
 same Explorer PID, so the memory delta is a true same-process before/after
-comparison rather than a comparison between unrelated Explorer instances.
+comparison rather than a comparison between unrelated Explorer instances. It
+remains a process-wide correlation: unrelated Explorer allocations between the
+two snapshots are part of the delta.
 
 The snapshot also records:
 
 - exact staged binary paths and SHA-256 hashes;
 - taskbar Explorer and resident-host process metrics and I/O counters;
-- all monitor bounds, work areas, DPI, and scaling;
+- all monitor bounds, work areas, and monitor scale from
+  `GetScaleFactorForMonitor`, with effective DPI derived from that scale (an
+  unavailable value is recorded as unavailable, never invented as 96);
 - taskbar edge and the Windows 11 alignment registry hint;
 - foreground-window geometry and session/process identity.
 
@@ -62,40 +69,67 @@ Close the menu and run the performance probe only after the host reports
     -EnforceTargets
 ```
 
-The probe sends the resident-host control message directly. It does not include
-the startup cost of a transient `A4SMenuHost.exe --toggle` process. Each open
-sample measures command dispatch to the first visible
-`A4SMenu.CMenuContainer`, then calls `DwmFlush` and records the presentation
-boundary. Close uses the corresponding hidden-window boundary and `DwmFlush`.
+The probe verifies that the resident host and DLL are the exact files in the
+selected product directory, and that the observer, host, and taskbar
+Explorer share one interactive session. It then sends the resident-host control
+message directly. It does not include the startup cost of a transient
+`A4SMenuHost.exe --toggle` process. Each open sample measures command dispatch
+until an Explorer-owned `A4SMenu.CMenuContainer` is observed visible, then
+calls `DwmFlush` from the observer process. Close records the corresponding
+hidden-window observation and observer-process `DwmFlush` boundary.
 
-The current external gates are:
+These are external proxies, not first/last-presented-frame markers.
+`IsWindowVisible` can change before composition, and `DwmFlush` in PowerShell
+does not prove which frame contained another process's window update. The 1 ms
+poll also inherits scheduler granularity and can create conservative timing
+failures. Product-side QPC/ETW markers and a presentation trace are required
+for authoritative frame claims.
 
-- warm-open p95 at or below 50 ms;
-- close p95 within one refresh interval reported by the menu's display;
+The staged product directory is the default. To qualify an installed payload,
+pass its directory explicitly, for example
+`-ProductDirectory (Join-Path $env:LOCALAPPDATA 'A4SMenu')`. The report records
+the exact host and DLL SHA-256 hashes.
+
+The current external proxy gates are:
+
+- warm-open observer/DWM proxy p95 at or below 50 ms;
+- close observer/DWM proxy p95 within one nominal refresh interval reported by
+  the menu's display;
 - resident host idle CPU at or below 0.05% of total machine capacity;
-- no observed Explorer read/write operations or bytes during every warm open.
+- no change to Explorer's process-wide read/write I/O counters during every
+  warm open.
 
-The report includes p50, p95, and maximum timings, every raw sample, host and
-Explorer IDs, same-process memory deltas, and process-wide I/O deltas. The JSON
+The report includes p50, p95, and maximum timings, every raw sample, exact
+binary paths, host and Explorer IDs, same-process memory deltas, and
+process-wide I/O-counter deltas. The JSON
 evidence is written before an enforced target failure is raised.
+
+The I/O-counter gate is not a physical-disk proof. Unrelated Explorer work can
+increment it (false positive), while cache hits, paging, and memory-mapped I/O
+can escape it (false negative). Use WPR/ETW file-I/O events and stacks for the
+actual "no warm disk access" acceptance claim.
 
 `-OperatorAttestsFirstOpenIsCold` labels the first sample as an operator
 attestation; the tool cannot prove that no menu was opened earlier in that DLL
 lifetime. A defensible cold run therefore needs the clean snapshot, a fresh
 host, and the operator to run the probe before any other opening. Warm results
-exclude that first sample.
+exclude that first sample and still contain exactly `-WarmSamples` samples. If
+the switch is omitted, the tool performs one unmeasured open/close warm-up
+before collecting exactly `-WarmSamples` warm samples.
 
-Pop-in evidence consists of a PNG taken just after the first presented window
-and another after the settle delay. Equal PNG hashes prove pixel stability for
-that sample. Different hashes are inconclusive because acrylic, wallpaper,
-the cursor, and other desktop animation can also alter pixels; compare the two
-images visually.
+Pop-in evidence consists of a PNG sampled after the first observer-process
+`DwmFlush` and another after the settle delay. Equal PNG hashes show pixel
+equality for those two sampled captures only; the first capture can miss
+shorter-lived pop-in. Different hashes are inconclusive because acrylic,
+wallpaper, the cursor, and other desktop animation can also alter pixels;
+compare the two images visually.
 
 ## Measurement boundaries
 
-External observation can prove host-toggle latency, display-frame close,
-host idle CPU, same-Explorer memory growth, and process-wide Explorer I/O. It
-cannot accurately attribute these internal phases:
+External observation can measure host-toggle/window-visibility proxies, host
+idle CPU, same-Explorer memory growth, and process-wide Explorer I/O counters.
+It cannot prove exact presented-frame latency, physical disk quiet, or
+accurately attribute these internal phases:
 
 - pinned-item enumeration;
 - decoded-icon loading versus cache hits;
@@ -105,19 +139,20 @@ cannot accurately attribute these internal phases:
 - a lone Windows-key event to first paint;
 - repaint rectangles or the exact first fully populated frame.
 
-Those require product markers. The recommended implementation is an A4S-only
-ETW/TraceLogging provider that is dormant when no trace session listens and
-emits QPC-correlated events for activation request/source, open-path begin,
-pinned enumeration begin/end and count, icon load begin/end and cache hit,
-acrylic prepare begin/end, window visible, first paint complete, Programs
-enumeration begin/end, search initialization begin/end, close requested, and
-window hidden. WPR file-I/O stacks can then distinguish A4S activity from
-unrelated Explorer background work. This avoids adding a test-only export or
-shared-memory ABI to the installed DLL.
+The product now includes the A4S-only `A4SMenu.Runtime` TraceLogging provider,
+which is dormant when no trace session listens. It emits correlated operation
+events for activation source, open/close paths, pinned and Programs
+enumeration, icon load/cache result, backdrop preparation, visibility, first
+paint, search initialization, preload, and hiding. The external PowerShell
+report does not start or parse that provider. An explicit WPR/ETW capture and
+analysis pass is still required; file-I/O and presentation stacks can then
+distinguish A4S activity from unrelated Explorer background work without a
+test-only export or shared-memory ABI in the installed DLL.
 
 Until those markers exist, the report labels Explorer CPU and I/O as
 process-wide correlation, not A4S attribution. It must not be used to claim
-that internal enumeration, icon, acrylic, or search targets passed.
+that internal enumeration, icon, acrylic, search, exact frame, or physical-disk
+targets passed.
 
 ## Record the stability matrix
 
@@ -136,9 +171,9 @@ open/close cycle without changing that environment:
 
 To test normal Start-menu focus dismissal, add
 `-ObserveManualFocusDismissal`. The tool opens the menu and asks the tester to
-focus another application; it only observes that the menu disappears. If a
-test fails, it closes a still-visible menu through the normal toggle path and
-preserves the evidence.
+focus another application. A pass requires both menu disappearance and a new
+foreground window owned by a non-Explorer process. If a test fails, it attempts
+to close a still-visible menu through the normal toggle path.
 
 Fullscreen and recovery runs can assert the state that the tester prepared
 without causing the transition. For example, record a pre-lock entry and then
@@ -164,6 +199,23 @@ Use `-ExpectedForegroundMode fullscreen` for a prepared fullscreen state,
 `\\.\DISPLAY2`, and `-ExpectedMenuScalePercent` to prove the menu's actual
 window DPI after opening. These are assertions only; the tool does not switch
 applications, displays, taskbars, or sessions.
+
+Launching a command from a terminal normally makes that terminal foreground.
+For a fullscreen/windowed foreground assertion, add (for example)
+`-ForegroundObservationDelaySeconds 5` and reactivate the target application
+during the countdown. The snapshot occurs only after that delay.
+
+Fullscreen classification is intentionally named a geometry heuristic in the
+evidence. It requires a non-shell, non-minimized foreground window whose bounds
+cover one monitor within two pixels; it does not distinguish exclusive
+fullscreen from a borderless window. Pair it with application-specific or
+present-mode evidence. Taskbar alignment is likewise the Windows 11 registry
+hint, not a pixel-level observation of the Start button.
+
+`-ExpectedHostPresence resident` checks only for the host window. Recovery
+qualification must also use `-AllowMenuAutomation`, which requires `READY`, an
+A4S DLL mapping in the taskbar Explorer process, shared session identity, and a
+successful foreground open/close cycle.
 
 Entries append to `build/test-results/A4S-stability-matrix.json` by default.
 Use a unique `-ScenarioName` and optional `-Notes` for every run.
@@ -195,10 +247,14 @@ Run the non-injecting tool gate after edits:
 .\tools\Test-A4SPerformanceTools.ps1
 ```
 
-It parses every performance/stability script, compiles each embedded native
-helper, verifies explicit menu-automation gates, rejects a list of destructive
-system commands, and smoke-tests only the read-only environment snapshot. It
-does not open the menu or alter Explorer.
+It parses every performance/stability script, compiles a freshly renamed copy
+of each embedded native helper, verifies `RECT`, `IO_COUNTERS`,
+`MONITORINFOEX`, and `DEVMODE` byte sizes, checks explicit automation gates and
+Explorer-owner filtering, rejects a curated list of destructive commands and
+native APIs, and smoke-tests only the read-only environment snapshot. The
+denylist is defense in depth rather than proof about arbitrary future code; a
+human review remains required. The gate does not open the menu or alter
+Explorer.
 
 ## Current qualification status
 

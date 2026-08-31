@@ -20,7 +20,6 @@ using System.Text;
 
 public static class A4SObservationNative
 {
-    private delegate bool EnumWindowsProc(IntPtr window, IntPtr parameter);
     private delegate bool EnumMonitorsProc(IntPtr monitor, IntPtr hdc, ref RECT rect, IntPtr parameter);
 
     [StructLayout(LayoutKind.Sequential)]
@@ -68,6 +67,8 @@ public static class A4SObservationNative
         public bool Primary;
         public uint DpiX;
         public uint DpiY;
+        public bool DpiAvailable;
+        public uint ScalePercent;
     }
 
     public sealed class IoRecord
@@ -89,17 +90,23 @@ public static class A4SObservationNative
     [DllImport("user32.dll", SetLastError = true)]
     private static extern bool GetWindowRect(IntPtr window, out RECT rect);
 
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern int GetClassNameW(IntPtr window, StringBuilder className, int count);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(IntPtr window);
+
     [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
 
     [DllImport("user32.dll")]
     private static extern bool EnumDisplayMonitors(IntPtr hdc, IntPtr clip, EnumMonitorsProc callback, IntPtr parameter);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFOEX info);
 
     [DllImport("shcore.dll")]
-    private static extern int GetDpiForMonitor(IntPtr monitor, int dpiType, out uint dpiX, out uint dpiY);
+    private static extern int GetScaleFactorForMonitor(IntPtr monitor, out int scalePercent);
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
@@ -112,6 +119,19 @@ public static class A4SObservationNative
 
     [DllImport("user32.dll")]
     public static extern IntPtr GetForegroundWindow();
+
+    public static string WindowClass(IntPtr window)
+    {
+        StringBuilder name = new StringBuilder(256);
+        if (window != IntPtr.Zero && GetClassNameW(window, name, name.Capacity) > 0)
+            return name.ToString();
+        return String.Empty;
+    }
+
+    public static bool WindowIsMinimized(IntPtr window)
+    {
+        return window != IntPtr.Zero && IsIconic(window);
+    }
 
     public static RECT WindowRect(IntPtr window)
     {
@@ -131,10 +151,22 @@ public static class A4SObservationNative
                 info.Size = (uint)Marshal.SizeOf(typeof(MONITORINFOEX));
                 if (!GetMonitorInfoW(monitor, ref info))
                     return true;
-                uint dpiX = 96, dpiY = 96;
-                try { GetDpiForMonitor(monitor, 0, out dpiX, out dpiY); }
+                uint dpiX = 0, dpiY = 0, scalePercent = 0;
+                bool dpiAvailable = false;
+                try
+                {
+                    int reportedScale;
+                    int result = GetScaleFactorForMonitor(monitor, out reportedScale);
+                    dpiAvailable = result == 0 && reportedScale >= 100 && reportedScale <= 500;
+                    if (dpiAvailable)
+                    {
+                        scalePercent = (uint)reportedScale;
+                        dpiX = dpiY = (uint)Math.Round(96.0 * reportedScale / 100.0);
+                    }
+                }
                 catch (DllNotFoundException) { }
                 catch (EntryPointNotFoundException) { }
+                if (!dpiAvailable) { dpiX = 0; dpiY = 0; }
                 records.Add(new MonitorRecord {
                     DeviceName = info.DeviceName,
                     Left = info.Monitor.Left,
@@ -147,7 +179,9 @@ public static class A4SObservationNative
                     WorkHeight = info.Work.Bottom - info.Work.Top,
                     Primary = (info.Flags & 1) != 0,
                     DpiX = dpiX,
-                    DpiY = dpiY
+                    DpiY = dpiY,
+                    DpiAvailable = dpiAvailable,
+                    ScalePercent = scalePercent
                 });
                 return true;
             }, IntPtr.Zero))
@@ -278,7 +312,21 @@ $foregroundRecord = $null
 if ($foregroundWindow -ne [IntPtr]::Zero) {
     [uint32]$foregroundProcessId = 0
     [void][A4SObservationNative]::GetWindowThreadProcessId($foregroundWindow, [ref]$foregroundProcessId)
-    $foregroundRect = [A4SObservationNative]::WindowRect($foregroundWindow)
+    $foregroundRect = $null
+    try { $foregroundRect = [A4SObservationNative]::WindowRect($foregroundWindow) } catch {
+        # Foreground windows can disappear between GetForegroundWindow and
+        # GetWindowRect. Preserve an explicit unavailable classification rather
+        # than failing the entire environment snapshot or guessing "windowed".
+        $foregroundRecord = [ordered]@{
+            hwnd = ('0x{0:X}' -f $foregroundWindow.ToInt64())
+            pid = $foregroundProcessId
+            fullscreenGeometryCandidate = $null
+            classification = 'unavailable-window-changed'
+        }
+    }
+    if ($null -ne $foregroundRect) {
+    $foregroundClass = [A4SObservationNative]::WindowClass($foregroundWindow)
+    $foregroundMinimized = [A4SObservationNative]::WindowIsMinimized($foregroundWindow)
     $foregroundMonitor = @($monitorRecords | Sort-Object -Descending {
         $overlapWidth = [Math]::Max(0, [Math]::Min($foregroundRect.Right, $_.Left + $_.Width) - [Math]::Max($foregroundRect.Left, $_.Left))
         $overlapHeight = [Math]::Max(0, [Math]::Min($foregroundRect.Bottom, $_.Top + $_.Height) - [Math]::Max($foregroundRect.Top, $_.Top))
@@ -289,12 +337,34 @@ if ($foregroundWindow -ne [IntPtr]::Zero) {
         [Math]::Abs($foregroundRect.Top - $foregroundMonitor.Top) -le $fullscreenTolerance -and
         [Math]::Abs($foregroundRect.Right - ($foregroundMonitor.Left + $foregroundMonitor.Width)) -le $fullscreenTolerance -and
         [Math]::Abs($foregroundRect.Bottom - ($foregroundMonitor.Top + $foregroundMonitor.Height)) -le $fullscreenTolerance
+    $shellSurfaceClasses = @('Progman', 'WorkerW', 'Shell_TrayWnd', 'Shell_SecondaryTrayWnd')
+    $fullscreenGeometryCandidate = $foregroundProcessId -ne 0 -and $coversMonitor -and -not $foregroundMinimized -and $foregroundClass -notin $shellSurfaceClasses
+    $foregroundProcessName = $null
+    $foregroundProcessPath = $null
+    if ($foregroundProcessId) {
+        try {
+            $foregroundProcess = [Diagnostics.Process]::GetProcessById([int]$foregroundProcessId)
+            try {
+                $foregroundProcessName = $foregroundProcess.ProcessName
+                try { $foregroundProcessPath = $foregroundProcess.MainModule.FileName } catch { }
+            } finally {
+                $foregroundProcess.Dispose()
+            }
+        } catch { }
+    }
     $foregroundRecord = [ordered]@{
         hwnd = ('0x{0:X}' -f $foregroundWindow.ToInt64())
         pid = $foregroundProcessId
+        processName = $foregroundProcessName
+        processPath = $foregroundProcessPath
+        className = $foregroundClass
+        minimized = $foregroundMinimized
         rect = Convert-Rect $foregroundRect
         monitor = $foregroundMonitor.DeviceName
         coversMonitorBounds = $coversMonitor
+        fullscreenGeometryCandidate = $fullscreenGeometryCandidate
+        classification = if ($fullscreenGeometryCandidate) { 'fullscreen-geometry-candidate' } else { 'windowed-or-shell-surface' }
+    }
     }
 }
 
@@ -310,6 +380,7 @@ $snapshot = [ordered]@{
     capturedUtc = [DateTime]::UtcNow.ToString('o')
     machine = $env:COMPUTERNAME
     user = [Environment]::UserName
+    observerSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
     os = [ordered]@{
         version = [Environment]::OSVersion.Version.ToString()
         logicalProcessors = [Environment]::ProcessorCount
@@ -329,9 +400,11 @@ $snapshot = [ordered]@{
                 primary = $_.Primary
                 bounds = [ordered]@{ left = $_.Left; top = $_.Top; width = $_.Width; height = $_.Height }
                 workArea = [ordered]@{ left = $_.WorkLeft; top = $_.WorkTop; width = $_.WorkWidth; height = $_.WorkHeight }
-                dpiX = $_.DpiX
-                dpiY = $_.DpiY
-                scalePercent = [Math]::Round($_.DpiX * 100.0 / 96.0, 2)
+                dpiAvailable = $_.DpiAvailable
+                dpiSource = if ($_.DpiAvailable) { 'GetScaleFactorForMonitor; effective DPI derived from scale' } else { $null }
+                dpiX = if ($_.DpiAvailable) { $_.DpiX } else { $null }
+                dpiY = if ($_.DpiAvailable) { $_.DpiY } else { $null }
+                scalePercent = if ($_.DpiAvailable) { $_.ScalePercent } else { $null }
             }
         })
         taskbar = [ordered]@{

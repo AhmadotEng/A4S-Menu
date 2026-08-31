@@ -9,6 +9,7 @@ param(
     [int] $TransitionTimeoutMilliseconds = 3000,
     [ValidateRange(0, 2000)]
     [int] $SettleMilliseconds = 250,
+    [string] $ProductDirectory,
     [string] $BaselinePath,
     [string] $OutputPath,
     [switch] $OperatorAttestsFirstOpenIsCold,
@@ -149,16 +150,19 @@ public static class A4SPerformanceNative
     public static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
 
     [DllImport("user32.dll")]
+    public static extern IntPtr GetForegroundWindow();
+
+    [DllImport("user32.dll")]
     private static extern IntPtr MonitorFromWindow(IntPtr window, uint flags);
 
-    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern bool GetMonitorInfoW(IntPtr monitor, ref MONITORINFOEX info);
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern bool EnumDisplaySettingsW(string deviceName, int modeNumber, ref DEVMODE mode);
 
     [DllImport("dwmapi.dll")]
-    public static extern int DwmFlush();
+    private static extern int DwmFlush();
 
     [DllImport("kernel32.dll", SetLastError = true)]
     private static extern IntPtr OpenProcess(uint access, bool inheritHandle, uint processId);
@@ -199,7 +203,7 @@ public static class A4SPerformanceNative
             throw new InvalidOperationException("The A4S host rejected the toggle request.");
     }
 
-    public static IntPtr[] VisibleMenuWindows()
+    public static IntPtr[] VisibleMenuWindows(uint ownerProcessId)
     {
         List<IntPtr> matches = new List<IntPtr>();
         if (!EnumWindows(delegate(IntPtr window, IntPtr parameter)
@@ -208,7 +212,12 @@ public static class A4SPerformanceNative
             StringBuilder name = new StringBuilder(256);
             if (GetClassNameW(window, name, name.Capacity) > 0 &&
                 String.Equals(name.ToString(), "A4SMenu.CMenuContainer", StringComparison.Ordinal))
-                matches.Add(window);
+            {
+                uint processId;
+                GetWindowThreadProcessId(window, out processId);
+                if (processId == ownerProcessId)
+                    matches.Add(window);
+            }
             return true;
         }, IntPtr.Zero))
             throw new Win32Exception(Marshal.GetLastWin32Error(), "EnumWindows failed");
@@ -223,7 +232,7 @@ public static class A4SPerformanceNative
         return rect;
     }
 
-    public static uint RefreshRate(IntPtr window)
+    public static uint NominalRefreshRate(IntPtr window)
     {
         IntPtr monitor = MonitorFromWindow(window, 2);
         MONITORINFOEX info = new MONITORINFOEX();
@@ -234,7 +243,14 @@ public static class A4SPerformanceNative
         mode.Size = (ushort)Marshal.SizeOf(typeof(DEVMODE));
         if (!EnumDisplaySettingsW(info.DeviceName, -1, ref mode))
             return 0;
-        return mode.DisplayFrequency;
+        return mode.DisplayFrequency >= 20 && mode.DisplayFrequency <= 1000 ? mode.DisplayFrequency : 0;
+    }
+
+    public static void FlushDwmChecked()
+    {
+        int result = DwmFlush();
+        if (result < 0)
+            Marshal.ThrowExceptionForHR(result);
     }
 
     public static IoRecord ProcessIo(uint processId)
@@ -266,11 +282,12 @@ public static class A4SPerformanceNative
 function Wait-MenuVisibility {
     param(
         [Parameter(Mandatory)][bool] $Visible,
-        [Parameter(Mandatory)][int] $TimeoutMilliseconds
+        [Parameter(Mandatory)][int] $TimeoutMilliseconds,
+        [Parameter(Mandatory)][uint32] $OwnerProcessId
     )
     $timer = [Diagnostics.Stopwatch]::StartNew()
     do {
-        $windows = @([A4SPerformanceNative]::VisibleMenuWindows())
+        $windows = @([A4SPerformanceNative]::VisibleMenuWindows($OwnerProcessId))
         if (($Visible -and $windows.Count -gt 0) -or (-not $Visible -and $windows.Count -eq 0)) {
             return [ordered]@{ elapsedMilliseconds = $timer.Elapsed.TotalMilliseconds; windows = $windows }
         }
@@ -330,8 +347,10 @@ function Save-WindowCapture {
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
-$stageDirectory = Join-Path $repoRoot 'build\stage\A4SProduct'
-$expectedDll = [IO.Path]::GetFullPath((Join-Path $stageDirectory 'A4SMenu.dll'))
+if (-not $ProductDirectory) { $ProductDirectory = Join-Path $repoRoot 'build\stage\A4SProduct' }
+$resolvedProductDirectory = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($ProductDirectory))
+$expectedHost = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenuHost.exe'))
+$expectedDll = [IO.Path]::GetFullPath((Join-Path $resolvedProductDirectory 'A4SMenu.dll'))
 $hostWindow = [A4SPerformanceNative]::HostWindow()
 if ($hostWindow -eq [IntPtr]::Zero) { throw 'No resident A4SMenuHost window was found. This tool never starts or injects the host.' }
 if ([A4SPerformanceNative]::HostStatus($hostWindow, 2500) -ne 3) { throw 'A4SMenuHost is not READY.' }
@@ -346,12 +365,24 @@ if (-not $explorerProcessId -or -not $residentHostProcessId) { throw 'Could not 
 
 $explorerProcess = [Diagnostics.Process]::GetProcessById([int]$explorerProcessId)
 $residentHostProcess = [Diagnostics.Process]::GetProcessById([int]$residentHostProcessId)
+$observerSessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+if ($explorerProcess.SessionId -ne $observerSessionId -or $residentHostProcess.SessionId -ne $observerSessionId) {
+    throw "The observer, Explorer, and A4S host must share one interactive session. observer=$observerSessionId explorer=$($explorerProcess.SessionId) host=$($residentHostProcess.SessionId)."
+}
+$actualHostPath = [IO.Path]::GetFullPath($residentHostProcess.MainModule.FileName)
+if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHostPath, $expectedHost)) {
+    throw "The resident host is not the product directory under test. Expected '$expectedHost'; found '$actualHostPath'."
+}
 $mappedDlls = @($explorerProcess.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' } | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
 if ($mappedDlls.Count -ne 1 -or -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDlls[0], $expectedDll)) {
-    throw "Expected exactly one staged A4SMenu.dll mapping in Explorer PID $explorerProcessId; found '$($mappedDlls -join '; ')'."
+    throw "Expected exactly one A4SMenu.dll mapping from the product directory under test in Explorer PID $explorerProcessId; found '$($mappedDlls -join '; ')'."
+}
+$productHashes = [ordered]@{
+    hostSha256 = (Get-FileHash -LiteralPath $expectedHost -Algorithm SHA256).Hash
+    dllSha256 = (Get-FileHash -LiteralPath $expectedDll -Algorithm SHA256).Hash
 }
 
-$visibleBefore = @([A4SPerformanceNative]::VisibleMenuWindows())
+$visibleBefore = @([A4SPerformanceNative]::VisibleMenuWindows($explorerProcessId))
 if ($visibleBefore.Count -ne 0) {
     throw 'Close the A4S menu before starting the performance probe. The tool will not guess the current menu state.'
 }
@@ -370,7 +401,14 @@ $baselineComparison = $null
 if ($BaselinePath) {
     $resolvedBaseline = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BaselinePath))
     $baseline = Get-Content -LiteralPath $resolvedBaseline -Raw | ConvertFrom-Json
+    if ($baseline.schemaVersion -ne 1) { throw "Unsupported clean-baseline schema in '$resolvedBaseline'." }
+    if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$baseline.machine, [Environment]::MachineName) -or
+        -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$baseline.user, [Environment]::UserName)) {
+        throw 'The clean baseline belongs to a different machine or user.'
+    }
     if ($baseline.explorer.pid -ne $explorerProcessId) { throw "Baseline Explorer PID $($baseline.explorer.pid) does not match current PID $explorerProcessId." }
+    if ($baseline.explorer.startTimeUtc -ne $explorerProcess.StartTime.ToUniversalTime().ToString('o')) { throw 'The baseline Explorer start time does not match the current Explorer process.' }
+    if ($baseline.observerSessionId -ne $observerSessionId -or $baseline.explorer.sessionId -ne $observerSessionId) { throw 'The clean baseline belongs to a different interactive session.' }
     if (@($baseline.product.mappedDllPaths).Count -ne 0 -or $baseline.product.residentHost) { throw 'The baseline was not captured in a clean pre-injection state.' }
     $currentMetrics = Get-ProcessMetrics -Process $explorerProcess
     $baselineComparison = [ordered]@{
@@ -390,25 +428,43 @@ $firstCaptureHash = $null
 $settledCaptureHash = $null
 
 try {
-    for ($index = 0; $index -lt $WarmSamples; $index++) {
+    # A run that does not claim a cold first sample gets an explicit, unmeasured
+    # opening first. This prevents an accidentally cold opening from being
+    # classified as a warm sample.
+    if (-not $OperatorAttestsFirstOpenIsCold) {
+        [A4SPerformanceNative]::Toggle($hostWindow, 2500)
+        $preconditioned = Wait-MenuVisibility -Visible $true -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId
+        if ($preconditioned.windows.Count -ne 1) { throw "Warm-up found $($preconditioned.windows.Count) visible A4S menu windows; expected one." }
+        [A4SPerformanceNative]::FlushDwmChecked()
+        [A4SPerformanceNative]::Toggle($hostWindow, 2500)
+        [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
+        [A4SPerformanceNative]::FlushDwmChecked()
+    }
+
+    $sampleCount = $WarmSamples + $(if ($OperatorAttestsFirstOpenIsCold) { 1 } else { 0 })
+    for ($index = 0; $index -lt $sampleCount; $index++) {
         if ($SettleMilliseconds) { Start-Sleep -Milliseconds $SettleMilliseconds }
         $ioBefore = [A4SPerformanceNative]::ProcessIo($explorerProcessId)
         $openTimer = [Diagnostics.Stopwatch]::StartNew()
         [A4SPerformanceNative]::Toggle($hostWindow, 2500)
-        $visible = Wait-MenuVisibility -Visible $true -TimeoutMilliseconds $TransitionTimeoutMilliseconds
+        $visible = Wait-MenuVisibility -Visible $true -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId
         $visibilityMilliseconds = $openTimer.Elapsed.TotalMilliseconds
-        [void][A4SPerformanceNative]::DwmFlush()
-        $presentMilliseconds = $openTimer.Elapsed.TotalMilliseconds
+        if ($visible.windows.Count -ne 1) { throw "Sample $($index + 1) found $($visible.windows.Count) visible A4S menu windows; expected one." }
         $menuWindow = [IntPtr]$visible.windows[0]
-        if (-not $refreshRate) { $refreshRate = [A4SPerformanceNative]::RefreshRate($menuWindow) }
+        [A4SPerformanceNative]::FlushDwmChecked()
+        $afterDwmFlushMilliseconds = $openTimer.Elapsed.TotalMilliseconds
+        if ([A4SPerformanceNative]::GetForegroundWindow() -ne $menuWindow) {
+            throw "Sample $($index + 1) is invalid because the opened A4S menu was not the foreground top-level window."
+        }
+        if (-not $refreshRate) { $refreshRate = [A4SPerformanceNative]::NominalRefreshRate($menuWindow) }
         $ioAfter = [A4SPerformanceNative]::ProcessIo($explorerProcessId)
 
         if ($CapturePopInEvidence -and $index -eq 0) {
-            $firstCapturePath = Join-Path $outputDirectory 'A4S-popin-first-visible.png'
+            $firstCapturePath = Join-Path $outputDirectory 'A4S-popin-after-dwm-flush.png'
             $settledCapturePath = Join-Path $outputDirectory 'A4S-popin-settled.png'
             Save-WindowCapture -Window $menuWindow -Path $firstCapturePath
             if ($SettleMilliseconds) { Start-Sleep -Milliseconds $SettleMilliseconds }
-            [void][A4SPerformanceNative]::DwmFlush()
+            [A4SPerformanceNative]::FlushDwmChecked()
             Save-WindowCapture -Window $menuWindow -Path $settledCapturePath
             $firstCaptureHash = (Get-FileHash -LiteralPath $firstCapturePath -Algorithm SHA256).Hash
             $settledCaptureHash = (Get-FileHash -LiteralPath $settledCapturePath -Algorithm SHA256).Hash
@@ -416,17 +472,19 @@ try {
 
         $closeTimer = [Diagnostics.Stopwatch]::StartNew()
         [A4SPerformanceNative]::Toggle($hostWindow, 2500)
-        [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
-        [void][A4SPerformanceNative]::DwmFlush()
-        $closeMilliseconds = $closeTimer.Elapsed.TotalMilliseconds
+        [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
+        $closeVisibilityMilliseconds = $closeTimer.Elapsed.TotalMilliseconds
+        [A4SPerformanceNative]::FlushDwmChecked()
+        $closeAfterDwmFlushMilliseconds = $closeTimer.Elapsed.TotalMilliseconds
 
         $samples.Add([ordered]@{
             index = $index + 1
             classification = if ($index -eq 0 -and $OperatorAttestsFirstOpenIsCold) { 'operator-attested-first-open' } else { 'warm' }
-            openVisibleMilliseconds = [Math]::Round($visibilityMilliseconds, 3)
-            openPresentedMilliseconds = [Math]::Round($presentMilliseconds, 3)
-            closePresentedMilliseconds = [Math]::Round($closeMilliseconds, 3)
-            explorerIoDuringOpen = Get-IoDelta -Before $ioBefore -After $ioAfter
+            openVisibilityObservedMilliseconds = [Math]::Round($visibilityMilliseconds, 3)
+            openAfterDwmFlushMilliseconds = [Math]::Round($afterDwmFlushMilliseconds, 3)
+            closeVisibilityObservedMilliseconds = [Math]::Round($closeVisibilityMilliseconds, 3)
+            closeAfterDwmFlushMilliseconds = [Math]::Round($closeAfterDwmFlushMilliseconds, 3)
+            explorerProcessIoCountersDuringOpen = Get-IoDelta -Before $ioBefore -After $ioAfter
         })
     }
 
@@ -444,55 +502,67 @@ try {
     $explorerIdlePercent = if ($normalizer -gt 0) { 100.0 * $explorerCpuDelta / $normalizer } else { 0 }
 
     $warm = @($samples | Where-Object classification -eq 'warm')
-    $openValues = [double[]]@($warm | ForEach-Object { $_.openPresentedMilliseconds })
-    $closeValues = [double[]]@($samples | ForEach-Object { $_.closePresentedMilliseconds })
+    if ($warm.Count -ne $WarmSamples) { throw "Internal sample-classification error: expected $WarmSamples warm samples, found $($warm.Count)." }
+    $attestedCold = @($samples | Where-Object classification -eq 'operator-attested-first-open')
+    $openVisibilityValues = [double[]]@($warm | ForEach-Object { $_.openVisibilityObservedMilliseconds })
+    $openAfterFlushValues = [double[]]@($warm | ForEach-Object { $_.openAfterDwmFlushMilliseconds })
+    $closeVisibilityValues = [double[]]@($warm | ForEach-Object { $_.closeVisibilityObservedMilliseconds })
+    $closeAfterFlushValues = [double[]]@($warm | ForEach-Object { $_.closeAfterDwmFlushMilliseconds })
     $frameMilliseconds = if ($refreshRate -gt 0) { 1000.0 / $refreshRate } else { $null }
-    $diskQuietSamples = @($warm | Where-Object {
-        $_.explorerIoDuringOpen.readOperations -eq 0 -and
-        $_.explorerIoDuringOpen.writeOperations -eq 0 -and
-        $_.explorerIoDuringOpen.readBytes -eq 0 -and
-        $_.explorerIoDuringOpen.writeBytes -eq 0
+    $ioCounterQuietSamples = @($warm | Where-Object {
+        $_.explorerProcessIoCountersDuringOpen.readOperations -eq 0 -and
+        $_.explorerProcessIoCountersDuringOpen.writeOperations -eq 0 -and
+        $_.explorerProcessIoCountersDuringOpen.readBytes -eq 0 -and
+        $_.explorerProcessIoCountersDuringOpen.writeBytes -eq 0
     }).Count
 
     $summary = [ordered]@{
-        warmOpenP50Milliseconds = [Math]::Round((Get-Percentile $openValues 0.50), 3)
-        warmOpenP95Milliseconds = [Math]::Round((Get-Percentile $openValues 0.95), 3)
-        warmOpenMaximumMilliseconds = [Math]::Round((($openValues | Measure-Object -Maximum).Maximum), 3)
-        closeP50Milliseconds = [Math]::Round((Get-Percentile $closeValues 0.50), 3)
-        closeP95Milliseconds = [Math]::Round((Get-Percentile $closeValues 0.95), 3)
-        closeMaximumMilliseconds = [Math]::Round((($closeValues | Measure-Object -Maximum).Maximum), 3)
-        refreshRateHz = $refreshRate
-        displayFrameMilliseconds = if ($frameMilliseconds) { [Math]::Round($frameMilliseconds, 3) } else { $null }
-        warmOpenAtOrBelowTarget = (Get-Percentile $openValues 0.95) -le $WarmOpenTargetMilliseconds
-        closeWithinOneFrame = if ($frameMilliseconds) { (Get-Percentile $closeValues 0.95) -le $frameMilliseconds } else { $null }
-        warmOpenDiskQuietSamples = $diskQuietSamples
-        warmOpenDiskQuietTotal = $warm.Count
-        allWarmOpensProcessIoQuiet = $diskQuietSamples -eq $warm.Count
+        operatorAttestedColdOpenVisibilityObservedMilliseconds = if ($attestedCold.Count -eq 1) { $attestedCold[0].openVisibilityObservedMilliseconds } else { $null }
+        operatorAttestedColdOpenAfterDwmFlushMilliseconds = if ($attestedCold.Count -eq 1) { $attestedCold[0].openAfterDwmFlushMilliseconds } else { $null }
+        warmOpenVisibilityObservedP50Milliseconds = [Math]::Round((Get-Percentile $openVisibilityValues 0.50), 3)
+        warmOpenVisibilityObservedP95Milliseconds = [Math]::Round((Get-Percentile $openVisibilityValues 0.95), 3)
+        warmOpenAfterDwmFlushP50Milliseconds = [Math]::Round((Get-Percentile $openAfterFlushValues 0.50), 3)
+        warmOpenAfterDwmFlushP95Milliseconds = [Math]::Round((Get-Percentile $openAfterFlushValues 0.95), 3)
+        warmOpenAfterDwmFlushMaximumMilliseconds = [Math]::Round((($openAfterFlushValues | Measure-Object -Maximum).Maximum), 3)
+        closeVisibilityObservedP95Milliseconds = [Math]::Round((Get-Percentile $closeVisibilityValues 0.95), 3)
+        closeAfterDwmFlushP50Milliseconds = [Math]::Round((Get-Percentile $closeAfterFlushValues 0.50), 3)
+        closeAfterDwmFlushP95Milliseconds = [Math]::Round((Get-Percentile $closeAfterFlushValues 0.95), 3)
+        closeAfterDwmFlushMaximumMilliseconds = [Math]::Round((($closeAfterFlushValues | Measure-Object -Maximum).Maximum), 3)
+        nominalRefreshRateHz = $refreshRate
+        nominalDisplayFrameMilliseconds = if ($frameMilliseconds) { [Math]::Round($frameMilliseconds, 3) } else { $null }
+        warmOpenProxyAtOrBelowTarget = (Get-Percentile $openAfterFlushValues 0.95) -le $WarmOpenTargetMilliseconds
+        closeProxyWithinOneNominalFrame = if ($frameMilliseconds) { (Get-Percentile $closeAfterFlushValues 0.95) -le $frameMilliseconds } else { $null }
+        warmOpenIoCounterQuietSamples = $ioCounterQuietSamples
+        warmOpenIoCounterQuietTotal = $warm.Count
+        allWarmOpensExplorerIoCountersQuiet = $ioCounterQuietSamples -eq $warm.Count
         hostIdleCpuPercent = [Math]::Round($hostIdlePercent, 6)
         explorerProcessIdleCpuPercent = [Math]::Round($explorerIdlePercent, 6)
         hostEffectivelyIdle = $hostIdlePercent -le $HostIdleCpuTargetPercent
     }
 
     $result = [ordered]@{
-        schemaVersion = 1
+        schemaVersion = 2
         capturedUtc = [DateTime]::UtcNow.ToString('o')
         measurementScope = [ordered]@{
-            commandPath = 'resident-host SendMessageTimeout to first visible menu plus DwmFlush'
-            explorerIo = 'process-wide; background Explorer activity can create false positives'
+            commandPath = 'resident-host SendMessageTimeout to an Explorer-owned visible-window observation, followed by DwmFlush in the observer process'
+            presentationLimit = 'IsWindowVisible and observer-process DwmFlush are timing proxies; neither proves the exact first or last presented menu frame'
+            pollingLimit = 'EnumWindows polling and scheduler granularity can add measurement latency and therefore create false timing failures'
+            explorerIo = 'process-wide I/O counters; background Explorer activity can create false positives, while cache, paging, and memory-mapped activity can create false negatives for physical disk access'
             explorerCpu = 'process-wide; not attributable to A4S without ETW markers'
-            coldClassification = if ($OperatorAttestsFirstOpenIsCold) { 'operator attestation only' } else { 'not measured' }
+            coldClassification = if ($OperatorAttestsFirstOpenIsCold) { 'operator attestation only; excluded from warm summary' } else { 'not measured; an unmeasured warm-up cycle ran before all samples' }
         }
-        processes = [ordered]@{ hostPid = $residentHostProcessId; explorerPid = $explorerProcessId; mappedDll = $mappedDlls[0] }
-        targets = [ordered]@{ warmOpenMilliseconds = $WarmOpenTargetMilliseconds; closeFrames = 1; hostIdleCpuPercent = $HostIdleCpuTargetPercent; warmOpenDiskBytes = 0 }
+        product = [ordered]@{ directory = $resolvedProductDirectory; hostSha256 = $productHashes.hostSha256; dllSha256 = $productHashes.dllSha256 }
+        processes = [ordered]@{ observerSessionId = $observerSessionId; hostPid = $residentHostProcessId; hostPath = $actualHostPath; explorerPid = $explorerProcessId; mappedDll = $mappedDlls[0] }
+        targets = [ordered]@{ warmOpenProxyMilliseconds = $WarmOpenTargetMilliseconds; closeProxyNominalFrames = 1; hostIdleCpuPercent = $HostIdleCpuTargetPercent; warmOpenExplorerIoCounterChanges = 0 }
         baselineComparison = $baselineComparison
         summary = $summary
         popInEvidence = if ($CapturePopInEvidence) { [ordered]@{
-            firstVisiblePath = $firstCapturePath
+            captureAfterDwmFlushPath = $firstCapturePath
             settledPath = $settledCapturePath
-            firstVisibleSha256 = $firstCaptureHash
+            captureAfterDwmFlushSha256 = $firstCaptureHash
             settledSha256 = $settledCaptureHash
             pixelStableByExactPngHash = $firstCaptureHash -eq $settledCaptureHash
-            qualification = 'Different hashes are inconclusive because acrylic/background/cursor changes also alter pixels; visually compare both images.'
+            qualification = 'The first capture occurs after an observer-process DwmFlush and can miss short-lived pop-in. Equal hashes show only sampled-image equality. Different hashes are inconclusive because acrylic, wallpaper, cursor, and desktop animation also alter pixels.'
         } } else { $null }
         samples = $samples
     }
@@ -500,21 +570,34 @@ try {
     $json = $result | ConvertTo-Json -Depth 10
     [IO.File]::WriteAllText($resolvedOutput, $json + [Environment]::NewLine, [Text.UTF8Encoding]::new($false))
     Write-Host "Wrote A4S performance evidence: $resolvedOutput"
-    Write-Host ("Warm open p95={0:N3} ms; close p95={1:N3} ms; host idle CPU={2:N6}%; disk-quiet warm opens={3}/{4}" -f
-        $summary.warmOpenP95Milliseconds, $summary.closeP95Milliseconds, $summary.hostIdleCpuPercent,
-        $summary.warmOpenDiskQuietSamples, $summary.warmOpenDiskQuietTotal)
+    Write-Host ("Warm-open proxy p95={0:N3} ms; close proxy p95={1:N3} ms; host idle CPU={2:N6}%; Explorer-I/O-counter-quiet warm opens={3}/{4}" -f
+        $summary.warmOpenAfterDwmFlushP95Milliseconds, $summary.closeAfterDwmFlushP95Milliseconds, $summary.hostIdleCpuPercent,
+        $summary.warmOpenIoCounterQuietSamples, $summary.warmOpenIoCounterQuietTotal)
 
     if ($EnforceTargets) {
         $failures = [Collections.Generic.List[string]]::new()
-        if (-not $summary.warmOpenAtOrBelowTarget) { $failures.Add("warm-open p95 exceeds $WarmOpenTargetMilliseconds ms") }
-        if ($null -eq $summary.closeWithinOneFrame) { $failures.Add('display refresh rate was unavailable, so one-frame close could not be proved') }
-        elseif (-not $summary.closeWithinOneFrame) { $failures.Add('close p95 exceeds one display frame') }
+        if (-not $summary.warmOpenProxyAtOrBelowTarget) { $failures.Add("warm-open external proxy p95 exceeds $WarmOpenTargetMilliseconds ms") }
+        if ($null -eq $summary.closeProxyWithinOneNominalFrame) { $failures.Add('nominal display refresh rate was unavailable, so the external close proxy could not be compared with one nominal frame') }
+        elseif (-not $summary.closeProxyWithinOneNominalFrame) { $failures.Add('close external proxy p95 exceeds one nominal display frame') }
         if (-not $summary.hostEffectivelyIdle) { $failures.Add("host idle CPU exceeds $HostIdleCpuTargetPercent percent") }
-        if (-not $summary.allWarmOpensProcessIoQuiet) { $failures.Add('Explorer process I/O changed during one or more warm opens') }
+        if (-not $summary.allWarmOpensExplorerIoCountersQuiet) { $failures.Add('Explorer process read/write I/O counters changed during one or more warm opens') }
         if ($failures.Count) { throw "A4S performance gate failed: $($failures -join '; '). Evidence was preserved at $resolvedOutput" }
     }
 }
 finally {
+    try {
+        $leftVisible = @([A4SPerformanceNative]::VisibleMenuWindows($explorerProcessId))
+        if ($leftVisible.Count -gt 0) {
+            # Cleanup uses the same normal toggle path and only runs after an
+            # Explorer-owned A4S window is still observed. An expected-state
+            # flag alone is deliberately insufficient because toggling an
+            # already-dismissed menu would reopen it.
+            [A4SPerformanceNative]::Toggle($hostWindow, 2500)
+            [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
+        }
+    } catch {
+        Write-Warning "Could not confirm menu cleanup after the probe: $($_.Exception.Message)"
+    }
     $residentHostProcess.Dispose()
     $explorerProcess.Dispose()
 }
