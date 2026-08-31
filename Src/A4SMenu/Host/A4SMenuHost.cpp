@@ -250,30 +250,30 @@ namespace
 		bool m_owned=false;
 	};
 
-	void LoadSafetyState()
+	void ApplySafetyStateToRuntime(const CrashGuardState &state)
 	{
-		g_runtime.safetyDisabled = false;
-		g_runtime.abnormalExplorerExitTimes.fill(0);
-		g_runtime.abnormalExplorerExitCount = 0;
-		SafetyMutationLock mutationLock;
-		if (!mutationLock.acquire())
-		{
-			// Fail closed: an unreadable or concurrently owned crash guard must
-			// never cause a second injector to bypass the native-Start fallback.
-			g_runtime.safetyDisabled=true;
-			DebugLog(L"could not serialize HostSafety state loading; injection remains disabled");
-			return;
-		}
+		g_runtime.safetyDisabled=state.disabled;
+		g_runtime.abnormalExplorerExitTimes=state.abnormalExitTimes;
+		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
+	}
+
+	bool ReadSafetyStateLocked(CrashGuardState &state)
+	{
+		state=A4S_EMPTY_CRASH_GUARD;
 		HKEY key = nullptr;
-		if (RegOpenKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,KEY_QUERY_VALUE,&key)!=ERROR_SUCCESS)
-			return;
+		const LONG openResult=RegOpenKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,
+			0,KEY_QUERY_VALUE,&key);
+		if (openResult==ERROR_FILE_NOT_FOUND || openResult==ERROR_PATH_NOT_FOUND)
+			return true;
+		if (openResult!=ERROR_SUCCESS)
+			return false;
 
 		DWORD value = 0;
 		DWORD type = 0;
 		DWORD size = sizeof(value);
 		if (RegQueryValueExW(key,kSafetyDisabledValue,nullptr,&type,
 			reinterpret_cast<BYTE*>(&value),&size)==ERROR_SUCCESS && type==REG_DWORD && size==sizeof(value))
-			g_runtime.safetyDisabled=value!=0;
+			state.disabled=value!=0;
 		std::array<ULONGLONG,kCrashLoopThreshold> timestamps={};
 		type=0;
 		size=static_cast<DWORD>(sizeof(timestamps));
@@ -284,8 +284,7 @@ namespace
 		{
 			for (ULONGLONG timestamp:timestamps)
 				if (timestamp)
-					g_runtime.abnormalExplorerExitTimes[
-						g_runtime.abnormalExplorerExitCount++]=timestamp;
+					state.abnormalExitTimes[state.abnormalExitCount++]=timestamp;
 		}
 		else
 		{
@@ -302,44 +301,53 @@ namespace
 			size=sizeof(legacyWindowStart);
 			RegQueryValueExW(key,kCrashWindowValue,nullptr,&type,
 				reinterpret_cast<BYTE*>(&legacyWindowStart),&size);
-			g_runtime.abnormalExplorerExitCount=(std::min)(legacyCount,kCrashLoopThreshold);
-			for (DWORD index=0;index<g_runtime.abnormalExplorerExitCount;index++)
-				g_runtime.abnormalExplorerExitTimes[index]=legacyWindowStart;
+			state.abnormalExitCount=(std::min)(legacyCount,kCrashLoopThreshold);
+			for (DWORD index=0;index<state.abnormalExitCount;index++)
+				state.abnormalExitTimes[index]=legacyWindowStart;
 		}
 		RegCloseKey(key);
-
-		CrashGuardState state={g_runtime.abnormalExplorerExitTimes,
-			g_runtime.abnormalExplorerExitCount,g_runtime.safetyDisabled};
-		state=AdvanceCrashGuard(state,false,CurrentUtcFileTime());
-		g_runtime.abnormalExplorerExitTimes=state.abnormalExitTimes;
-		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
+		return true;
 	}
 
-	bool PersistSafetyState(DWORD lastExitCode)
+	void LoadSafetyState()
 	{
+		CrashGuardState state=A4S_EMPTY_CRASH_GUARD;
 		SafetyMutationLock mutationLock;
-		if (!mutationLock.acquire())
-			return false;
+		if (!mutationLock.acquire() || !ReadSafetyStateLocked(state))
+		{
+			// Fail closed: an unreadable or concurrently owned crash guard must
+			// never cause a second injector to bypass the native-Start fallback.
+			state.disabled=true;
+			ApplySafetyStateToRuntime(state);
+			DebugLog(L"could not serialize HostSafety state loading; injection remains disabled");
+			return;
+		}
+		state=AdvanceCrashGuard(state,false,CurrentUtcFileTime());
+		ApplySafetyStateToRuntime(state);
+	}
+
+	bool PersistSafetyStateLocked(const CrashGuardState &state, DWORD lastExitCode)
+	{
 		HKEY key = nullptr;
 		DWORD disposition = 0;
 		if (RegCreateKeyExW(HKEY_CURRENT_USER,A4S_HOST_SAFETY_REGISTRY_W,0,nullptr,0,
 			KEY_SET_VALUE,nullptr,&key,&disposition)!=ERROR_SUCCESS)
 			return false;
-		const DWORD disabled=g_runtime.safetyDisabled?1u:0u;
+		const DWORD disabled=state.disabled?1u:0u;
 		const LONG result1=RegSetValueExW(key,kSafetyDisabledValue,0,REG_DWORD,
 			reinterpret_cast<const BYTE*>(&disabled),sizeof(disabled));
 		const LONG result2=RegSetValueExW(key,kCrashCountValue,0,REG_DWORD,
-			reinterpret_cast<const BYTE*>(&g_runtime.abnormalExplorerExitCount),
-			sizeof(g_runtime.abnormalExplorerExitCount));
-		const ULONGLONG windowStart=g_runtime.abnormalExplorerExitCount?
-			g_runtime.abnormalExplorerExitTimes[0]:0;
+			reinterpret_cast<const BYTE*>(&state.abnormalExitCount),
+			sizeof(state.abnormalExitCount));
+		const ULONGLONG windowStart=state.abnormalExitCount?
+			state.abnormalExitTimes[0]:0;
 		const LONG result3=RegSetValueExW(key,kCrashWindowValue,0,REG_QWORD,
 			reinterpret_cast<const BYTE*>(&windowStart),sizeof(windowStart));
 		const LONG result4=RegSetValueExW(key,kLastExitCodeValue,0,REG_DWORD,
 			reinterpret_cast<const BYTE*>(&lastExitCode),sizeof(lastExitCode));
 		const LONG result5=RegSetValueExW(key,kCrashTimesValue,0,REG_BINARY,
-			reinterpret_cast<const BYTE*>(g_runtime.abnormalExplorerExitTimes.data()),
-			static_cast<DWORD>(sizeof(g_runtime.abnormalExplorerExitTimes)));
+			reinterpret_cast<const BYTE*>(state.abnormalExitTimes.data()),
+			static_cast<DWORD>(sizeof(state.abnormalExitTimes)));
 		RegCloseKey(key);
 		return result1==ERROR_SUCCESS && result2==ERROR_SUCCESS &&
 			result3==ERROR_SUCCESS && result4==ERROR_SUCCESS && result5==ERROR_SUCCESS;
@@ -361,21 +369,39 @@ namespace
 
 	bool RecordExplorerExitForCrashGuard(bool countAbnormalExit, DWORD exitCode)
 	{
+		SafetyMutationLock mutationLock;
+		if (!mutationLock.acquire())
+		{
+			g_runtime.safetyDisabled=true;
+			DebugLog(L"could not serialize Explorer crash-loop update; injection remains disabled");
+			return true;
+		}
+		CrashGuardState state=A4S_EMPTY_CRASH_GUARD;
+		if (!ReadSafetyStateLocked(state))
+		{
+			g_runtime.safetyDisabled=true;
+			DebugLog(L"could not re-read Explorer crash-loop state; injection remains disabled");
+			return true;
+		}
 		const ULONGLONG now=CurrentUtcFileTime();
-		CrashGuardState state={g_runtime.abnormalExplorerExitTimes,
-			g_runtime.abnormalExplorerExitCount,g_runtime.safetyDisabled};
+		const bool previouslyDisabled=state.disabled;
 		state=AdvanceCrashGuard(state,countAbnormalExit,now);
-		g_runtime.abnormalExplorerExitTimes=state.abnormalExitTimes;
-		g_runtime.abnormalExplorerExitCount=state.abnormalExitCount;
-		const bool newlyDisabled=!g_runtime.safetyDisabled && state.disabled;
-		g_runtime.safetyDisabled=state.disabled;
+		if (!PersistSafetyStateLocked(state,exitCode))
+		{
+			g_runtime.safetyDisabled=true;
+			DebugLog(L"could not persist Explorer crash-loop safety state; injection remains disabled");
+			return true;
+		}
+		// Publish only the state that was committed while the cross-session
+		// mutex was held. This prevents two session hosts from overwriting a
+		// newer crash count with independently advanced stale process state.
+		ApplySafetyStateToRuntime(state);
+		const bool newlyDisabled=!previouslyDisabled && state.disabled;
 		if (newlyDisabled)
 		{
 			DebugLog(L"Explorer crash-loop guard disabled injection; native Start remains available");
 		}
-		if (!PersistSafetyState(exitCode))
-			DebugLog(L"could not persist Explorer crash-loop safety state");
-		return g_runtime.safetyDisabled;
+		return state.disabled;
 	}
 
 	bool RegisterSessionNotifications()

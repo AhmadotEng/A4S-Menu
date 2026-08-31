@@ -131,11 +131,11 @@ foreach ($pattern in @(
     'CreateMutexW\(nullptr,FALSE,name\.c_str\(\)\)',
     'WaitForSingleObject\(m_mutex\.get\(\),2000\)',
     'void LoadSafetyState\(\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)',
-    'bool PersistSafetyState\(DWORD lastExitCode\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)',
-    'bool ResetSafetyState\(\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)'
+    'bool ResetSafetyState\(\)[\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)',
+    'bool RecordExplorerExitForCrashGuard\([\s\S]*SafetyMutationLock mutationLock;[\s\S]*mutationLock\.acquire\(\)[\s\S]*ReadSafetyStateLocked\(state\)[\s\S]*AdvanceCrashGuard\(state,countAbnormalExit,now\)[\s\S]*PersistSafetyStateLocked\(state,exitCode\)[\s\S]*ApplySafetyStateToRuntime\(state\)'
 )) {
     Assert-Match $hostSource $pattern `
-        'A HostSafety read/write/reset path escaped cross-session serialization.'
+        'A HostSafety load/reset path or crash read-modify-write transaction escaped cross-session serialization.'
 }
 
 # Independent executable model for the rolling-window edge that a window
