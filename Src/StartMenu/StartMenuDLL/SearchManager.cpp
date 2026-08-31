@@ -34,6 +34,9 @@ const int RANK_LIST_SIZE=256;
 CSearchManager::CSearchManager( void )
 {
 	m_bInitialized=false;
+#ifdef A4S_PRODUCT
+	m_bInitializationFailed=false;
+#endif
 	m_bRanksLoaded=false;
 	memset(m_CriticalSections,0,sizeof(m_CriticalSections));
 	memset(m_CriticalSectionOwners,0,sizeof(m_CriticalSectionOwners));
@@ -57,7 +60,17 @@ CSearchManager::~CSearchManager( void )
 bool CSearchManager::Init( void )
 {
 #ifdef A4S_PRODUCT
+	// Product search is intentionally initialized on the first non-empty query.
+	// A failed attempt is terminal for this DLL mapping: keep the menu usable and
+	// leave search disabled instead of repeatedly allocating partial resources.
+	if (m_bInitializationFailed)
+		return false;
+	if (m_bInitialized)
+		return true;
 	A4SPerformanceScope searchScope(A4S_PERF_SEARCH_INITIALIZATION);
+#else
+	if (m_bInitialized)
+		return true;
 #endif
 	m_bInitialized=true;
 	for (int i=0;i<LOCK_COUNT;i++)
@@ -68,6 +81,7 @@ bool CSearchManager::Init( void )
 	if (!m_SearchEvent || !m_ExitEvent)
 	{
 		Close();
+		m_bInitializationFailed=true;
 		return false;
 	}
 #endif
@@ -78,6 +92,7 @@ bool CSearchManager::Init( void )
 		if (!m_SearchThreads[i])
 		{
 			Close();
+			m_bInitializationFailed=true;
 			return false;
 		}
 #endif
@@ -152,8 +167,22 @@ static CString ParseAutoCompletePath( const CString &searchText )
 	return CString();
 }
 
-void CSearchManager::BeginSearch( const CString &searchText )
+bool CSearchManager::BeginSearch( const CString &searchText )
 {
+#ifdef A4S_PRODUCT
+	// Closing a menu before the user has searched must not create search
+	// synchronization objects or workers. Only a real query crosses the lazy
+	// initialization boundary.
+	if (m_bInitializationFailed)
+		return false;
+	if (!m_bInitialized)
+	{
+		if (searchText.IsEmpty())
+			return true;
+		if (!Init())
+			return false;
+	}
+#endif
 	Assert(GetCurrentThreadId()==m_MainThreadId);
 
 	{
@@ -179,10 +208,17 @@ void CSearchManager::BeginSearch( const CString &searchText )
 		m_SearchRequest.autoCompletePath=ParseAutoCompletePath(searchText);
 	}
 	SetEvent(m_SearchEvent);
+	return true;
 }
 
 void CSearchManager::CloseMenu( void )
 {
+	if (!m_bInitialized
+#ifdef A4S_PRODUCT
+		|| m_bInitializationFailed
+#endif
+	)
+		return;
 	Lock lock(this,LOCK_DATA);
 	m_LastRequestId++;
 	m_LastProgramsRequestId=m_LastRequestId;
@@ -289,6 +325,14 @@ void CSearchManager::LoadItemRanks( void )
 
 void CSearchManager::AddItemRank( unsigned int hash )
 {
+	// Ranking launches before the first product search are intentionally not
+	// persisted. They must never force the lazy search subsystem to initialize.
+	if (!m_bInitialized
+#ifdef A4S_PRODUCT
+		|| m_bInitializationFailed
+#endif
+	)
+		return;
 	Assert(GetCurrentThreadId()==m_MainThreadId);
 	Assert(m_bRanksLoaded);
 	Lock lock(this,LOCK_RANKS);
@@ -1420,6 +1464,16 @@ void CSearchManager::GetSearchResults( SearchResults &results )
 	results.indexed.clear();
 	results.autocomplete.clear();
 	results.autoCompletePath.Empty();
+	if (!m_bInitialized
+#ifdef A4S_PRODUCT
+		|| m_bInitializationFailed
+#endif
+	)
+	{
+		results.bResults=false;
+		results.bSearching=false;
+		return;
+	}
 	Lock lock(this,LOCK_DATA);
 	results.autoCompletePath=m_AutoCompletePath;
 	bool bSearchSubWord=GetSettingBool(L"SearchSubWord");

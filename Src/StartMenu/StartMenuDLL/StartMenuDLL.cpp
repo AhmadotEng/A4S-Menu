@@ -5452,8 +5452,10 @@ STARTMENUAPI bool InitManagers( bool bNohook )
 	InitializeSkinManager(bNohook);
 	if (!g_ItemManager.Init()) // must be after skin manager because it uses the metro colors
 		return false;
+#ifndef A4S_PRODUCT
 	if (!g_SearchManager.Init())
 		return false;
+#endif
 	return true;
 }
 

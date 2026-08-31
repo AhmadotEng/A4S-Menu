@@ -68,7 +68,7 @@ public:
 		std::list<SearchCategory> indexed;
 	};
 
-	void BeginSearch( const CString &searchText );
+	bool BeginSearch( const CString &searchText );
 	void GetSearchResults( SearchResults &results );
 	void AddItemRank( unsigned int hash );
 	void CloseMenu( void );
@@ -109,6 +109,9 @@ private:
 	};
 
 	bool m_bInitialized;
+#ifdef A4S_PRODUCT
+	bool m_bInitializationFailed;
+#endif
 
 	CString m_SearchText;
 	CString m_AutoCompletePath;
