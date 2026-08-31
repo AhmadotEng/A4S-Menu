@@ -97,6 +97,10 @@ enum TMenuID
 	MENU_RESTART_NOUPDATE,
 	MENU_SHUTDOWN_NOUPDATE,
 	MENU_SHUTDOWN_HYBRID,
+	MENU_A4S_CONTEXT_RUNAS,
+	MENU_A4S_CONTEXT_PIN,
+	MENU_A4S_CONTEXT_UNPIN,
+	MENU_A4S_CONTEXT_OPEN_LOCATION,
 	
 	MENU_IGNORE=1024, // ignore this item
 };
@@ -439,6 +443,7 @@ private:
 		CONTAINER_NOEXTENSIONS = 0x0800000, // hide extensions
 		CONTAINER_JUMPLIST     = 0x1000000, // this is a jumplist menu
 		CONTAINER_APPS         = 0x2000000, // this is the folder for Metro apps
+		CONTAINER_A4S_CONTEXT  = 0x4000000, // source-owned A4S program context flyout
 	};
 
 	// description of a menu item
@@ -656,6 +661,9 @@ private:
 	bool m_bHoverArrow;
 	int m_ContextItem; // force this to be the hot item while a context menu is up
 	HBITMAP m_Bitmap; // the background bitmap
+	bool m_bA4SFlyoutBackdropActive; // root overlap is excluded while an acrylic flyout is open
+	int *m_pA4SContextResult; // synchronous result owned by ShowA4SContextFlyout
+	bool m_bA4SContextFileSystemItem;
 	int m_BitmapOffset; // the horizontal offset of the main menu background from the window
 	HRGN m_Region; // the outline region
 	POINT m_PaintOffset;
@@ -681,6 +689,8 @@ private:
 	bool m_bScrollTimerTouch;
 	bool m_bNoSearchDraw;
 	bool m_bSearchDrawn;
+	bool m_bA4SSearchCaretVisible;
+	bool m_bA4SNativeCaretHidden;
 	bool m_bInSearchUpdate;
 	bool m_bDisableProgHover;
 	bool m_bClosing;
@@ -721,6 +731,10 @@ private:
 		CMD_RENAME,
 		CMD_MARKOLD,
 		CMD_UNINSTALL,
+		CMD_A4S_RUNAS,
+		CMD_A4S_PIN_PROGRAM,
+		CMD_A4S_UNPIN_PROGRAM,
+		CMD_A4S_OPEN_LOCATION,
 
 		CMD_LAST,
 		CMD_MAX=32767
@@ -763,6 +777,7 @@ private:
 		TIMER_BALLOON_HIDE=6,
 		TIMER_SEARCH=7,
 		TIMER_DRAG=8,
+		TIMER_SEARCH_CARET=9,
 
 		MCM_REFRESH=WM_USER+10, // posted to force the container to refresh its contents
 		MCM_SETCONTEXTITEM=WM_USER+11, // sets the item for the context menu. wParam is the nameHash of the item
@@ -823,7 +838,14 @@ private:
 	bool GetItemRect( int index, RECT &rc );
 	void GetSearchEditRect( const RECT &itemRect, RECT &editRect ) const;
 	void GetSearchGlyphRect( const RECT &itemRect, RECT &glyphRect ) const;
+	void DrawA4SSearchEdit( HDC hdc );
+	void ResetA4SSearchCaret( void );
 	bool IsA4SShutdownFlyout( void ) const;
+	bool IsA4SContextFlyout( void ) const;
+	bool IsA4SContextItemEnabled( const MenuItem &item ) const;
+	void PrepareA4SFlyoutBackdrop( const RECT &flyoutRect );
+	void DestroyA4SFlyoutBackdrop( void );
+	int ShowA4SContextFlyout( int parentIndex, const POINT *pPt, bool bPinned, bool bFileSystemItem );
 	int HitTest( const POINT &pt, bool *bArrow, bool bDrop=false );
 	bool DragOut( int index, bool bApp );
 	bool DragOutApps( const CItemManager::ItemInfo *pInfo );

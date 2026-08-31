@@ -1,53 +1,80 @@
 <a href="#"><img src=/Src/Setup/OpenShell.ico width="80" align="left"/></a>
 
+# A4S Menu
 
-# Open-Shell
+A source-level Open-Shell fork that reproduces only the popup Start menu for
+the captured Windows environment. It is not a skin and does not replace the
+taskbar, Start-button appearance, File Explorer, external shell context menus,
+or other Windows shell surfaces.
 
-A collection of utilities bringing back classic features to Windows.
+Current source profile: `A4SMenu/phase4-source-profile/23`.
 
-> [!NOTE]
-> This branch contains the **A4S Menu** source fork. It reproduces only the
-> popup Start menu for the captured Windows environment. See
-> [A4SMENU-PHASE4.md](A4SMENU-PHASE4.md) for the product boundary and build
-> workflow, and [docs/reference](docs/reference) for the accepted visual
-> specification.
+## Implemented behavior
 
-*Originally* **[Classic Shell](http://www.classicshell.net)** *by [Ivo Beltchev](https://sourceforge.net/u/ibeltchev/profile/)*
+- Fixed 463×443-DIP two-column layout with DPI-scaled geometry, native DWM
+  chrome, and continuous wallpaper-reactive acrylic.
+- Current-user pinned programs with 40-DIP rows and 32×32-DIP icons, plus the
+  22-DIP inline All Programs tree.
+- Clean two-state scrollbar with a quiet 2-pixel idle thumb, bright 6-pixel
+  active thumb and arrows, and a 600-ms return to idle.
+- Source-rendered search hint, query, selection, horizontal scrolling, and
+  caret while retaining the native edit control as the input model.
+- Fixed right-column links, including a Command Prompt action that uses the
+  existing elevated-command path.
+- Source-owned power flyout with connected footer highlighting, no delayed
+  shell-description tooltips, and the configured Sleep-before-Restart order.
+- Compact source-owned program context flyout containing only Run as
+  administrator, Pin/Unpin from start menu, and Open file location.
+- Context flyouts open at the clicked program and can be replaced immediately
+  by left- or right-clicking another eligible pinned or All Programs entry.
 
-[![GitHub Release](https://img.shields.io/github/release/Open-Shell/Open-Shell-Menu.svg?style=flat-square)](https://github.com/Open-Shell/Open-Shell-Menu/releases/latest)&nbsp;&nbsp;[![GitHub Pre-Release](https://img.shields.io/github/release/Open-Shell/Open-Shell-Menu/all.svg?style=flat-square)](https://github.com/Open-Shell/Open-Shell-Menu/releases)&nbsp;&nbsp;[![Build](https://github.com/Open-Shell/Open-Shell-Menu/actions/workflows/build.yml/badge.svg)](https://github.com/Open-Shell/Open-Shell-Menu/actions/workflows/build.yml)&nbsp;&nbsp;[![Build status](https://img.shields.io/appveyor/build/passionate-coder/Open-Shell-Menu?logo=appveyor&style=flat-square)](https://ci.appveyor.com/project/passionate-coder/open-shell-menu/branch/master)&nbsp;&nbsp;[![GitQ](https://img.shields.io/badge/gitq-discussions-1577fa?style=flat-square)](https://gitq.com/passionate-coder/Classic-Start)&nbsp;&nbsp;[![Gitter chat](https://img.shields.io/gitter/room/badges/shields.svg?color=lightseagreen&logo=gitter&style=flat-square)](https://gitter.im/open-shell/Lobby)&nbsp;&nbsp;[![Discord](https://img.shields.io/discord/757701054782636082?color=mediumslateblue&label=Discord&logo=discord&logoColor=white&style=flat-square)](https://discord.gg/7H6arr5)
+## Runtime boundary
 
-[Open-Shell Homepage](https://open-shell.github.io/Open-Shell-Menu)  
+The staged x64 runtime contains exactly:
 
-### Features
-- Classic style Start menu for Windows 7, 8, 8.1, 10, and 11
-- Toolbar for Windows Explorer
-- Explorer status bar with file size and disk space
-- Classic copy UI (Windows 7 only)
-- Title bar and status bar for Internet Explorer
+- `StartMenu.exe`
+- `StartMenuDLL.dll`
 
-### Download
-You can find the latest stable version here:
+The general Open-Shell settings/skin experience, Classic Explorer, Classic IE,
+updater, and installer are outside this environment-specific runtime. See
+[A4SMENU-PHASE4.md](A4SMENU-PHASE4.md) for the complete source-fork contract.
 
-[![GitHub All Releases](https://img.shields.io/github/downloads/Open-Shell/Open-Shell-Menu/total?style=for-the-badge&color=4bc2ee&logo=github)](https://github.com/Open-Shell/Open-Shell-Menu/releases/latest)
+## Build and preview
 
-> [!IMPORTANT]
-> #### Windows for ARM compatibility
-> Open-Shell is compatible with Windows for ARM since version [4.4.196](https://github.com/Open-Shell/Open-Shell-Menu/releases/tag/v4.4.196).
->
-> If you install older one on a Windows for ARM installation (ex. using Parallels Desktop on an Apple Silicon Mac), you will no longer be able to log into your account the next time you reboot. Please refrain from installing Open-Shell on Windows for ARM.
+Build the x64 runtime and stage the exact two-file payload:
 
-### Code signing
-Free code signing provided by [SignPath.io](https://about.signpath.io/), certificate by [SignPath Foundation](https://signpath.org/)
+```powershell
+.\tools\Build-A4SMenu.ps1
+```
 
-### Temporary Translation/Language Solution
-1. Download [language DLL](https://coddec.github.io/Classic-Shell/www.classicshell.net/translations/index.html)  
-2. Place it either in the Open-Shell's __install folder__ or in the `%ALLUSERSPROFILE%\OpenShell\Languages` folder
+Open the standalone comparison preview without injecting Explorer or disabling
+StartAllBack:
 
-----
+```powershell
+.\tools\Preview-A4SMenu.ps1 -CenterBottom
+```
 
-*For archival reasons, we have a mirror of `www.classicshell.net` [here](https://coddec.github.io/Classic-Shell/www.classicshell.net/).*
+The staged runtime is written to `build\stage\A4SMenu`.
 
-[How To Skin a Start Menu](https://coddec.github.io/Classic-Shell/www.classicshell.net/tutorials/skintutorial.html)  
-[Classic Shell: Custom Start Buttons](https://coddec.github.io/Classic-Shell/www.classicshell.net/tutorials/buttontutorial.html)  
-[Questions? Ask on the Discussions section](https://github.com/Open-Shell/Open-Shell-Menu/discussions) or on [Discord](https://discord.gg/7H6arr5)  
-[Submit a bug report/feature request](https://github.com/Open-Shell/Open-Shell-Menu/issues)
+## Validation
+
+No automated test suite is currently checked into this fork. Validation uses:
+
+- **14 accepted StartAllBack reference images** covering **10 required-state
+  entries**: nine captured states and one user-menu state that is not
+  applicable to this configuration.
+- A clean x64 build through `tools\Build-A4SMenu.ps1`.
+- Staging checks that reject non-x64 binaries and any payload other than the
+  two supported runtime files.
+- Manual standalone visual and interaction review at 96 DPI through
+  `tools\Preview-A4SMenu.ps1 -CenterBottom`.
+
+The measured visual and interaction contract is in
+[docs/reference/StartAllBack-visual-spec.md](docs/reference/StartAllBack-visual-spec.md).
+
+## Upstream
+
+A4S Menu is derived from
+[Open-Shell/Open-Shell-Menu](https://github.com/Open-Shell/Open-Shell-Menu),
+originally Classic Shell by Ivo Beltchev. Upstream Open-Shell downloads do not
+contain this environment-specific A4S fork.

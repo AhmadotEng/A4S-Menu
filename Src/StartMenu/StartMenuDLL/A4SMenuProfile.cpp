@@ -5,7 +5,7 @@
 
 namespace
 {
-	const wchar_t kBuildId[]=L"A4SMenu/phase4-source-profile/10";
+	const wchar_t kBuildId[]=L"A4SMenu/phase4-source-profile/23";
 
 	const wchar_t kRightColumnModel[]=
 		L"Item1.Command=user_files\n"
@@ -118,14 +118,10 @@ namespace
 			profile.ItemSettings[i].font=font;
 			profile.ItemSettings[i].bOwnFont=(i==MenuSkin::COLUMN1_ITEM);
 		}
-		// The native transparent EDIT does not pass through DTT_COMPOSITED. Give it
-		// the same Variable Text outlines with grayscale coverage so query/hint text
-		// cannot acquire colored subpixel fringes over the acrylic child surface.
-		HFONT searchEdit=CreateFont(-A4SMenuProfile::Scale(13,dpi),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
-			DEFAULT_CHARSET,OUT_TT_PRECIS,CLIP_DEFAULT_PRECIS,ANTIALIASED_QUALITY,
-			DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI Variable Text");
-		profile.Search_hint_font=searchEdit?searchEdit:font;
-		profile.BOwnHintFont=searchEdit!=NULL;
+		// Use the exact same face, size, hinting, and quality for the native edit.
+		// Its old grayscale-only font made typed queries visibly softer than rows.
+		profile.Search_hint_font=font;
+		profile.BOwnHintFont=false;
 
 		HFONT searchHeader=CreateFont(-A4SMenuProfile::Scale(16,dpi),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
 			DEFAULT_CHARSET,OUT_TT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_NATURAL_QUALITY,
@@ -208,7 +204,7 @@ namespace A4SMenuProfile
 	{
 		rect.left=Scale(285,dpi);
 		rect.top=Scale(404,dpi);
-		rect.right=Scale(400,dpi);
+		rect.right=Scale(397,dpi);
 		rect.bottom=Scale(430,dpi);
 	}
 
@@ -237,8 +233,8 @@ namespace A4SMenuProfile
 		ForceInt(L"ShiftClick",1);
 		ForceInt(L"ShiftWin",1);
 
-		// Fixed StartAllBack-compatible model: empty normal left pane, inline
-		// All Programs, fixed right links, and no jump-list/pinning subsystem.
+		// Fixed StartAllBack-compatible model: the normal left pane contains only
+		// user pins, with inline All Programs and fixed right links.
 		ForceInt(L"ProgramsStyle",PROGRAMS_INLINE);
 		ForceBool(L"OpenPrograms",false);
 		ForceBool(L"AllProgramsMetro",true);
@@ -250,6 +246,9 @@ namespace A4SMenuProfile
 		ForceBool(L"HighlightNew",false);
 		ForceBool(L"HighlightNewApps",false);
 		ForceString(L"MenuItems7",kRightColumnModel);
+		// The product popup deliberately has no delayed shell-description tips.
+		ForceString(L"InfotipDelay",L"0,0");
+		ForceString(L"FolderInfotipDelay",L"0,0");
 
 		// Search is part of the accepted menu, but unrelated providers and
 		// tracking are removed.
@@ -266,8 +265,8 @@ namespace A4SMenuProfile
 		ForceBool(L"SearchInternet",false);
 		ForceBool(L"MoreResults",true);
 
-		// Match the captured power button and flyout contents. ShutdownW7 is a
-		// filter; the upstream fixed model supplies the captured ordering.
+		// Match the power button and the user-directed flyout contents. ShutdownW7
+		// is a filter; the fixed model supplies the requested Sleep/Restart order.
 		ForceInt(L"ShutdownCommand",SHUTDOWN_TYPE_SHUTDOWN);
 		ForceString(L"ShutdownW7",L"switch_user logoff lock restart sleep");
 		ForceBool(L"HybridShutdown",false);
@@ -284,7 +283,7 @@ namespace A4SMenuProfile
 		ForceInt(L"JumplistWidth",0);
 		ForceInt(L"MinMainHeight",0);
 		ForceInt(L"SmallIconSize",20);
-		ForceInt(L"LargeIconSize",40);
+		ForceInt(L"LargeIconSize",32);
 		ForceBool(L"MenuShadow",true);
 		ForceBool(L"EnableGlass",true);
 		ForceBool(L"GlassOverride",true);
@@ -324,7 +323,7 @@ namespace A4SMenuProfile
 		profile.ForceRTL=false;
 		profile.TwoColumns=true;
 		profile.ForceTouch=false;
-		profile.Main_icon_size=MenuSkin::ICON_SIZE_SMALL;
+		profile.Main_icon_size=MenuSkin::ICON_SIZE_LARGE;
 		profile.Main2_icon_size=MenuSkin::ICON_SIZE_SMALL;
 		profile.User_image_size=0;
 		profile.User_bitmapSize.cx=profile.User_bitmapSize.cy=0;
@@ -389,14 +388,14 @@ namespace A4SMenuProfile
 			item.glowSize=0;
 		}
 
-		// Captured row rhythm at 96 DPI: 22 px left/program rows, 40 px
-		// right links, and a compact 26 px footer action.
+		// Captured row rhythm at 96 DPI: 40 px pinned rows, 22 px inline
+		// All Programs rows, 40 px right links, and a 26 px footer action.
 		for (int i=MenuSkin::COLUMN1_ITEM;i<=MenuSkin::COLUMN1_SEPARATOR;i++)
 		{
 			MenuSkin::ItemDrawSettings &item=profile.ItemSettings[i];
-			SetPadding(item.textPadding,5,3,8,4,dpi);
-			SetPadding(item.iconPadding,4,1,4,1,dpi);
-			item.itemHeight=Scale(22,dpi);
+			SetPadding(item.textPadding,1,3,8,4,dpi);
+			SetPadding(item.iconPadding,4,4,4,4,dpi);
+			item.itemHeight=Scale(40,dpi);
 		}
 		for (int i=MenuSkin::COLUMN2_ITEM;i<=MenuSkin::COLUMN2_INLINE;i++)
 		{
@@ -424,7 +423,9 @@ namespace A4SMenuProfile
 		for (int i=MenuSkin::SUBMENU_ITEM;i<=MenuSkin::SUBMENU_SEPARATOR_SPLIT;i++)
 		{
 			MenuSkin::ItemDrawSettings &item=profile.ItemSettings[i];
-			SetPadding(item.textPadding,5,0,4,0,dpi);
+			// Align the compact power flyout text with the StartAllBack reference and
+			// leave enough room for the complete "Switch user" label at 117 px.
+			SetPadding(item.textPadding,1,0,4,0,dpi);
 			SetPadding(item.iconPadding,0,0,0,0,dpi);
 		}
 		for (int i=MenuSkin::PROGRAMS_BUTTON;i<=MenuSkin::PROGRAMS_CASCADING_NEW;i++)
@@ -450,7 +451,7 @@ namespace A4SMenuProfile
 			return;
 
 		for (int i=MenuSkin::COLUMN1_ITEM;i<=MenuSkin::COLUMN1_SEPARATOR;i++)
-			profile.ItemSettings[i].itemHeight=Scale(22,dpi);
+			profile.ItemSettings[i].itemHeight=Scale(40,dpi);
 		for (int i=MenuSkin::COLUMN2_ITEM;i<=MenuSkin::COLUMN2_INLINE;i++)
 			profile.ItemSettings[i].itemHeight=Scale(40,dpi);
 		for (int i=MenuSkin::PROGRAMS_TREE_ITEM;i<=MenuSkin::PROGRAMS_TREE_NEW;i++)

@@ -2249,6 +2249,168 @@ void CMenuContainer::CreateSubmenuRegion( int width, int height )
 	}
 }
 
+void CMenuContainer::DrawA4SSearchEdit( HDC hdc )
+{
+	if (!m_SearchBox.m_hWnd || m_SearchIndex<0)
+		return;
+
+	RECT itemRect;
+	if (!GetItemRect(m_SearchIndex,itemRect))
+		return;
+
+	CString text;
+	m_SearchBox.GetWindowText(text);
+	const bool hint=text.IsEmpty() &&
+		(((GetSettingInt(L"SearchBox")==SEARCHBOX_NORMAL) && GetSettingBool(L"SearchSelect")) || GetFocus()!=m_SearchBox.m_hWnd);
+	if (hint)
+	{
+		if (GetSettingBool(L"SearchHint"))
+			text=GetSettingString(L"SearchHintText");
+		else
+			text=m_Items[m_SearchIndex].name;
+	}
+
+	// The exact captured text cell is 17 DIP high at y=408 and remains inside
+	// the native edit's live client rectangle for mouse/input hit testing.
+	RECT childRect;
+	::GetClientRect(m_SearchBox.m_hWnd,&childRect);
+	::MapWindowPoints(m_SearchBox.m_hWnd,m_hWnd,(POINT*)&childRect,2);
+	RECT clipRect={itemRect.left+A4SMenuProfile::Scale(27,s_Skin.Dpi),
+		itemRect.top+A4SMenuProfile::Scale(4,s_Skin.Dpi),
+		itemRect.right-A4SMenuProfile::Scale(1,s_Skin.Dpi),
+		itemRect.top+A4SMenuProfile::Scale(21,s_Skin.Dpi)};
+	if (!IntersectRect(&clipRect,&clipRect,&childRect))
+		return;
+
+	HGDIOBJ oldFont=SelectObject(hdc,s_Skin.Search_hint_font);
+	TEXTMETRIC metrics={0};
+	GetTextMetrics(hdc,&metrics);
+	const int cellTop=itemRect.top+A4SMenuProfile::Scale(4,s_Skin.Dpi);
+	const int cellBottom=(std::min)(clipRect.bottom,cellTop+metrics.tmHeight);
+
+	int textX=itemRect.left+A4SMenuProfile::Scale(hint?38:31,s_Skin.Dpi);
+	if (!hint && !text.IsEmpty())
+	{
+		// For a single-line EDIT this is the first visible character. Recover the
+		// full-string origin from its native, scroll-aware position so long queries
+		// keep the same caret and horizontal-scroll behavior as the input model.
+		int first=(int)m_SearchBox.SendMessage(EM_GETFIRSTVISIBLELINE);
+		if (first<0) first=0;
+		if (first>text.GetLength()) first=text.GetLength();
+		LRESULT pos=m_SearchBox.SendMessage(EM_POSFROMCHAR,first);
+		if (pos!=-1)
+		{
+			SIZE prefix={0,0};
+			if (first>0)
+				GetTextExtentPoint32(hdc,text,first,&prefix);
+			textX=childRect.left+(short)LOWORD(pos)-prefix.cx;
+		}
+	}
+
+	SIZE textSize={0,0};
+	if (!text.IsEmpty())
+		GetTextExtentPoint32(hdc,text,text.GetLength(),&textSize);
+	RECT textRect={textX,cellTop,textX+(std::max)(textSize.cx,clipRect.right-clipRect.left)+A4SMenuProfile::Scale(2,s_Skin.Dpi),cellBottom};
+
+	DWORD selectionStart=0, selectionEnd=0;
+	if (!hint)
+		m_SearchBox.SendMessage(EM_GETSEL,(WPARAM)&selectionStart,(LPARAM)&selectionEnd);
+	selectionStart=(std::min)(selectionStart,(DWORD)text.GetLength());
+	selectionEnd=(std::min)(selectionEnd,(DWORD)text.GetLength());
+	if (selectionEnd<selectionStart)
+		std::swap(selectionStart,selectionEnd);
+
+	auto CharacterX=[&](DWORD index)->int
+	{
+		SIZE prefix={0,0};
+		if (index>0)
+			GetTextExtentPoint32(hdc,text,(int)index,&prefix);
+		return textX+prefix.cx;
+	};
+
+	RECT selectionRect={0,0,0,0};
+	const bool hasFocus=GetFocus()==m_SearchBox.m_hWnd;
+	const bool hasSelection=hasFocus && !hint && selectionStart!=selectionEnd;
+	if (hasSelection)
+	{
+		selectionRect.left=CharacterX(selectionStart);
+		selectionRect.right=CharacterX(selectionEnd);
+		selectionRect.top=cellTop;
+		selectionRect.bottom=cellBottom;
+		RECT visibleSelection;
+		if (IntersectRect(&visibleSelection,&selectionRect,&clipRect))
+			FillA4SOpaqueRect(hdc,visibleSelection,GetSysColor(COLOR_HIGHLIGHT));
+	}
+
+	int saved=SaveDC(hdc);
+	IntersectClipRect(hdc,clipRect.left,clipRect.top,clipRect.right,clipRect.bottom);
+	if (!text.IsEmpty())
+	{
+		const DWORD flags=DT_SINGLELINE|DT_NOPREFIX|DT_NOCLIP;
+		if (s_Theme)
+		{
+			DTTOPTS options={sizeof(options),DTT_TEXTCOLOR|DTT_COMPOSITED};
+			options.crText=hint?s_Skin.Search_text_colors[1]:s_Skin.Search_text_colors[0];
+			COLORREF selectedText=GetSysColor(COLOR_HIGHLIGHTTEXT);
+			if (hasSelection && selectedText!=options.crText)
+			{
+				int normal=SaveDC(hdc);
+				ExcludeClipRect(hdc,selectionRect.left,selectionRect.top,selectionRect.right,selectionRect.bottom);
+				DrawThemeTextEx(s_Theme,hdc,0,0,text,text.GetLength(),flags,&textRect,&options);
+				RestoreDC(hdc,normal);
+				int selected=SaveDC(hdc);
+				IntersectClipRect(hdc,selectionRect.left,selectionRect.top,selectionRect.right,selectionRect.bottom);
+				options.crText=selectedText;
+				DrawThemeTextEx(s_Theme,hdc,0,0,text,text.GetLength(),flags,&textRect,&options);
+				RestoreDC(hdc,selected);
+			}
+			else
+				DrawThemeTextEx(s_Theme,hdc,0,0,text,text.GetLength(),flags,&textRect,&options);
+		}
+		else
+		{
+			SetBkMode(hdc,TRANSPARENT);
+			COLORREF normalText=hint?s_Skin.Search_text_colors[1]:s_Skin.Search_text_colors[0];
+			COLORREF selectedText=GetSysColor(COLOR_HIGHLIGHTTEXT);
+			if (hasSelection && selectedText!=normalText)
+			{
+				int normal=SaveDC(hdc);
+				ExcludeClipRect(hdc,selectionRect.left,selectionRect.top,selectionRect.right,selectionRect.bottom);
+				SetTextColor(hdc,normalText);
+				DrawText(hdc,text,text.GetLength(),&textRect,flags);
+				RestoreDC(hdc,normal);
+				int selected=SaveDC(hdc);
+				IntersectClipRect(hdc,selectionRect.left,selectionRect.top,selectionRect.right,selectionRect.bottom);
+				SetTextColor(hdc,selectedText);
+				DrawText(hdc,text,text.GetLength(),&textRect,flags);
+				RestoreDC(hdc,selected);
+			}
+			else
+			{
+				SetTextColor(hdc,normalText);
+				DrawText(hdc,text,text.GetLength(),&textRect,flags);
+			}
+		}
+	}
+
+	if (hasFocus && !hasSelection && m_bA4SSearchCaretVisible)
+	{
+		POINT caret={!hint && !text.IsEmpty()?CharacterX(selectionEnd):itemRect.left+A4SMenuProfile::Scale(31,s_Skin.Dpi),cellTop};
+		POINT nativeCaret;
+		if (::GetCaretPos(&nativeCaret))
+		{
+			::MapWindowPoints(m_SearchBox.m_hWnd,m_hWnd,&nativeCaret,1);
+			caret.x=nativeCaret.x;
+		}
+		RECT caretRect={caret.x,cellTop,caret.x+1,cellBottom};
+		RECT visibleCaret;
+		if (IntersectRect(&visibleCaret,&caretRect,&clipRect))
+			FillA4SOpaqueRect(hdc,visibleCaret,RGB(230,230,230));
+	}
+	RestoreDC(hdc,saved);
+	SelectObject(hdc,oldFont);
+}
+
 void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 {
 	HDC hdc2=CreateCompatibleDC(hdc);
@@ -2513,6 +2675,10 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 		}
 
 		bool bHot=(index==m_HotItem || index==m_SubJumpItem || (m_HotItem==-1 && (index==m_Submenu || index==m_ContextItem)));
+		const bool bA4SContextFlyout=IsA4SContextFlyout();
+		const bool bA4SContextItemEnabled=IsA4SContextItemEnabled(item);
+		if (!bA4SContextItemEnabled)
+			bHot=false;
 		bool bSplit=false;
 		int stateLeft=0, stateRight=0;
 		bool bNew=!bHot && item.bNew && !(s_bWin7Style && item.id==MENU_PROGRAMS && s_MenuMode==MODE_PROGRAMS);
@@ -2548,6 +2714,11 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 		}
 		if (item.id==MENU_PROGRAMS_TREE)
 			bHot=false;
+		// An open power flyout keeps m_Submenu pointed at the root Shut down
+		// item. For the A4S profile that ownership must not latch its visual hot
+		// state after the pointer has left the footer control.
+		if (A4SMenuProfile::IsEnabled() && item.id==MENU_SHUTDOWN_BUTTON)
+			bHot=index==m_HotItem;
 		int splitX=itemRect.right;
 		const MenuSkin::ItemDrawSettings &settings=s_Skin.ItemSettings[drawType];
 		int glowSize=s_Theme?settings.glowSize:0;
@@ -2559,25 +2730,47 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				bSplit=(item.bSplit && (item.bFolder || item.jumpIndex>=0 || item.id==MENU_SEARCH_CATEGORY || item.id==MENU_SHUTDOWN_BUTTON));
 				if (item.id==MENU_SHUTDOWN_BUTTON)
 				{
-					if (GetCapture()==m_hWnd)
+					if (A4SMenuProfile::IsEnabled())
 					{
-						if (index==m_ClickIndex && !m_bClickArrow && index==m_HotItem && !m_bHotArrow)
-							stateLeft=2;
-						else if (index==m_ClickIndex || index==m_Submenu || index==m_SubJumpItem)
+						// Keep the two click targets, but derive the connected visual
+						// state only from the pointer/capture—not from the open flyout.
+						if (index==m_HotItem)
+						{
+							if (GetCapture()==m_hWnd && index==m_ClickIndex)
+							{
+								if (m_bClickArrow && m_bHotArrow)
+									stateRight=2;
+								else if (!m_bClickArrow && !m_bHotArrow)
+									stateLeft=2;
+								else
+									stateLeft=stateRight=1;
+							}
+							else
+								stateLeft=stateRight=1;
+						}
+					}
+					else
+					{
+						if (GetCapture()==m_hWnd)
+						{
+							if (index==m_ClickIndex && !m_bClickArrow && index==m_HotItem && !m_bHotArrow)
+								stateLeft=2;
+							else if (index==m_ClickIndex || index==m_Submenu || index==m_SubJumpItem)
+								stateLeft=1;
+						}
+						else if (index==m_HotItem || index==m_Submenu || index==m_SubJumpItem)
 							stateLeft=1;
-					}
-					else if (index==m_HotItem || index==m_Submenu || index==m_SubJumpItem)
-						stateLeft=1;
 
-					if (index==m_Submenu || index==m_SubJumpItem)
-						stateRight=2;
-					else if (GetCapture()==m_hWnd)
-					{
-						if (index==m_ClickIndex && m_bClickArrow && index==m_HotItem && m_bHotArrow)
+						if (index==m_Submenu || index==m_SubJumpItem)
 							stateRight=2;
+						else if (GetCapture()==m_hWnd)
+						{
+							if (index==m_ClickIndex && m_bClickArrow && index==m_HotItem && m_bHotArrow)
+								stateRight=2;
+						}
+						else if (index==m_HotItem)
+							stateRight=1;
 					}
-					else if (index==m_HotItem)
-						stateRight=1;
 				}
 				else
 				{
@@ -2669,8 +2862,10 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				itemRect2.right=splitX;
 				if (A4SMenuProfile::IsEnabled())
 				{
-					if (stateLeft>0)
-						DrawA4SSelectionRect(hdc,itemRect2,s_Skin.Dpi);
+					// The command and chevron remain separate hit targets, but their
+					// visual selection is one continuous rounded surface.
+					if (stateLeft>0 || stateRight>0)
+						DrawA4SSelectionRect(hdc,itemRect,s_Skin.Dpi);
 				}
 				else
 					DrawEdge(hdc,&itemRect2,stateLeft==2?BDR_SUNKENOUTER:BDR_RAISEDINNER,BF_RECT|BF_MIDDLE);
@@ -2687,12 +2882,7 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				}
 				itemRect2.left=itemRect2.right;
 				itemRect2.right=itemRect.right;
-				if (A4SMenuProfile::IsEnabled())
-				{
-					if (stateRight>0)
-						DrawA4SSelectionRect(hdc,itemRect2,s_Skin.Dpi);
-				}
-				else
+				if (!A4SMenuProfile::IsEnabled())
 					DrawEdge(hdc,&itemRect2,stateRight==2?BDR_SUNKENOUTER:BDR_RAISEDINNER,BF_RECT|BF_MIDDLE);
 			}
 			else
@@ -2735,7 +2925,19 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				else
 				{
 					if (A4SMenuProfile::IsEnabled())
-						DrawA4SSelectionRect(hdc,itemRect,s_Skin.Dpi);
+					{
+						RECT selectionRect=itemRect;
+						if (IsA4SShutdownFlyout())
+						{
+							// Trim only the visible first/last hover fills. Row geometry,
+							// text baselines, keyboard focus, and hit targets stay intact.
+							if (item.id==MENU_SWITCHUSER)
+								selectionRect.top+=A4SMenuProfile::Scale(2,s_Skin.Dpi);
+							else if (item.id==MENU_RESTART || item.id==MENU_RESTART_NOUPDATE)
+								selectionRect.bottom-=A4SMenuProfile::Scale(2,s_Skin.Dpi);
+						}
+						DrawA4SSelectionRect(hdc,selectionRect,s_Skin.Dpi);
+					}
 					else
 						FillRect(hdc,&itemRect,(HBRUSH)GetStockObject(DC_BRUSH));
 				}
@@ -2931,6 +3133,7 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				else
 					DrawA4SSearchClear(hdc,itemRect.left+A4SMenuProfile::Scale(6,s_Skin.Dpi),
 						itemRect.top+A4SMenuProfile::Scale(6,s_Skin.Dpi),s_Skin.Dpi);
+				DrawA4SSearchEdit(hdc);
 				continue;
 			}
 			MenuBitmap searchIcons;
@@ -3006,6 +3209,11 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 				color = settings.textColors[bHotColor ? 1 : 0];
 				shadowColor = settings.textShadowColors[bHotColor ? 1 : 0];
 			}
+		}
+		if (bA4SContextFlyout && !bA4SContextItemEnabled)
+		{
+			color=RGB(128,128,128);
+			shadowColor=0xFFFFFFFF;
 		}
 
 		A4SRightGlyph a4sRightGlyph=A4S_RIGHT_GLYPH_NONE;
@@ -3087,6 +3295,24 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 					AlphaBlend(hdc,x,y,s.cx,s.cy,hdc2,s_bRTL?sizes[6].x-sizes[4].y:sizes[3].x,0,s.cx,s.cy,func);
 				}
 				SelectObject(hdc2,bmp0);
+			}
+		}
+		else if (bA4SContextFlyout)
+		{
+			if (item.id==MENU_A4S_CONTEXT_RUNAS)
+			{
+				SHSTOCKICONINFO shield={sizeof(shield)};
+				if (SUCCEEDED(SHGetStockIconInfo(SIID_SHIELD,SHGSI_ICON|SHGSI_SMALLICON,&shield)) && shield.hIcon)
+				{
+					const int size=A4SMenuProfile::Scale(16,s_Skin.Dpi);
+					const int x=A4SMenuProfile::Scale(11,s_Skin.Dpi);
+					const int y=(itemRect.top+itemRect.bottom-size)/2;
+					if (bA4SContextItemEnabled)
+						DrawIconEx(hdc,x,y,shield.hIcon,size,size,0,NULL,DI_NORMAL);
+					else
+						DrawState(hdc,NULL,NULL,(LPARAM)shield.hIcon,0,x,y,size,size,DST_ICON|DSS_DISABLED);
+					DestroyIcon(shield.hIcon);
+				}
 			}
 		}
 		else if (bA4SRightPane)
@@ -3194,6 +3420,16 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 		}
 		if (A4SMenuProfile::IsEnabled() && item.id==MENU_SHUTDOWN_BUTTON)
 			rc.left-=A4SMenuProfile::Scale(2,s_Skin.Dpi);
+		if (A4SMenuProfile::IsEnabled() && IsA4SShutdownFlyout() &&
+			(item.id==MENU_RESTART || item.id==MENU_RESTART_NOUPDATE))
+			OffsetRect(&rc,0,-A4SMenuProfile::Scale(1,s_Skin.Dpi));
+		if (bA4SContextFlyout)
+		{
+			rc.left=A4SMenuProfile::Scale(35,s_Skin.Dpi);
+			rc.top=itemRect.top;
+			rc.right=A4SMenuProfile::Scale(208,s_Skin.Dpi);
+			rc.bottom=itemRect.bottom;
+		}
 
 		DWORD flags=DT_END_ELLIPSIS;
 		if (item.id==MENU_NO || (item.id==MENU_RECENT && recentType!=RECENT_KEYS_DIGITS))
@@ -3225,7 +3461,7 @@ void CMenuContainer::DrawBackground( HDC hdc, const RECT &drawRect )
 		if (s_Theme)
 		{
 			DTTOPTS opts={sizeof(opts),DTT_TEXTCOLOR};
-			if (glowSize || settings.opacity==MenuSkin::OPACITY_FULLALPHA || settings.opacity==MenuSkin::OPACITY_FULLGLASS)
+			if (bA4SContextFlyout || glowSize || settings.opacity==MenuSkin::OPACITY_FULLALPHA || settings.opacity==MenuSkin::OPACITY_FULLGLASS)
 				opts.dwFlags|=DTT_COMPOSITED;
 			if (glowSize)
 			{

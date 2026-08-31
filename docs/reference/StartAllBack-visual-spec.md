@@ -3,7 +3,7 @@
 Status: **reference set complete for Phase 4**
 
 Captured on: 2026-08-30
-Target: only the popup Start menu. The taskbar, Start button, File Explorer, context menus, and every other Windows shell surface are out of scope.
+Target: only the popup Start menu, including its program-row popup. The taskbar, Start button, File Explorer UI and its own context menus, and every other Windows shell surface are out of scope.
 
 Labeled review sheet: `StartAllBack-capture-sheet.png`.
 
@@ -21,6 +21,22 @@ This document separates measured facts from implementation choices. The live con
 - The popup uses normal foreground-window z-order, not persistent `WS_EX_TOPMOST`: opening it or clicking inside raises it, while activating another application may place that application above it.
 - Hovering **All Programs** or **Back** paints the normal hover highlight only. Switching between those views requires an explicit mouse click or keyboard activation; no hover timer may toggle the view.
 - Scroll input, thumb dragging, and scrollbar-button use must immediately show the bright 6 px thumb and arrows, then decay to the quiet 2 px idle line after interaction.
+- Delayed shell-description tooltips are disabled throughout the A4S popup, including program rows, right-pane links, the shutdown control, and its flyout.
+- Per the current user preference, the A4S power flyout shows Sleep before Restart. Its 117x128 px size and captured overlapping position are retained. The flyout uses the same acrylic policy and opacity as the main menu; the overlapped root pixels are temporarily excluded so the flyout samples the desktop/application once rather than double-tinting the main material.
+
+## User-directed pinned-program and context-menu contract (2026-08-31)
+
+- A pinned program is a large root-row variant: **40 DIP** high with a **32×32 DIP** icon. At 96 DPI the first row begins at local `y=7`, its icon occupies `x=12..43`, `y=11..42`, and its text ink begins at approximately `x=50`.
+- The larger geometry applies only to root pinned programs. All Programs retains its 22 DIP rows and small icons; search results and the right pane retain their independent metrics.
+- The product continues to read pins from the current user Start Menu root so it shares the user's existing StartAllBack pins. Pinning copies a source `.lnk` rather than creating a nested link; unpinning may delete only a validated direct-child `.lnk` from that root.
+- Right-clicking an unpinned program shows exactly three source-owned commands, with no injected shell-extension entries or separators:
+  1. Run as administrator
+  2. Pin to start menu
+  3. Open file location
+- A pinned program uses the same order, changing only command 2 to **Unpin from start menu**.
+- Program folders, blank space, search results, right-pane links, and other popup surfaces do not expose Open-Shell's generic context menu.
+- The footer power control ends at x=397 DIP, three pixels left of the earlier prototype; its chevron, split hit boundary, connected highlight edge, and flyout anchor move left with that edge.
+- Categorized search rows use their actual 31-DIP pitch and stop completely above the fixed See more results strip at y=362. The native edit remains the input, selection, clipboard, accessibility, and horizontal-scroll model but contributes no visible pixels. Query, hint, selection, and the blinking caret are rendered together on the parent's 32-bit buffer using the menu's ClearType-natural Segoe UI Variable Text font through `DTT_COMPOSITED`, producing grayscale coverage without child-surface erase artifacts.
 
 ## Capture matrix
 
@@ -116,7 +132,7 @@ This document separates measured facts from implementation choices. The live con
 ## Normal/main state
 
 - The normal capture has the same 463×443 frame and right rail.
-- The left program area is intentionally empty: `Start_TrackProgs=0`, `StartMenuFavorites=0`, and the favorites payload contains no pinned entries.
+- The captured StartAllBack left program area is intentionally empty: `Start_TrackProgs=0`, `StartMenuFavorites=0`, and the capture-time favorites payload contains no pinned entries. The current A4S product may display explicit current-user pins in this area; it must never synthesize MFU/recent defaults.
 - `Start_MinMFU=9` reserves the empty program area.
 - The bottom-left band says **All Programs** with a right-pointing chevron; selecting it switches the same pane to the All Programs list.
 - Do not populate the empty area with Open-Shell recent programs or pinned defaults.
@@ -145,7 +161,7 @@ This document separates measured facts from implementation choices. The live con
 
 - Search outer bounds: `x=13..269`, `y=404..429`, exactly **257×26 px**.
 - Border: about `#4B4F50`–`#4E5053`, 1 px, 3–4 px radius.
-- Fill mode: `#191919`; it stays materially more opaque/fixed than the glass body.
+- Captured StartAllBack fill mode: `#191919`, materially more opaque/fixed than the glass body. The current A4S product intentionally overrides that captured material with the continuous wallpaper-reactive acrylic policy defined above.
 - Empty-state magnifier: `x=18..32`, `y=409..423`, 15×15 visible pixels in a 16 px cell.
 - The bright vertical at `x=44`, `y=408..424` is the focused empty-edit **caret**, not a decorative divider. It must blink and follow focus.
 - Search hint begins at `x≈51/52`.
@@ -174,17 +190,20 @@ This document separates measured facts from implementation choices. The live con
 
 ## Shutdown hover and flyout
 
-- Hovering the power control highlights the footer button and can show the system tooltip (`Closes all apps and turns off the PC`).
+- Hovering either half of the power control paints one connected rounded highlight across **Shut down** and its chevron. Delayed system-description tooltips are disabled.
+- Opening the power flyout does not latch the root **Shut down** highlight; the connected root highlight is present only while the pointer or an active press remains over the footer control.
 - Clicking the chevron opens a **117×128 px** flyout, captured at screenshot coordinates `(399,306)..(515,433)`.
 - Item order is authoritative:
   1. Switch user
   2. Sign out
   3. separator
   4. Lock
-  5. Restart
-  6. Sleep
+  5. Sleep
+  6. Restart
 - Hibernate is absent because it is disabled on this system.
 - Flyout uses the same dark, subtly backdrop-reactive material, small rounded chrome, white Segoe UI text, 24–25 px row rhythm, and neutral hover treatment.
+- The first-row **Switch user** hover fill is trimmed by 2 DIP at the flyout's top edge, and the last-row **Restart** fill is trimmed by 2 DIP at its bottom edge; row hit targets and text positions do not move.
+- The fixed right-pane **Command Prompt** entry launches through Open-Shell's existing elevated-command path on a normal click and therefore requests standard UAC consent when required.
 
 ## User-account behavior
 
@@ -193,12 +212,23 @@ This document separates measured facts from implementation choices. The live con
 - Therefore a separate user-menu state is **not applicable** to the current setup. Do not invent one in Open-Shell.
 - Session actions that do exist (Switch user and Sign out) are represented in the shutdown flyout.
 
+## Program context flyout
+
+- Right-clicking a pinned program or an All Programs leaf opens a source-owned compact flyout, not the native Windows `HMENU` surface.
+- The command order is fixed: **Run as administrator**, **Pin/Unpin from start menu**, **Open file location**.
+- At 96 DPI the popup is exactly **216x80 px**: 4 px top padding, three 24 px rows, and 4 px bottom padding.
+- Row hit rectangles are `[4,4,212,28)`, `[4,28,212,52)`, and `[4,52,212,76)`; the visible hover fill retains the shared one-physical-pixel inset.
+- The UAC shield is 16x16 px at popup-local `x=11`; text begins at popup-local `x=35` and uses the same composited Segoe UI Variable Text rendering as the shutdown flyout.
+- The popup uses the shutdown flyout's WCA acrylic, small DWM corners, border, and native shadow. Where it overlaps the root menu, the overlap is temporarily excluded from the root so the popup samples the desktop/application once instead of inheriting the root tint.
+- It follows normal menu focus behavior: it appears above the active Start menu, dismisses on Escape or an outside click, and does not remain globally topmost after another application is activated.
+- While it is open, left- or right-clicking another eligible pinned or All Programs leaf consumes that complete click, closes the old popup, and opens a replacement at the newly clicked program. Clicking any ineligible surface performs an ordinary dismissal.
+
 ## Backdrop material, color, and opacity
 
 - Neutral clean-body modes are `#272727` and `#282828`; footer modes are `#212121`–`#222222`.
-- The blue-background capture moves body sample `(100,100)` from neutral `#282828` to `#172954`, while the search sample `(250,417)` stays `#191919`.
+- The blue-background StartAllBack capture moves body sample `(100,100)` from neutral `#282828` to `#172954`, while its search sample `(250,417)` stays `#191919`. This is a reference fact; A4S applies its documented continuous-material override to the search surface too.
 - This proves a **live adaptive blurred-backdrop tint**, not a flat dark fill or static transparent bitmap.
-- Search fill is deliberately more opaque/fixed than the surrounding material.
+- StartAllBack's captured search fill is more opaque/fixed than the surrounding material; this behavior is not carried into the current A4S override.
 - Flattened 24-bit screenshots cannot uniquely separate blur kernel, tint, and compositor alpha. Use `StartMenuAlpha=128`, native Windows backdrop composition, and live A/B validation rather than fitting a guessed static alpha.
 
 ## Current StartAllBack configuration
@@ -219,7 +249,7 @@ This document separates measured facts from implementation choices. The live con
 2. Make the main Start Menu renderer/DLL authoritative for geometry, material, painting, interaction states, icons, search, inline folders, scrollbar behavior, and the shutdown flyout.
 3. Retain only the minimal executable/loader and DLL boundary required to hook the existing Start button and show this popup. Remove or compile out unrelated Open-Shell feature surfaces, skin selection, menu customization, settings pages, update plumbing, and unused shell components.
 4. Keep environment constants in a small, explicit renderer profile inside the customizable DLL so future visual changes do not require restoring the general Open-Shell skin/settings system.
-5. Do not change the taskbar, Start button appearance, File Explorer, context menus, or any other shell behavior.
+5. Do not change the taskbar, Start button appearance, File Explorer or its context menus, or any other shell behavior outside this popup.
 6. Match the 463×443 silhouette, 8 px corners, column split, row rhythms, icon cells, type baselines, footer/search layout, inline folder expansion, two-state clean scrollbar, highlights, shutdown flyout, and backdrop-reactive material.
 7. Use live composition for backdrop and native DWM shadow; do not paint flattened screenshot colors as fixed fills.
 8. Keep the normal left pane empty and omit Open-Shell feature clutter that is absent from the reference.

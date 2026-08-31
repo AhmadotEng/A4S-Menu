@@ -64,11 +64,24 @@ static auto ExecuteOnSTAThread(TFunc&& func) -> decltype(func())
 	return result;
 }
 
-// Wrapper for IContextMenu::InvokeCommand that runs on separate STA thread and pumps messages
+// Wrapper for IContextMenu::InvokeCommand that runs on a separate STA thread
+// while the caller pumps messages. IContextMenu is created in the menu's UI
+// apartment, so it must be marshalled before the worker can use it.
 static HRESULT InvokeCommandSafe(IContextMenu* pMenu, LPCMINVOKECOMMANDINFO pInfo)
 {
-	return ExecuteOnSTAThread([&]() {
-		return pMenu->InvokeCommand(pInfo);
+	IStream *pStream=NULL;
+	HRESULT hr=CoMarshalInterThreadInterfaceInStream(IID_IContextMenu,pMenu,&pStream);
+	if (FAILED(hr))
+		return hr;
+
+	return ExecuteOnSTAThread([pStream,pInfo]() {
+		IContextMenu *pWorkerMenu=NULL;
+		HRESULT workerHr=CoGetInterfaceAndReleaseStream(pStream,IID_IContextMenu,(void **)&pWorkerMenu);
+		if (FAILED(workerHr))
+			return workerHr;
+		workerHr=pWorkerMenu->InvokeCommand(pInfo);
+		pWorkerMenu->Release();
+		return workerHr;
 	});
 }
 
@@ -703,6 +716,11 @@ void CMenuContainer::OpenSubMenu( int index, TActivateType type, bool bShift )
 		speed=GetSettingInt(L"SubMenuAnimationSpeed");
 		if (speed<=0) speed=MENU_ANIM_SPEED_SUBMENU;
 		else if (speed>=10000) speed=10000;
+	}
+	if (A4SMenuProfile::IsEnabled() && item.id==MENU_SHUTDOWN_BUTTON)
+	{
+		animFlags&=~AW_TOPMOST;
+		pMenu->PrepareA4SFlyoutBackdrop(rc2);
 	}
 	pMenu->AnimateMenu(animFlags,speed,rc2);
 
@@ -1387,7 +1405,21 @@ static HRESULT CreatePinLink( PCIDLIST_ABSOLUTE sourcePidl, const wchar_t *name,
 	wchar_t finalPath[_MAX_PATH];
 	PathYetAnotherMakeUniqueName(finalPath,path,NULL,PathFindFileName(path));
 
-	HRESULT hr;
+	HRESULT hr=S_OK;
+	bool copiedSourceLink=false;
+	wchar_t sourcePath[_MAX_PATH];
+	if (SHGetPathFromIDList(sourcePidl,sourcePath) &&
+		_wcsicmp(PathFindExtension(sourcePath),L".lnk")==0)
+	{
+		// Preserve the original shortcut target, arguments, working directory,
+		// AppID, and icon. Creating an IShellLink to a .lnk would instead make a
+		// fragile link-to-link pin.
+		if (!CopyFile(sourcePath,finalPath,TRUE))
+			return HRESULT_FROM_WIN32(GetLastError());
+		copiedSourceLink=true;
+	}
+
+	if (!copiedSourceLink)
 	{
 		CComPtr<IShellLink> pLink;
 		hr=pLink.CoCreateInstance(CLSID_ShellLink);
@@ -1434,6 +1466,49 @@ static HRESULT CreatePinLink( PCIDLIST_ABSOLUTE sourcePidl, const wchar_t *name,
 	return S_OK;
 }
 
+static bool GetA4SPinnedLinkPath( PCIDLIST_ABSOLUTE itemPidl, const wchar_t *pinFolder, wchar_t *path, int pathCount )
+{
+	if (!itemPidl || !pinFolder || !*pinFolder || !path || pathCount==0)
+		return false;
+
+	wchar_t itemPath[_MAX_PATH];
+	if (!SHGetPathFromIDList(itemPidl,itemPath) ||
+		_wcsicmp(PathFindExtension(itemPath),L".lnk")!=0)
+		return false;
+
+	wchar_t parent[_MAX_PATH];
+	wchar_t pins[_MAX_PATH];
+	Strcpy(parent,_countof(parent),itemPath);
+	Strcpy(pins,_countof(pins),pinFolder);
+	PathRemoveBackslash(pins);
+	if (!PathRemoveFileSpec(parent) || _wcsicmp(parent,pins)!=0)
+		return false;
+
+	Strcpy(path,pathCount,itemPath);
+	return true;
+}
+
+static HRESULT RemoveA4SPinnedLink( PCIDLIST_ABSOLUTE itemPidl, const wchar_t *pinFolder )
+{
+	wchar_t path[_MAX_PATH];
+	if (!GetA4SPinnedLinkPath(itemPidl,pinFolder,path,_countof(path)))
+		return E_ACCESSDENIED;
+
+	DWORD attributes=GetFileAttributes(path);
+	if (attributes==INVALID_FILE_ATTRIBUTES)
+		return HRESULT_FROM_WIN32(GetLastError());
+	if ((attributes&FILE_ATTRIBUTE_READONLY) &&
+		!SetFileAttributes(path,attributes&~FILE_ATTRIBUTE_READONLY))
+		return HRESULT_FROM_WIN32(GetLastError());
+
+	if (DeleteFile(path))
+		return S_OK;
+	DWORD error=GetLastError();
+	if (attributes&FILE_ATTRIBUTE_READONLY)
+		SetFileAttributes(path,attributes);
+	return HRESULT_FROM_WIN32(error);
+}
+
 static CString GetContextMenuItemVerb(IContextMenu* pContextMenu, UINT_PTR uId)
 {
 	wchar_t verbW[256] = {};
@@ -1445,6 +1520,210 @@ static CString GetContextMenuItemVerb(IContextMenu* pContextMenu, UINT_PTR uId)
 		return CString(verbA);
 
 	return {};
+}
+
+static bool IsA4SContextOutsideMouseMessage( const MSG &msg, HWND popup )
+{
+	if (msg.hwnd==popup || ::IsChild(popup,msg.hwnd))
+		return false;
+	return (msg.message>=WM_MOUSEFIRST && msg.message<=WM_MOUSELAST) ||
+		msg.message==WM_NCLBUTTONDOWN || msg.message==WM_NCRBUTTONDOWN ||
+		msg.message==WM_NCMBUTTONDOWN || msg.message==WM_NCXBUTTONDOWN;
+}
+
+static bool IsA4SContextDismissMessage( UINT message )
+{
+	return message==WM_LBUTTONDOWN || message==WM_LBUTTONDBLCLK ||
+		message==WM_RBUTTONDOWN || message==WM_RBUTTONDBLCLK ||
+		message==WM_MBUTTONDOWN || message==WM_MBUTTONDBLCLK ||
+		message==WM_XBUTTONDOWN || message==WM_XBUTTONDBLCLK ||
+		message==WM_NCLBUTTONDOWN || message==WM_NCRBUTTONDOWN ||
+		message==WM_NCMBUTTONDOWN || message==WM_NCXBUTTONDOWN;
+}
+
+int CMenuContainer::ShowA4SContextFlyout( int parentIndex, const POINT *pPt, bool bPinned, bool bFileSystemItem )
+{
+	StdMenuItem menuItems[4]=
+	{
+		{NULL,MENU_A4S_CONTEXT_RUNAS,NULL,NULL,L"Run as administrator",L"",L"none"},
+		{NULL,bPinned?MENU_A4S_CONTEXT_UNPIN:MENU_A4S_CONTEXT_PIN,NULL,NULL,
+			bPinned?L"Unpin from start menu":L"Pin to start menu",L"",L"none"},
+		{NULL,MENU_A4S_CONTEXT_OPEN_LOCATION,NULL,NULL,L"Open file location",L"",L"none"},
+		{NULL,MENU_LAST},
+	};
+
+	int result=0;
+	CMenuContainer *pMenu=new CSubMenuContainer(this,parentIndex,CONTAINER_A4S_CONTEXT,menuItems,NULL,NULL);
+	pMenu->m_pA4SContextResult=&result;
+	pMenu->m_bA4SContextFileSystemItem=bFileSystemItem;
+	pMenu->m_MaxWidth=A4SMenuProfile::Scale(216,s_Skin.Dpi);
+	pMenu->InitItems();
+
+	SetActiveWindow();
+	CloseSubMenus(CLOSE_SKIP_LAST,this);
+	HWND owner=GetParent();
+	if (!pMenu->Create(owner,NULL,s_SubmenuStyle,WS_EX_TOOLWINDOW|(s_bRTL?WS_EX_LAYOUTRTL:0)))
+	{
+		pMenu->Release();
+		return 0;
+	}
+
+	if (GetSettingBool(L"MenuShadow") && s_Skin.Submenu_shadow==MenuSkin::SHADOW_ON)
+		SetClassLongPtr(pMenu->m_hWnd,GCL_STYLE,GetClassLongPtr(pMenu->m_hWnd,GCL_STYLE)|CS_DROPSHADOW);
+	else
+		SetClassLongPtr(pMenu->m_hWnd,GCL_STYLE,GetClassLongPtr(pMenu->m_hWnd,GCL_STYLE)&~CS_DROPSHADOW);
+
+	POINT popupPoint;
+	if (pPt)
+		popupPoint=*pPt;
+	else
+	{
+		RECT itemRect;
+		GetItemRect(parentIndex,itemRect);
+		MapWindowPoints(NULL,&itemRect);
+		popupPoint.x=itemRect.left;
+		popupPoint.y=itemRect.top;
+	}
+
+	RECT popupRect;
+	pMenu->GetWindowRect(&popupRect);
+	const int width=popupRect.right-popupRect.left;
+	const int height=popupRect.bottom-popupRect.top;
+	popupRect.left=popupPoint.x;
+	popupRect.top=popupPoint.y;
+	popupRect.right=popupRect.left+width;
+	popupRect.bottom=popupRect.top+height;
+	if (popupRect.right>s_MenuLimits.right)
+		OffsetRect(&popupRect,(std::max)(s_MenuLimits.left,popupPoint.x-width)-popupRect.left,0);
+	if (popupRect.left<s_MenuLimits.left)
+		OffsetRect(&popupRect,s_MenuLimits.left-popupRect.left,0);
+	if (popupRect.bottom>s_MenuLimits.bottom)
+		OffsetRect(&popupRect,0,(std::max)(s_MenuLimits.top,popupPoint.y-height)-popupRect.top);
+	if (popupRect.top<s_MenuLimits.top)
+		OffsetRect(&popupRect,0,s_MenuLimits.top-popupRect.top);
+
+	SetSubmenu(parentIndex);
+	SetContextItem(parentIndex);
+	InvalidateItem(parentIndex);
+	KillTimer(TIMER_HOVER);
+	pMenu->SetFocus();
+	int hotItem=-1;
+	if (!pPt)
+	{
+		for (int i=0;i<(int)pMenu->m_Items.size();i++)
+			if (pMenu->CanSelectItem(i))
+			{
+				hotItem=i;
+				break;
+			}
+	}
+	pMenu->SetHotItem(hotItem);
+	pMenu->PrepareA4SFlyoutBackdrop(popupRect);
+	pMenu->AnimateMenu(AW_ACTIVATE,0,popupRect);
+
+	HWND popup=pMenu->m_hWnd;
+	HWND replacementTarget=NULL;
+	POINT replacementPoint={};
+	bool replacementArmed=false;
+	bool replacementReady=false;
+	UINT replacementButtonUp=0;
+	int quitCode=-1;
+	while (::IsWindow(popup))
+	{
+		MSG msg;
+		BOOL status=GetMessage(&msg,NULL,0,0);
+		if (status<=0)
+		{
+			if (status==0)
+				quitCode=(int)msg.wParam;
+			if (::IsWindow(popup))
+				::DestroyWindow(popup);
+			break;
+		}
+		if (replacementArmed && msg.message==WM_CONTEXTMENU)
+			continue;
+		if (replacementArmed && msg.message==replacementButtonUp)
+		{
+			// Consume the release as well as the press. Otherwise the TreeView can
+			// turn the tail of a left click into a launch, or generate a second native
+			// context request from a right click. Reopen only after this loop unwinds.
+			replacementReady=true;
+			if (::IsWindow(popup))
+				::DestroyWindow(popup);
+			continue;
+		}
+		if (IsA4SContextOutsideMouseMessage(msg,popup))
+		{
+			if ((msg.message==WM_LBUTTONDOWN || msg.message==WM_RBUTTONDOWN) && !replacementArmed)
+			{
+				bool bProgramRow=false;
+				HWND candidateTarget=NULL;
+				if (m_pProgramsTree && msg.hwnd==m_pProgramsTree->m_hWnd)
+				{
+					POINT clientPoint=msg.pt;
+					::ScreenToClient(msg.hwnd,&clientPoint);
+					TVHITTESTINFO test={clientPoint};
+					TreeView_HitTest(msg.hwnd,&test);
+					if ((test.flags&(TVHT_ONITEM|TVHT_ONITEMINDENT|TVHT_ONITEMRIGHT)) && test.hItem)
+					{
+						TVITEM treeItem={TVIF_PARAM,test.hItem};
+						TreeView_GetItem(msg.hwnd,&treeItem);
+						const CProgramsTree::CTreeItem *pTreeItem=(const CProgramsTree::CTreeItem*)treeItem.lParam;
+						bProgramRow=pTreeItem && !pTreeItem->bFolder && pTreeItem->pItemInfo1;
+						if (bProgramRow)
+							candidateTarget=m_pProgramsTree->m_hWnd;
+					}
+				}
+				else if ((msg.hwnd==m_hWnd || ::IsChild(m_hWnd,msg.hwnd)) &&
+					!m_bSubMenu && s_MenuMode==MODE_NORMAL)
+				{
+					POINT clientPoint=msg.pt;
+					ScreenToClient(&clientPoint);
+					int index=HitTest(clientPoint,NULL);
+					if (index>=0)
+					{
+						const MenuItem &item=m_Items[index];
+						bProgramRow=item.column==0 && item.id==MENU_NO && !item.pStdItem &&
+							!item.bFolder && item.pItem1;
+						if (bProgramRow)
+							candidateTarget=m_hWnd;
+					}
+				}
+
+				if (bProgramRow)
+				{
+					replacementTarget=candidateTarget;
+					replacementPoint=msg.pt;
+					replacementButtonUp=msg.message==WM_RBUTTONDOWN?WM_RBUTTONUP:WM_LBUTTONUP;
+					replacementArmed=true;
+					continue;
+				}
+			}
+			if (IsA4SContextDismissMessage(msg.message) && ::IsWindow(popup))
+				::DestroyWindow(popup);
+			continue;
+		}
+		TranslateMessage(&msg);
+		DispatchMessage(&msg);
+	}
+	if (quitCode>=0)
+		PostQuitMessage(quitCode);
+
+	if (!m_bDestroyed)
+	{
+		SetContextItem(-1);
+		if (m_HotItem<0)
+			SetHotItem(parentIndex);
+	}
+	if (replacementReady && !m_bDestroyed && ::IsWindow(replacementTarget))
+	{
+		// WM_CONTEXTMENU is queued after the complete left/right click so the old flyout's
+		// synchronous activation has returned before the replacement is created.
+		::PostMessage(replacementTarget,WM_CONTEXTMENU,(WPARAM)replacementTarget,
+			MAKELPARAM(replacementPoint.x,replacementPoint.y));
+	}
+	s_HotPos=GetMessagePos();
+	return result;
 }
 
 // This function "activates" an item. The item can be activated in multiple ways:
@@ -1535,6 +1814,41 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 				m_SearchScrollPos=m_Scrollbar.SetScrollPos(SB_CTL,pos);
 				InvalidateRect(&m_rContent);
 			}
+		}
+		return;
+	}
+
+	if ((m_Options&CONTAINER_A4S_CONTEXT) && (type==ACTIVATE_EXECUTE || type==ACTIVATE_MENU))
+	{
+		int command=0;
+		if (IsA4SContextItemEnabled(item))
+		{
+			switch (item.id)
+			{
+				case MENU_A4S_CONTEXT_RUNAS:
+					command=CMD_A4S_RUNAS;
+					break;
+				case MENU_A4S_CONTEXT_PIN:
+					command=CMD_A4S_PIN_PROGRAM;
+					break;
+				case MENU_A4S_CONTEXT_UNPIN:
+					command=CMD_A4S_UNPIN_PROGRAM;
+					break;
+				case MENU_A4S_CONTEXT_OPEN_LOCATION:
+					command=CMD_A4S_OPEN_LOCATION;
+					break;
+			}
+		}
+		if (command)
+		{
+			if (m_pA4SContextResult)
+				*m_pA4SContextResult=command;
+			// Close after this activation handler unwinds. DestroyWindow would run
+			// OnFinalMessage/Release re-entrantly and could delete this object before
+			// ActivateItem returns.
+			ShowWindow(SW_HIDE);
+			PostMessage(WM_CLOSE);
+			m_bClosing=true;
 		}
 		return;
 	}
@@ -1832,7 +2146,12 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 					DoEnvironmentSubst(buf,_countof(buf));
 					if (!searchText.IsEmpty() && (wcswcs(buf,L"%1") || wcswcs(buf,L"%2")))
 						DoSearchSubst(buf,_countof(buf),searchText);
-					ExecuteCommand(buf,bShift && bCtrl,false);
+					// Command Prompt is the only cmd.exe entry in the locked A4S right
+					// column. Reuse Open-Shell's existing elevation path for its normal
+					// click while leaving every other custom command unchanged.
+					const bool bA4SAdminCommandPrompt=A4SMenuProfile::IsEnabled() &&
+						item.id==MENU_CUSTOM && _wcsicmp(item.pStdItem->command,L"cmd.exe")==0;
+					ExecuteCommand(buf,bA4SAdminCommandPrompt || (bShift && bCtrl),false);
 				}
 		}
 		return;
@@ -1867,6 +2186,68 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 		_appId=item.pItemInfo->GetAppid();
 		_bIsLink=item.pItemInfo->IsLink();
 		_bExplicitAppId=item.pItemInfo->IsExplicitAppId();
+	}
+
+	if (A4SMenuProfile::IsEnabled() && (type==ACTIVATE_MENU || type==ACTIVATE_MENU_BACKGROUND))
+	{
+		const bool bProgramsTreeItem=pData && pData->bProgramsTree;
+		const bool bPinnedRootItem=!m_bSubMenu && s_MenuMode==MODE_NORMAL &&
+			item.column==0 && item.id==MENU_NO && !item.pStdItem;
+		const bool bA4SProgramItem=type==ACTIVATE_MENU && item.id==MENU_NO &&
+			!item.bFolder && pItemPidl1 && (bProgramsTreeItem || bPinnedRootItem);
+		if (!bA4SProgramItem)
+			return;
+		// The compact flyout runs a nested menu loop. Keep the parent container
+		// alive if a Start-button toggle or activation change closes the complete
+		// menu while that loop is dispatching messages.
+		AddRef();
+
+		wchar_t itemPath[_MAX_PATH]={};
+		const bool bFileSystemItem=SHGetPathFromIDList(pItemPidl1,itemPath)!=FALSE;
+		wchar_t pinnedPath[_MAX_PATH];
+		const bool bPinned=GetA4SPinnedLinkPath(pItemPidl1,s_PinFolder,pinnedPath,_countof(pinnedPath));
+
+		LOG_MENU(LOG_EXECUTE,L"Open A4S program context menu, ptr=%p",this);
+		int result=ShowA4SContextFlyout(index,pPt,bPinned,bFileSystemItem && !_bMetroApp);
+		LOG_MENU(LOG_EXECUTE,L"Select A4S program context menu, ptr=%p, index=%d",this,result);
+		if (pData)
+			pData->command=result;
+
+		if (result==CMD_A4S_RUNAS && bFileSystemItem && !_bMetroApp)
+		{
+			wchar_t command[_MAX_PATH];
+			Strcpy(command,_countof(command),itemPath);
+			PathQuoteSpaces(command);
+			PlayMenuSound(SOUND_COMMAND);
+			ExecuteCommand(command,true,false);
+			CloseSubMenus(CLOSE_POST,NULL);
+		}
+		else if (result==CMD_A4S_PIN_PROGRAM)
+		{
+			if (SUCCEEDED(CreatePinLink(pItemPidl1,item.name,NULL,0)))
+			{
+				PlayMenuSound(SOUND_COMMAND);
+				m_bRefreshItems=true;
+				PostRefreshMessage();
+			}
+		}
+		else if (result==CMD_A4S_UNPIN_PROGRAM)
+		{
+			if (SUCCEEDED(RemoveA4SPinnedLink(pItemPidl1,s_PinFolder)))
+			{
+				PlayMenuSound(SOUND_COMMAND);
+				m_bRefreshItems=true;
+				PostRefreshMessage();
+			}
+		}
+		else if (result==CMD_A4S_OPEN_LOCATION && bFileSystemItem && !_bMetroApp)
+		{
+			PlayMenuSound(SOUND_COMMAND);
+			SHOpenFolderAndSelectItemsSafe(pItemPidl1,0,NULL,0);
+			CloseSubMenus(CLOSE_POST,NULL);
+		}
+		Release();
+		return;
 	}
 
 	// create a context menu for the selected item. the context menu can be shown (ACTIVATE_MENU) or its default

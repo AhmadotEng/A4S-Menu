@@ -8,6 +8,6 @@ review the A4S Menu popup.
 - `states/` contains the individual StartAllBack menu states.
 - `StartAllBack-capture-sheet.png` is the consolidated review sheet.
 
-These files describe only the popup Start menu. They do not authorize or
-specify taskbar, Start-button, File Explorer, context-menu, or other shell
-changes.
+These files describe only the popup Start menu, including its source-owned
+program-row flyout. They do not authorize or specify taskbar, Start-button,
+File Explorer, external shell-context-menu, or other Windows shell changes.

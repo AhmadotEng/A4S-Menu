@@ -93,7 +93,8 @@ static LRESULT CALLBACK SubclassInfoTipProc( HWND hWnd, UINT uMsg, WPARAM wParam
 void CProgramsTree::Create( CMenuContainer *pOwner )
 {
 	m_pOwner=pOwner;
-	HWND hWnd=CreateWindowEx(0,WC_TREEVIEW,NULL,WS_CHILD|TVS_EDITLABELS|TVS_FULLROWSELECT|(CMenuContainer::s_TipHideTime?TVS_INFOTIP:0)|TVS_NOHSCROLL|TVS_SHOWSELALWAYS|TVS_NONEVENHEIGHT,0,0,0,0,pOwner->m_hWnd,NULL,g_Instance,NULL);
+	const DWORD tooltipStyle=A4SMenuProfile::IsEnabled()?TVS_NOTOOLTIPS:(CMenuContainer::s_TipHideTime?TVS_INFOTIP:0);
+	HWND hWnd=CreateWindowEx(0,WC_TREEVIEW,NULL,WS_CHILD|TVS_EDITLABELS|TVS_FULLROWSELECT|tooltipStyle|TVS_NOHSCROLL|TVS_SHOWSELALWAYS|TVS_NONEVENHEIGHT,0,0,0,0,pOwner->m_hWnd,NULL,g_Instance,NULL);
 	TreeView_SetExtendedStyle(hWnd,TVS_EX_AUTOHSCROLL,TVS_EX_AUTOHSCROLL);
 	const MenuSkin &skin=CMenuContainer::s_Skin;
 	m_TreeTheme=OpenThemeData(hWnd,L"treeview");
@@ -120,10 +121,13 @@ void CProgramsTree::Create( CMenuContainer *pOwner )
 	s_bFoldersFirst=GetSettingBool(L"FoldersFirst");
 
 	HWND tooltip=TreeView_GetToolTips(m_hWnd);
-	SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_AUTOPOP,CMenuContainer::s_TipHideTime);
-	SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_INITIAL,CMenuContainer::s_TipShowTime);
-	SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_RESHOW,CMenuContainer::s_TipShowTime);
-	SetWindowSubclass(tooltip,SubclassInfoTipProc,'CLSH',0);
+	if (tooltip)
+	{
+		SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_AUTOPOP,CMenuContainer::s_TipHideTime);
+		SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_INITIAL,CMenuContainer::s_TipShowTime);
+		SendMessage(tooltip,TTM_SETDELAYTIME,TTDT_RESHOW,CMenuContainer::s_TipShowTime);
+		SetWindowSubclass(tooltip,SubclassInfoTipProc,'CLSH',0);
+	}
 
 	AddRef(); // this will be released in OnFinalMeessage
 }
@@ -585,9 +589,29 @@ LRESULT CProgramsTree::OnTimer( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& b
 
 LRESULT CProgramsTree::OnContextMenu( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
-	if (CMenuContainer::s_bNoContextMenu) return 0;
-	HTREEITEM hItem;
-	const CTreeItem *pItem=GetSelectedItem(hItem);
+	if (CMenuContainer::s_bNoContextMenu && !A4SMenuProfile::IsEnabled()) return 0;
+	POINT popupPoint={(short)LOWORD(lParam),(short)HIWORD(lParam)};
+	const bool bMousePoint=popupPoint.x!=-1 || popupPoint.y!=-1;
+	HTREEITEM hItem=NULL;
+	const CTreeItem *pItem=NULL;
+	if (bMousePoint)
+	{
+		// WM_CONTEXTMENU carries screen coordinates. Hit-test them here instead of
+		// relying on an earlier button message to select the row. The A4S flyout
+		// replacement path deliberately consumes that earlier left click.
+		TVHITTESTINFO test={popupPoint};
+		ScreenToClient(&test.pt);
+		TreeView_HitTest(m_hWnd,&test);
+		if (!(test.flags&(TVHT_ONITEM|TVHT_ONITEMINDENT|TVHT_ONITEMRIGHT)) || !test.hItem)
+			return 0;
+		hItem=test.hItem;
+		TreeView_SelectItem(m_hWnd,hItem);
+		TVITEM item={TVIF_PARAM,hItem};
+		TreeView_GetItem(m_hWnd,&item);
+		pItem=(CTreeItem*)item.lParam;
+	}
+	else
+		pItem=GetSelectedItem(hItem);
 	if (pItem)
 	{
 		RECT rc;
@@ -612,7 +636,8 @@ LRESULT CProgramsTree::OnContextMenu( UINT uMsg, WPARAM wParam, LPARAM lParam, B
 			data.bAutoSort=m_bAutoSort;
 		}
 		data.hTreeItem=hItem;
-		m_pOwner->ActivateTreeItem(pItem,rc,CMenuContainer::ACTIVATE_MENU,NULL,&data);
+		const POINT *pPopupPoint=bMousePoint?&popupPoint:NULL;
+		m_pOwner->ActivateTreeItem(pItem,rc,CMenuContainer::ACTIVATE_MENU,pPopupPoint,&data);
 		if (data.command==CMenuContainer::CMD_RENAME && data.pNewItemInfo)
 			SaveRenamedOrder(hItem,data.pNewItemInfo);
 		if (data.command==CMenuContainer::CMD_TOGGLE)
@@ -778,7 +803,7 @@ LRESULT CProgramsTree::OnClick( int idCtrl, LPNMHDR pnmh, BOOL& bHandled )
 
 LRESULT CProgramsTree::OnRClick( int idCtrl, LPNMHDR pnmh, BOOL& bHandled )
 {
-	if (CMenuContainer::s_bNoContextMenu) return 1;
+	if (CMenuContainer::s_bNoContextMenu && !A4SMenuProfile::IsEnabled()) return 1;
 	CPoint pt(GetMessagePos());
 	TVHITTESTINFO test={pt};
 	ScreenToClient(&test.pt);

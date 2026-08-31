@@ -89,6 +89,44 @@ static StdMenuOption g_StdOptions[]=
 	{MENU_PCSETTINGS,MENU_ENABLED}, // enable on Win8+
 };
 
+namespace
+{
+	struct A4SAccentPolicy
+	{
+		int state;
+		int flags;
+		DWORD gradientColor;
+		int animationId;
+	};
+
+	void SetA4SWindowChrome( HWND hWnd, bool smallCorner, bool visibleBorder )
+	{
+		BOOL dark=TRUE;
+		DwmSetWindowAttribute(hWnd,(DWMWINDOWATTRIBUTE)20,&dark,sizeof(dark));
+		int corner=smallCorner?3:2; // DWMWCP_ROUNDSMALL / DWMWCP_ROUND
+		DwmSetWindowAttribute(hWnd,(DWMWINDOWATTRIBUTE)33,&corner,sizeof(corner));
+		DWORD border=visibleBorder?RGB(62,62,62):0xFFFFFFFE; // DWMWA_COLOR_NONE
+		DwmSetWindowAttribute(hWnd,(DWMWINDOWATTRIBUTE)34,&border,sizeof(border));
+	}
+
+	void ApplyA4SAcrylicMaterial( HWND hWnd )
+	{
+		tSetWindowCompositionAttribute setComposition=(tSetWindowCompositionAttribute)GetProcAddress(GetModuleHandle(L"user32.dll"),"SetWindowCompositionAttribute");
+		if (!setComposition)
+			return;
+
+		BOOL forceActive=TRUE;
+		WINCOMPATTRDATA activeData={15,&forceActive,sizeof(forceActive)};
+		setComposition(hWnd,&activeData);
+
+		A4SAccentPolicy policy={4,0x13,
+			((DWORD)A4SMenuProfile::BackdropAlpha()<<24)|(A4SMenuProfile::BackdropTint()&0xFFFFFF),0};
+		WINCOMPATTRDATA accentData={19,&policy,sizeof(policy)};
+		setComposition(hWnd,&accentData);
+	}
+
+}
+
 ///////////////////////////////////////////////////////////////////////////////
 
 void CUserWindow::Init( CMenuContainer *pOwner )
@@ -407,49 +445,45 @@ LRESULT CALLBACK CMenuContainer::SubclassSearchBox( HWND hWnd, UINT uMsg, WPARAM
 	CMenuContainer *pParent=(CMenuContainer*)uIdSubclass;
 	CWindow box(hWnd);
 	if (A4SMenuProfile::IsEnabled() &&
-		(uMsg==WM_KEYUP || uMsg==WM_LBUTTONDOWN || uMsg==WM_LBUTTONUP || (uMsg==WM_MOUSEMOVE && (wParam&MK_LBUTTON))))
+		(uMsg==WM_KEYUP || uMsg==WM_LBUTTONDOWN || uMsg==WM_LBUTTONUP || uMsg==WM_LBUTTONDBLCLK ||
+		 uMsg==EM_SETSEL || uMsg==WM_IME_STARTCOMPOSITION || uMsg==WM_IME_COMPOSITION || uMsg==WM_IME_ENDCOMPOSITION ||
+		 (uMsg==WM_MOUSEMOVE && (wParam&MK_LBUTTON))))
 	{
-		// Selection moves do not raise EN_CHANGE. Refresh their old translucent
-		// extent as well, otherwise a hollow edit can retain selection pixels.
+		// Keep the native EDIT as the input/selection model, then redraw that state
+		// once on the parent's composited acrylic surface.
 		LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
-		pParent->PostMessage(MCM_REDRAWEDIT);
+		pParent->ResetA4SSearchCaret();
 		return res;
 	}
 	if (A4SMenuProfile::IsEnabled() && uMsg==WM_PAINT)
 	{
-		// WS_EX_TRANSPARENT orders the acrylic parent before this child. Let the
-		// native edit draw only its text, selection, and caret onto that backing;
-		// the generic buffered path below makes the whole edit rectangle opaque.
+		// Input-only child: all visible query pixels belong to the parent buffer.
+		// Validating without DefSubclassProc prevents persistent child glyphs from
+		// ever being created, so deletion cannot leave a stale redirected surface.
+		if (GetFocus()==hWnd && !pParent->m_bA4SNativeCaretHidden && ::HideCaret(hWnd))
+			pParent->m_bA4SNativeCaretHidden=true;
+		PAINTSTRUCT ps;
+		::BeginPaint(hWnd,&ps);
+		::EndPaint(hWnd,&ps);
 		pParent->m_bSearchDrawn=true;
-		LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
-		if (::GetWindowTextLength(hWnd)==0 &&
-			((GetSettingInt(L"SearchBox")==SEARCHBOX_NORMAL && GetSettingBool(L"SearchSelect")) || GetFocus()!=hWnd) &&
-			pParent->m_SearchIndex>=0)
+		return 0;
+	}
+	if (A4SMenuProfile::IsEnabled() && uMsg==WM_ERASEBKGND)
+		return 1;
+	if (A4SMenuProfile::IsEnabled() && uMsg==WM_NCPAINT)
+		return 0;
+	if (A4SMenuProfile::IsEnabled() && (uMsg==WM_PRINT || uMsg==WM_PRINTCLIENT))
+		return 0;
+	if (A4SMenuProfile::IsEnabled() && uMsg==WM_NCDESTROY)
+	{
+		if (pParent->m_bA4SNativeCaretHidden)
 		{
-			// The old buffered path reached WM_PRINTCLIENT, where the hint was
-			// appended. Draw that foreground explicitly after native WM_PAINT so
-			// bypassing its opaque buffer does not also remove the placeholder.
-			HDC hdc=box.GetDC();
-			if (hdc)
-			{
-				RECT rc;
-				::SendMessage(hWnd,EM_GETRECT,0,(LPARAM)&rc);
-				if (s_bRTL)
-					rc.right-=5;
-				else
-					rc.left+=5;
-				HGDIOBJ font0=SelectObject(hdc,s_Skin.Search_hint_font);
-				SetBkMode(hdc,TRANSPARENT);
-				SetTextColor(hdc,s_Skin.Search_text_colors[1]);
-				if (GetSettingBool(L"SearchHint"))
-					DrawText(hdc,GetSettingString(L"SearchHintText"),-1,&rc,DT_SINGLELINE|DT_EDITCONTROL|(s_bRTL?DT_RIGHT:DT_LEFT));
-				else
-					DrawText(hdc,pParent->m_Items[pParent->m_SearchIndex].name,-1,&rc,DT_SINGLELINE|DT_EDITCONTROL|(s_bRTL?DT_RIGHT:DT_LEFT));
-				SelectObject(hdc,font0);
-				box.ReleaseDC(hdc);
-			}
+			::ShowCaret(hWnd);
+			pParent->m_bA4SNativeCaretHidden=false;
 		}
-		return res;
+		pParent->KillTimer(TIMER_SEARCH_CARET);
+		pParent->m_bA4SSearchCaretVisible=false;
+		return DefSubclassProc(hWnd,uMsg,wParam,lParam);
 	}
 	if (uMsg==WM_PAINT && !pParent->m_bNoSearchDraw)
 	{
@@ -596,6 +630,19 @@ LRESULT CALLBACK CMenuContainer::SubclassSearchBox( HWND hWnd, UINT uMsg, WPARAM
 			::SendMessage(hWnd,EM_SETSEL,start,start);
 			return 0;
 		}
+		if (A4SMenuProfile::IsEnabled() &&
+			(wParam==VK_LEFT || wParam==VK_RIGHT || wParam==VK_HOME || wParam==VK_END))
+		{
+			LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
+			pParent->ResetA4SSearchCaret();
+			return res;
+		}
+	}
+	if (A4SMenuProfile::IsEnabled() && uMsg==WM_CHAR && wParam==1) // Ctrl+A
+	{
+		LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
+		pParent->ResetA4SSearchCaret();
+		return res;
 	}
 	if (uMsg==WM_SYSCHAR)
 	{
@@ -642,7 +689,13 @@ LRESULT CALLBACK CMenuContainer::SubclassSearchBox( HWND hWnd, UINT uMsg, WPARAM
 	{
 		pParent->SetSearchState(::GetWindowTextLength(hWnd)>0?SEARCH_TEXT:SEARCH_BLANK);
 		if (A4SMenuProfile::IsEnabled())
-			pParent->PostMessage(MCM_REDRAWEDIT);
+		{
+			LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
+			if (!pParent->m_bA4SNativeCaretHidden && ::HideCaret(hWnd))
+				pParent->m_bA4SNativeCaretHidden=true;
+			pParent->ResetA4SSearchCaret();
+			return res;
+		}
 	}
 	if (uMsg==WM_KILLFOCUS)
 	{
@@ -655,7 +708,18 @@ LRESULT CALLBACK CMenuContainer::SubclassSearchBox( HWND hWnd, UINT uMsg, WPARAM
 #endif
 		}
 		if (A4SMenuProfile::IsEnabled())
+		{
+			if (pParent->m_bA4SNativeCaretHidden)
+			{
+				::ShowCaret(hWnd);
+				pParent->m_bA4SNativeCaretHidden=false;
+			}
+			pParent->KillTimer(TIMER_SEARCH_CARET);
+			pParent->m_bA4SSearchCaretVisible=false;
+			LRESULT res=DefSubclassProc(hWnd,uMsg,wParam,lParam);
 			pParent->PostMessage(MCM_REDRAWEDIT);
+			return res;
+		}
 	}
 	if (uMsg==WM_CONTEXTMENU && (lParam&0xFFFFFFFF)==0xFFFFFFFF)
 	{
@@ -730,6 +794,9 @@ CMenuContainer::CMenuContainer( CMenuContainer *pParent, int index, int options,
 	m_Options=options;
 	m_pStdItem=pStdItem;
 	m_Bitmap=NULL;
+	m_bA4SFlyoutBackdropActive=false;
+	m_pA4SContextResult=NULL;
+	m_bA4SContextFileSystemItem=true;
 	m_BitmapOffset=0;
 	m_Region=NULL;
 	m_PaintOffset.x=m_PaintOffset.y=0;
@@ -785,6 +852,8 @@ CMenuContainer::CMenuContainer( CMenuContainer *pParent, int index, int options,
 	m_bScrollTimerTouch=false;
 	m_bNoSearchDraw=false;
 	m_bSearchDrawn=false;
+	m_bA4SSearchCaretVisible=false;
+	m_bA4SNativeCaretHidden=false;
 	m_bInSearchUpdate=false;
 	m_bDisableProgHover=false;
 	m_bClosing=false;
@@ -812,6 +881,7 @@ CMenuContainer::CMenuContainer( CMenuContainer *pParent, int index, int options,
 
 CMenuContainer::~CMenuContainer( void )
 {
+	DestroyA4SFlyoutBackdrop();
 	ClearItems(m_Items.begin(),m_Items.end());
 	if (std::find(s_Menus.begin(),s_Menus.end(),m_pParent)!=s_Menus.end()) // check if the parent is still alive
 	{
@@ -2841,12 +2911,13 @@ bool CMenuContainer::InitSearchItems( void )
 	}
 	std::vector<SearchItem> items;
 	std::vector<int> counts;
-	int sepHeight=0, itemHeight=0, maxHeight=0, reservedHeight=0;
+	int sepHeight=0, itemHeight=0, resultPitch=0, maxHeight=0, reservedHeight=0;
 	int maxCount=0;
 	if (s_bWin7Style)
 	{
 		sepHeight=s_Skin.ItemSettings[s_Skin.More_bitmap_Size.cx?MenuSkin::LIST_SEPARATOR_SPLIT:MenuSkin::LIST_SEPARATOR].itemHeight;
 		itemHeight=s_Skin.ItemSettings[MenuSkin::LIST_ITEM].itemHeight;
+		resultPitch=itemHeight;
 		// total height minus the search box and the "more results"/"search internet", if present
 		maxHeight=m_Items[m_SearchIndex].itemRect.top-s_Skin.Main_search_padding.top-s_Skin.Search_padding.top;
 		maxHeight-=itemHeight*(m_SearchItemCount-1);
@@ -2854,11 +2925,10 @@ bool CMenuContainer::InitSearchItems( void )
 			maxHeight+=itemHeight;
 		if (A4SMenuProfile::IsEnabled())
 		{
-			// Results stop at the captured See-more row (y=362); the footer and
-			// its divider are never available as overflow space.
-			int fixedMax=A4SMenuProfile::Scale(362,s_Skin.Dpi)-s_Skin.Main_search_padding.top;
-			if (maxHeight>fixedMax)
-				maxHeight=fixedMax;
+			// The custom list begins at y=17, advances rows by 31 DIP, and ends
+			// before the fixed See-more strip at y=362.
+			resultPitch=A4SMenuProfile::Scale(31,s_Skin.Dpi);
+			maxHeight=A4SMenuProfile::Scale(345,s_Skin.Dpi);
 		}
 	}
 	if (bAutoComlpete)
@@ -2908,7 +2978,7 @@ bool CMenuContainer::InitSearchItems( void )
 		int n=(int)counts.size();
 		if (n>0)
 		{
-			int totalCount=(maxHeight-n*sepHeight)/itemHeight;
+			int totalCount=(maxHeight-n*sepHeight)/resultPitch;
 			maxCount=1;
 			if (totalCount>n)
 			{
@@ -2929,7 +2999,7 @@ bool CMenuContainer::InitSearchItems( void )
 			}
 			if (maxCount<3) maxCount=3;
 
-			reservedHeight=selectedCount>0?(sepHeight+selectedCount*itemHeight):0;
+			reservedHeight=selectedCount>0?(sepHeight+selectedCount*resultPitch):0;
 			if (reservedHeight>maxHeight) reservedHeight=maxHeight;
 			maxHeight-=reservedHeight;
 		}
@@ -2954,7 +3024,7 @@ bool CMenuContainer::InitSearchItems( void )
 		if (s_bWin7Style)
 		{
 			int h=(categoryHash==m_SearchCategoryHash?reservedHeight:maxHeight);
-			count=(h-sepHeight)/itemHeight;
+			count=(h-sepHeight)/resultPitch;
 			if (categoryHash!=m_SearchCategoryHash && count>maxCount)
 				count=maxCount;
 		}
@@ -3046,7 +3116,7 @@ bool CMenuContainer::InitSearchItems( void )
 			count=AddSearchItems(items,name,categoryHash,originalCount);
 		}
 		if (s_bWin7Style && categoryHash!=m_SearchCategoryHash && count>0)
-			maxHeight-=sepHeight+count*itemHeight;
+			maxHeight-=sepHeight+count*resultPitch;
 	}
 	if (s_bWin7Style)
 	{
@@ -3156,6 +3226,7 @@ void CMenuContainer::InitWindow( bool bDontShrink )
 void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, RECT &menuRect )
 {
 	const bool bA4SShutdownFlyout=IsA4SShutdownFlyout();
+	const bool bA4SContextFlyout=IsA4SContextFlyout();
 	bool bRecentReverse=GetSettingInt(L"MaxRecentPrograms")<0;
 	bool bRecentByName=GetSettingBool(L"RecentSortName");
 
@@ -3182,7 +3253,7 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 		s_Theme=OpenThemeData(m_hWnd,L"toolbar");
 		s_PagerTheme=OpenThemeData(m_hWnd,L"scrollbar");
 	}
-	if (!m_pParent && !s_Tooltip.m_hWnd)
+	if (!m_pParent && !s_Tooltip.m_hWnd && !A4SMenuProfile::IsEnabled())
 	{
 		s_Tooltip=CreateWindowEx(WS_EX_TOPMOST|WS_EX_TOOLWINDOW|WS_EX_TRANSPARENT|(s_bRTL?WS_EX_LAYOUTRTL:0),TOOLTIPS_CLASS,NULL,WS_POPUP|TTS_NOPREFIX|TTS_ALWAYSTIP,0,0,0,0,NULL,NULL,g_Instance,NULL);
 		s_Tooltip.SendMessage(TTM_SETMAXTIPWIDTH,0,500);
@@ -3282,6 +3353,11 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 		if (bA4SShutdownFlyout)
 		{
 			fixedWidth[0]=A4SMenuProfile::Scale(117,s_Skin.Dpi)-s_Skin.Submenu_padding.left-s_Skin.Submenu_padding.right;
+			maxItemWidth[0]=65536;
+		}
+		else if (bA4SContextFlyout)
+		{
+			fixedWidth[0]=A4SMenuProfile::Scale(216,s_Skin.Dpi)-s_Skin.Submenu_padding.left-s_Skin.Submenu_padding.right;
 			maxItemWidth[0]=65536;
 		}
 	}
@@ -3630,7 +3706,7 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 	}
 	if (bDontShrink && columnWidths[0]<m_rContent.right-m_rContent.left)
 		columnWidths[0]=m_rContent.right-m_rContent.left;
-	if (s_bWin7Style)
+	if (s_bWin7Style || bA4SContextFlyout)
 	{
 		if (fixedWidth[0]>=0)
 			columnWidths[0]=fixedWidth[0];
@@ -3838,6 +3914,8 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 		int h2=(maxh[1]<maxHeight[1]?maxh[1]:maxHeight[1]);
 		if (bA4SShutdownFlyout)
 			h1=A4SMenuProfile::Scale(128,s_Skin.Dpi)-menuPadding[0].top-menuPadding[0].bottom;
+		else if (bA4SContextFlyout)
+			h1=A4SMenuProfile::Scale(80,s_Skin.Dpi)-menuPadding[0].top-menuPadding[0].bottom;
 		if (m_bTwoColumns && columnWidths.size()>2)
 		{
 			w1=columnWidths[0];
@@ -4219,21 +4297,32 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 			A4SMenuProfile::GetSearchRect(fixedRect,s_Skin.Dpi);
 			m_Items[m_SearchIndex].itemRect=fixedRect;
 		}
-		if (s_MenuMode==MODE_SEARCH)
+		if (s_MenuMode==MODE_SEARCH && m_SearchScrollCount==0)
 		{
 			// Search owns a measured vertical rhythm independent of Open-Shell's
 			// compact generic list: 27-DIP header/rows and a 31-DIP result pitch.
 			int searchY=A4SMenuProfile::Scale(17,s_Skin.Dpi);
+			const int searchLimit=A4SMenuProfile::Scale(362,s_Skin.Dpi);
+			int pendingCategory=-1;
+			bool overflow=false;
 			for (int i=m_OriginalCount;i<(int)m_Items.size();i++)
 			{
 				MenuItem &item=m_Items[i];
+				if (overflow)
+				{
+					item.itemRect.bottom=item.itemRect.top;
+					continue;
+				}
 				if (item.id==MENU_SEARCH_CATEGORY)
 				{
+					if (pendingCategory>=0)
+						m_Items[pendingCategory].itemRect.bottom=m_Items[pendingCategory].itemRect.top;
 					item.itemRect.left=0;
 					item.itemRect.top=searchY;
 					item.itemRect.right=A4SMenuProfile::MenuWidth(s_Skin.Dpi);
 					item.itemRect.bottom=searchY+A4SMenuProfile::Scale(27,s_Skin.Dpi);
 					searchY=item.itemRect.bottom;
+					pendingCategory=i;
 				}
 				else if (item.id==MENU_NO || item.id==MENU_SEARCH_EXECUTE || item.id==MENU_SEARCH_EMPTY)
 				{
@@ -4243,7 +4332,25 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 					item.itemRect.bottom=searchY+A4SMenuProfile::Scale(27,s_Skin.Dpi);
 					searchY+=A4SMenuProfile::Scale(31,s_Skin.Dpi);
 				}
+				else
+					continue;
+
+				// Keep dynamic rows entirely above the fixed See more results strip.
+				// Collapsing the first partial row also removes its hit target, and a
+				// category is hidden when none of its results can fit below it.
+				if (item.itemRect.bottom>searchLimit)
+				{
+					item.itemRect.bottom=item.itemRect.top;
+					if (pendingCategory>=0)
+						m_Items[pendingCategory].itemRect.bottom=m_Items[pendingCategory].itemRect.top;
+					pendingCategory=-1;
+					overflow=true;
+				}
+				else if (item.id!=MENU_SEARCH_CATEGORY)
+					pendingCategory=-1;
 			}
+			if (pendingCategory>=0)
+				m_Items[pendingCategory].itemRect.bottom=m_Items[pendingCategory].itemRect.top;
 		}
 
 		int rightRow=0;
@@ -4252,6 +4359,13 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 		for (int i=0;i<m_OriginalCount;i++)
 		{
 			MenuItem &item=m_Items[i];
+			if (s_MenuMode==MODE_NORMAL && item.column==0 && item.id==MENU_NO && !item.pStdItem)
+			{
+				// Pinned programs use the captured 40-DIP large-row geometry. The
+				// inline All Programs tree keeps its independent 22-DIP metrics.
+				item.itemRect.left=A4SMenuProfile::Scale(8,s_Skin.Dpi);
+				item.itemRect.right=A4SMenuProfile::SplitX(s_Skin.Dpi);
+			}
 			if ((s_MenuMode==MODE_NORMAL || s_MenuMode==MODE_PROGRAMS) && item.column==0 && item.id==MENU_SEPARATOR)
 			{
 				item.itemRect.left=0;
@@ -4322,12 +4436,12 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 					item.itemRect.top=A4SMenuProfile::Scale(52,s_Skin.Dpi);
 					item.itemRect.bottom=A4SMenuProfile::Scale(75,s_Skin.Dpi);
 					break;
-				case MENU_RESTART:
-				case MENU_RESTART_NOUPDATE:
+				case MENU_SLEEP:
 					item.itemRect.top=A4SMenuProfile::Scale(75,s_Skin.Dpi);
 					item.itemRect.bottom=A4SMenuProfile::Scale(99,s_Skin.Dpi);
 					break;
-				case MENU_SLEEP:
+				case MENU_RESTART:
+				case MENU_RESTART_NOUPDATE:
 					item.itemRect.top=A4SMenuProfile::Scale(104,s_Skin.Dpi);
 					item.itemRect.bottom=A4SMenuProfile::Scale(128,s_Skin.Dpi);
 					break;
@@ -4347,6 +4461,25 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 					item.itemRect.bottom=item.itemRect.top;
 					break;
 			}
+		}
+	}
+	else if (bA4SContextFlyout)
+	{
+		int row=0;
+		for (size_t i=0;i<m_Items.size();i++)
+		{
+			MenuItem &item=m_Items[i];
+			item.itemRect.left=A4SMenuProfile::Scale(4,s_Skin.Dpi);
+			item.itemRect.right=A4SMenuProfile::Scale(212,s_Skin.Dpi);
+			if (item.id==MENU_A4S_CONTEXT_RUNAS || item.id==MENU_A4S_CONTEXT_PIN ||
+				item.id==MENU_A4S_CONTEXT_UNPIN || item.id==MENU_A4S_CONTEXT_OPEN_LOCATION)
+			{
+				item.itemRect.top=A4SMenuProfile::Scale(4+row*24,s_Skin.Dpi);
+				item.itemRect.bottom=A4SMenuProfile::Scale(28+row*24,s_Skin.Dpi);
+				row++;
+			}
+			else
+				item.itemRect.bottom=item.itemRect.top;
 		}
 	}
 
@@ -4408,6 +4541,9 @@ void CMenuContainer::InitWindowInternal( bool bDontShrink, const POINT &corner, 
 				m_SearchBox.SetFont(s_Skin.ItemSettings[MenuSkin::COLUMN1_ITEM].font);
 			m_SearchIcons=(HBITMAP)LoadImage(g_Instance,MAKEINTRESOURCE(IDB_SEARCH_ICONS),IMAGE_BITMAP,0,0,LR_CREATEDIBSECTION);
 			PremultiplyBitmap(m_SearchIcons,0xFFFFFF);
+			if (A4SMenuProfile::IsEnabled())
+				m_SearchBox.SendMessage(EM_SETMARGINS,EC_LEFTMARGIN|EC_RIGHTMARGIN,
+					MAKELPARAM(A4SMenuProfile::Scale(4,s_Skin.Dpi),A4SMenuProfile::Scale(2,s_Skin.Dpi)));
 		}
 	}
 
@@ -4714,34 +4850,8 @@ LRESULT CMenuContainer::OnCreate( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 	MenuSkin::TOpacity opacity=(m_bSubMenu?s_Skin.Submenu_opacity:s_Skin.Main_opacity);
 	if (A4SMenuProfile::IsEnabled())
 	{
-		// Match the installed StartAllBack 3.6.8 compositor contract. This is
-		// WCA acrylic (not Mica/system backdrop), with the captured 50% dark tint.
-		BOOL dark=TRUE;
-		DwmSetWindowAttribute(m_hWnd,(DWMWINDOWATTRIBUTE)20,&dark,sizeof(dark));
-		int corner=m_bSubMenu?3:2; // DWMWCP_ROUNDSMALL / DWMWCP_ROUND
-		DwmSetWindowAttribute(m_hWnd,(DWMWINDOWATTRIBUTE)33,&corner,sizeof(corner));
-		COLORREF border=RGB(62,62,62);
-		DwmSetWindowAttribute(m_hWnd,(DWMWINDOWATTRIBUTE)34,&border,sizeof(border));
-
-		tSetWindowCompositionAttribute SetWindowCompositionAttribute=(tSetWindowCompositionAttribute)GetProcAddress(GetModuleHandle(L"user32.dll"),"SetWindowCompositionAttribute");
-		if (SetWindowCompositionAttribute)
-		{
-			BOOL forceActive=TRUE;
-			WINCOMPATTRDATA activeData={15,&forceActive,sizeof(forceActive)};
-			SetWindowCompositionAttribute(m_hWnd,&activeData);
-
-			struct A4SAccentPolicy
-			{
-				int state;
-				int flags;
-				DWORD gradientColor;
-				int animationId;
-			};
-			A4SAccentPolicy policy={4,0x13,
-				((DWORD)A4SMenuProfile::BackdropAlpha()<<24)|(A4SMenuProfile::BackdropTint()&0xFFFFFF),0};
-			WINCOMPATTRDATA accentData={19,&policy,sizeof(policy)};
-			SetWindowCompositionAttribute(m_hWnd,&accentData);
-		}
+		SetA4SWindowChrome(m_hWnd,m_bSubMenu,true);
+		ApplyA4SAcrylicMaterial(m_hWnd);
 	}
 	else if (opacity==MenuSkin::OPACITY_ALPHA || opacity==MenuSkin::OPACITY_FULLALPHA)
 	{
@@ -4863,6 +4973,82 @@ bool CMenuContainer::IsA4SShutdownFlyout( void ) const
 	return A4SMenuProfile::IsEnabled() && m_bSubMenu && m_pParent && m_ParentIndex>=0 &&
 		m_ParentIndex<(int)m_pParent->m_Items.size() &&
 		m_pParent->m_Items[m_ParentIndex].id==MENU_SHUTDOWN_BUTTON;
+}
+
+bool CMenuContainer::IsA4SContextFlyout( void ) const
+{
+	return A4SMenuProfile::IsEnabled() && m_bSubMenu && (m_Options&CONTAINER_A4S_CONTEXT)!=0;
+}
+
+bool CMenuContainer::IsA4SContextItemEnabled( const MenuItem &item ) const
+{
+	if (!IsA4SContextFlyout() || m_bA4SContextFileSystemItem)
+		return true;
+	return item.id!=MENU_A4S_CONTEXT_RUNAS && item.id!=MENU_A4S_CONTEXT_OPEN_LOCATION;
+}
+
+void CMenuContainer::PrepareA4SFlyoutBackdrop( const RECT &flyoutRect )
+{
+	if (!IsA4SShutdownFlyout() && !IsA4SContextFlyout())
+		return;
+
+	DestroyA4SFlyoutBackdrop();
+	CMenuContainer *root=m_pParent;
+	while (root && root->m_pParent)
+		root=root->m_pParent;
+	if (!root || !::IsWindow(root->m_hWnd))
+		return;
+
+	// The flyout is a normal acrylic window with the same policy as the root.
+	// Remove the overlap from the root while it is present so the flyout samples
+	// the desktop/application once instead of sampling the root material again.
+	RECT rootRect;
+	root->GetWindowRect(&rootRect);
+	RECT overlap;
+	if (IntersectRect(&overlap,&rootRect,&flyoutRect))
+	{
+		RECT localFlyout=flyoutRect;
+		OffsetRect(&localFlyout,-rootRect.left,-rootRect.top);
+		const int rootRound=A4SMenuProfile::Scale(16,s_Skin.Dpi);
+		const int flyoutRound=A4SMenuProfile::Scale(8,s_Skin.Dpi);
+		HRGN rootRegion=CreateRoundRectRgn(0,0,rootRect.right-rootRect.left+1,rootRect.bottom-rootRect.top+1,rootRound,rootRound);
+		HRGN hole=CreateRoundRectRgn(localFlyout.left,localFlyout.top,localFlyout.right+1,localFlyout.bottom+1,flyoutRound,flyoutRound);
+		if (rootRegion && hole)
+		{
+			CombineRgn(rootRegion,rootRegion,hole,RGN_DIFF);
+			if (::SetWindowRgn(root->m_hWnd,rootRegion,TRUE))
+				m_bA4SFlyoutBackdropActive=true;
+			else
+				DeleteObject(rootRegion);
+		}
+		else if (rootRegion)
+			DeleteObject(rootRegion);
+		if (hole)
+			DeleteObject(hole);
+	}
+}
+
+void CMenuContainer::DestroyA4SFlyoutBackdrop( void )
+{
+	if (!m_bA4SFlyoutBackdropActive)
+		return;
+
+	CMenuContainer *root=NULL;
+	if (m_pParent && std::find(s_Menus.begin(),s_Menus.end(),m_pParent)!=s_Menus.end())
+	{
+		root=m_pParent;
+		while (root->m_pParent && std::find(s_Menus.begin(),s_Menus.end(),root->m_pParent)!=s_Menus.end())
+			root=root->m_pParent;
+	}
+
+	m_bA4SFlyoutBackdropActive=false;
+	if (root && ::IsWindow(root->m_hWnd))
+	{
+		// A4S normally has no Win32 region; clearing it restores the native
+		// Windows 11 rounded clip and shadow after the flyout closes.
+		::SetWindowRgn(root->m_hWnd,NULL,TRUE);
+		root->Invalidate();
+	}
 }
 
 void CMenuContainer::GetSearchGlyphRect( const RECT &itemRect, RECT &glyphRect ) const
@@ -5328,15 +5514,31 @@ LRESULT CMenuContainer::OnRedrawEdit( UINT uMsg, WPARAM wParam, LPARAM lParam, B
 {
 	if (A4SMenuProfile::IsEnabled() && m_SearchIndex>=0)
 	{
-		// The A4S edit has a hollow background. Repaint the shared acrylic and
-		// hairline first, then let the native control add text/selection/caret.
+		// The EDIT is input-only. Query, selection, hint, and caret are replaced
+		// together in one clean parent-buffer frame.
 		RECT itemRect;
 		GetItemRect(m_SearchIndex,itemRect);
 		::RedrawWindow(m_hWnd,&itemRect,NULL,RDW_INVALIDATE|RDW_UPDATENOW|RDW_NOCHILDREN);
+		return 0;
 	}
 	if (m_SearchBox.m_hWnd)
 		::RedrawWindow(m_SearchBox.m_hWnd,NULL,NULL,RDW_INVALIDATE|RDW_UPDATENOW);
 	return 0;
+}
+
+void CMenuContainer::ResetA4SSearchCaret( void )
+{
+	if (!A4SMenuProfile::IsEnabled())
+		return;
+	m_bA4SSearchCaretVisible=true;
+	KillTimer(TIMER_SEARCH_CARET);
+	if (m_SearchBox.m_hWnd && GetFocus()==m_SearchBox.m_hWnd)
+	{
+		UINT delay=GetCaretBlinkTime();
+		if (delay && delay!=INFINITE)
+			SetTimer(TIMER_SEARCH_CARET,delay);
+	}
+	PostMessage(MCM_REDRAWEDIT);
 }
 
 LRESULT CMenuContainer::OnRefreshIcons( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
@@ -5413,7 +5615,7 @@ LRESULT CMenuContainer::OnEditChange( WORD wNotifyCode, WORD wID, HWND hWndCtl, 
 {
 	s_bPendingSearchEnter=false;
 	if (A4SMenuProfile::IsEnabled())
-		PostMessage(MCM_REDRAWEDIT);
+		ResetA4SSearchCaret();
 	else
 		m_SearchBox.RedrawWindow();
 	wchar_t text[256];
@@ -5610,6 +5812,18 @@ LRESULT CMenuContainer::OnWorkAreaChanged( UINT uMsg, WPARAM wParam, LPARAM lPar
 
 LRESULT CMenuContainer::OnTimer( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
+	if (wParam==TIMER_SEARCH_CARET)
+	{
+		if (!A4SMenuProfile::IsEnabled() || !m_SearchBox.m_hWnd || GetFocus()!=m_SearchBox.m_hWnd)
+		{
+			KillTimer(TIMER_SEARCH_CARET);
+			m_bA4SSearchCaretVisible=false;
+			return 0;
+		}
+		m_bA4SSearchCaretVisible=!m_bA4SSearchCaretVisible;
+		PostMessage(MCM_REDRAWEDIT);
+		return 0;
+	}
 	if (wParam==TIMER_HOVER)
 	{
 		LOG_MENU(LOG_MOUSE,L"End Hover, hover=%d%s, hot=%d, submenu=%d",m_HoverItem,m_bHoverArrow?L"(arrow)":L"",m_HotItem,m_Submenu);
@@ -5780,7 +5994,9 @@ LRESULT CMenuContainer::OnTimer( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& 
 // Handle right-click and the menu keyboard button
 LRESULT CMenuContainer::OnContextMenu( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
-	if (s_bNoContextMenu) return 0;
+	// The A4S product keeps Open-Shell's general context-menu feature disabled,
+	// but owns a tiny program-only popup in ActivateItem.
+	if (s_bNoContextMenu && !A4SMenuProfile::IsEnabled()) return 0;
 	POINT pt={(short)LOWORD(lParam),(short)HIWORD(lParam)};
 	int index;
 	BOOL bPad=FALSE;
@@ -5849,6 +6065,8 @@ bool CMenuContainer::CanSelectItem( int index, bool bKeyboard )
 			return false;
 	}
 	const MenuItem &item=m_Items[index];
+	if (!IsA4SContextItemEnabled(item))
+		return false;
 	if (!m_bSubMenu && s_MenuMode==MODE_SEARCH && index<m_OriginalCount && item.id!=MENU_SEARCH_BOX && item.id!=MENU_SHUTDOWN_BUTTON && item.id!=MENU_MORE_RESULTS && item.id!=MENU_SEARCH_INTERNET && item.id!=MENU_SEARCH_PROVIDER)
 		return false;
 	if (item.id==MENU_SEPARATOR || item.id==MENU_SEARCH_EMPTY)
@@ -6554,6 +6772,10 @@ LRESULT CMenuContainer::OnChar( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& b
 
 LRESULT CMenuContainer::OnDestroy( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 {
+	KillTimer(TIMER_SEARCH_CARET);
+	m_bA4SSearchCaretVisible=false;
+	m_bA4SNativeCaretHidden=false;
+	DestroyA4SFlyoutBackdrop();
 	LOG_MENU(LOG_OPEN,L"Close Menu, ptr=%p",this);
 	if (m_pAccessible)
 	{
@@ -7317,7 +7539,7 @@ LRESULT CMenuContainer::OnRButtonUp( UINT uMsg, WPARAM wParam, LPARAM lParam, BO
 	if (GetCapture()!=m_hWnd)
 		return 0;
 	ReleaseCapture();
-	if (s_bNoContextMenu) return 0;
+	if (s_bNoContextMenu && !A4SMenuProfile::IsEnabled()) return 0;
 	POINT pt={(short)LOWORD(lParam),(short)HIWORD(lParam)};
 	bool bArrow=false;
 	int index=HitTest(pt,&bArrow);
