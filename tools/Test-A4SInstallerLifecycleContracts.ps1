@@ -738,6 +738,17 @@ Assert-OrderedMarkers $rollbackSource @(
     'ReleaseOwnedDeployment(journal, runningCleanupImage)',
     'DeleteJournalDurably()') 'registration-first exact-owned filesystem rollback'
 
+$completeSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void CompleteJournal(const ServicingJournal &journal) {' `
+    -EndMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {'
+Assert-OrderedMarkers $completeSource @(
+    'SetDword(key.get(), L"CompletionStarted", 1)',
+    'RegFlushKey(key.get())',
+    'ClearSafetyStateChecked()',
+    'DeleteJournalDurably()',
+    'DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue)') `
+    'idempotent recovery residue after the journal commit point'
+
 $hostSafetySource = Get-SourceSection -Text $setupSource `
     -StartMarker 'void ClearSafetyStateChecked()' `
     -EndMarker 'void DeleteJournalDurably()'
@@ -758,6 +769,97 @@ foreach ($marker in @(
     Assert-ContainsOrdinal $setupSource $marker `
         "native owned-path failure decision matrix omits '$marker'"
 }
+$pinnedDirectorySource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'UniqueHandle OpenPinnedOwnedDirectory(' `
+    -EndMarker 'UniqueHandle MaterializeOwnedDirectory('
+foreach ($marker in @('FILE_SHARE_READ | FILE_SHARE_WRITE',
+        'FILE_FLAG_OPEN_REPARSE_POINT',
+        'SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity)')) {
+    Assert-ContainsOrdinal $pinnedDirectorySource $marker `
+        "pinned deployment-directory ownership omits '$marker'"
+}
+Assert-Contract ($pinnedDirectorySource.IndexOf(
+        'FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE',
+        [StringComparison]::Ordinal) -lt 0) `
+    'pinned deployment-directory leases permit pathname replacement'
+$ownedReleaseSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void ReleaseOwnedDeployment(' `
+    -EndMarker 'void ReleaseOwnedCleanupHelper('
+foreach ($marker in @(
+        'stagingExists && !journal.deployment.staging.identity.valid',
+        'finalExists && !finalProof.valid',
+        'const bool inspectionComplete = explorer != 0 && inspection.complete',
+        '!explorer || inspection.unknownA4SModule')) {
+    Assert-ContainsOrdinal $ownedReleaseSource $marker `
+        "crash-safe deployment release omits '$marker'"
+}
+$ownedSlotRemovalSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'bool RemoveOwnedSlotDirectory(' `
+    -EndMarker 'void ReleaseEmptyOwnedDirectory('
+foreach ($marker in @('bool allowMissingFiles, bool allowJournaledPartial',
+        'if (!allowMissingFiles && (!host || !menu || !setup))',
+        'allowJournaledPartial && identityMatches && identityRequired')) {
+    Assert-ContainsOrdinal $ownedSlotRemovalSource $marker `
+        "retry-safe owned-slot removal omits '$marker'"
+}
+$normalizedOwnedReleaseSource = $ownedReleaseSource -replace '\s+', ' '
+foreach ($marker in @(
+        'journal.deployment.staging.identity, journal.deployment, true, true, runningOwnedImage)',
+        'finalProof, journal.deployment, true, false, runningOwnedImage)')) {
+    Assert-ContainsOrdinal $normalizedOwnedReleaseSource $marker `
+        "owned-slot recovery call contract omits '$marker'"
+}
+$emptyOwnedDirectorySource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void ReleaseEmptyOwnedDirectory(' `
+    -EndMarker 'void ReleaseOwnedDeployment('
+foreach ($marker in @('if (!record.identity.valid)',
+        'FILE_SHARE_READ | FILE_SHARE_WRITE',
+        '!SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity)',
+        'record.phase = OwnedPathPhase::Released')) {
+    Assert-ContainsOrdinal $emptyOwnedDirectorySource $marker `
+        "exact empty-directory recovery omits '$marker'"
+}
+$helperReleaseSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void ReleaseOwnedCleanupHelper(' `
+    -EndMarker 'void RollBackJournal('
+Assert-ContainsOrdinal $helperReleaseSource 'if (!helper.identity.valid)' `
+    'intent-only cleanup-helper recovery can still delete without identity proof'
+$knownSlotCleanupSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'bool RemoveKnownSlotFilesUnchecked(' `
+    -EndMarker 'void RemoveStagingBestEffort('
+foreach ($marker in @('FILE_SHARE_READ | FILE_SHARE_WRITE',
+        'FILE_FLAG_OPEN_REPARSE_POINT', 'links.nNumberOfLinks != 1U',
+        'SlotNameMatchesPayload(leaf, PayloadSlotBase(',
+        'SetFileInformationByHandle(file.get(), FileDispositionInfoEx')) {
+    Assert-ContainsOrdinal $knownSlotCleanupSource $marker `
+        "exact known-slot cleanup omits '$marker'"
+}
+$cleanupContinuationSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'bool CleanupContinuationMatches(' `
+    -EndMarker 'std::wstring RecoveryCommand('
+Assert-OrderedMarkers $cleanupContinuationSource @(
+    'ReadLifecycleHighWater() < identity.sequence',
+    '!LastOperationMatches(identity)',
+    'StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, expected)') `
+    'cleanup continuation CAS after an uncommitted high-water advance'
+$expectedCleanupSource = (Get-FunctionAst -Ast $ast `
+    -Name 'Get-ExpectedCleanupRunOnceForSnapshot').Extent.Text
+Assert-ContainsOrdinal $expectedCleanupSource `
+    '$operation.LastSequence -gt $operation.HighWater' `
+    'pending-cleanup model rejects a valid last commit after a rolled-back sequence advance'
+Assert-Contract ($expectedCleanupSource.IndexOf(
+        '$operation.LastSequence -ne $operation.HighWater',
+        [StringComparison]::Ordinal) -lt 0) `
+    'pending-cleanup model still requires last-operation/high-water equality'
+$rollbackRecoverySource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'std::wstring RollbackRecoverySetup(' `
+    -EndMarker 'void QueueJournalRecovery('
+Assert-OrderedMarkers $rollbackRecoverySource @(
+    'FileProductVersion(targetSetup)',
+    'kDurableFilesystemJournalMinimumVersion',
+    'ValidateSlotBasic(state.activeSlot)',
+    'FileProductVersion(activeSetup)',
+    'return activeSetup') 'frozen-v1 rollback schema coordinator'
 $nativeReconcileSource = Get-SourceSection -Text $setupSource `
     -StartMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {' `
     -EndMarker 'bool StartPreparedCleanup('

@@ -276,6 +276,9 @@ namespace
     };
 
     using ProductVersion = std::uint64_t;
+    constexpr ProductVersion kDurableFilesystemJournalMinimumVersion =
+        (static_cast<ProductVersion>(1U) << 48U) |
+        (static_cast<ProductVersion>(1U) << 32U); // 1.1.0.0
 
     enum class JournalTarget : DWORD
     {
@@ -966,36 +969,145 @@ namespace
         }
     }
 
+    bool ExactSingleLinkFile(const std::wstring &path,
+        std::span<const std::uint8_t> expected, const FileIdentity *expectedIdentity,
+        FileIdentity *actualIdentity = nullptr)
+    {
+        // Pin the leaf without write/delete sharing so content, link count,
+        // reparse state, and file ID are one coherent observation.
+        UniqueHandle file(CreateFileW(path.c_str(), GENERIC_READ,
+            FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!file)
+            return false;
+        FILE_ATTRIBUTE_TAG_INFO attributes = {};
+        BY_HANDLE_FILE_INFORMATION links = {};
+        if (!GetFileInformationByHandleEx(file.get(), FileAttributeTagInfo,
+                &attributes, sizeof(attributes)) ||
+            !GetFileInformationByHandle(file.get(), &links) ||
+            (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                FILE_ATTRIBUTE_REPARSE_POINT)) != 0 || links.nNumberOfLinks != 1U)
+            return false;
+        const FileIdentity identity = FileIdentityFromHandle(file.get());
+        if ((expectedIdentity && expectedIdentity->valid &&
+                !SameFileIdentity(identity, *expectedIdentity)) ||
+            !HandleContainsExactBytes(file.get(), expected))
+            return false;
+        if (actualIdentity)
+            *actualIdentity = identity;
+        return true;
+    }
+
     // The checked wrapper is implemented after Explorer-module inspection.
     // No caller may bypass that inspection before removing a slot.
     bool RemoveKnownSlot(const std::wstring &slot);
 
     bool RemoveKnownSlotFilesUnchecked(const std::wstring &slot)
     {
-        RejectReparsePoint(slot, true);
-        bool complete = true;
-        for (const wchar_t *name : { A4S_PRODUCT_HOST_FILENAME_W, A4S_PRODUCT_DLL_FILENAME_W, kSetupFilename })
+        UniqueHandle directory(CreateFileW(slot.c_str(), FILE_READ_ATTRIBUTES | DELETE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!directory)
         {
-            const std::wstring path = Join(slot, name);
-            const DWORD attributes = GetFileAttributesW(path.c_str());
-            if (attributes == INVALID_FILE_ATTRIBUTES)
-            {
-                const DWORD error = GetLastError();
-                if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
-                    complete = false;
-                continue;
-            }
-            // A directory or reparse point using a product filename is unknown
-            // content. Preserve it and never follow it during bounded cleanup.
-            if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
-                continue;
-            if (!DeleteFileW(path.c_str()))
-                complete = false;
+            const DWORD error = GetLastError();
+            return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
         }
-        if (!RemoveDirectoryW(slot.c_str()) && GetLastError() != ERROR_FILE_NOT_FOUND &&
-            GetLastError() != ERROR_PATH_NOT_FOUND)
-            complete = false;
-        return complete;
+        FILE_ATTRIBUTE_TAG_INFO directoryAttributes = {};
+        if (!GetFileInformationByHandleEx(directory.get(), FileAttributeTagInfo,
+                &directoryAttributes, sizeof(directoryAttributes)) ||
+            (directoryAttributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (directoryAttributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            return false;
+
+        const std::array<std::wstring, 3> paths = {
+            Join(slot, A4S_PRODUCT_HOST_FILENAME_W),
+            Join(slot, A4S_PRODUCT_DLL_FILENAME_W),
+            Join(slot, kSetupFilename),
+        };
+        std::array<UniqueHandle, 3> files;
+        std::array<std::vector<std::uint8_t>, 3> bytes;
+        for (size_t index = 0; index < files.size(); ++index)
+        {
+            files[index].reset(CreateFileW(paths[index].c_str(), GENERIC_READ | DELETE,
+                FILE_SHARE_READ, nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+            if (!files[index])
+                return false;
+            FILE_ATTRIBUTE_TAG_INFO attributes = {};
+            BY_HANDLE_FILE_INFORMATION links = {};
+            if (!GetFileInformationByHandleEx(files[index].get(), FileAttributeTagInfo,
+                    &attributes, sizeof(attributes)) ||
+                !GetFileInformationByHandle(files[index].get(), &links) ||
+                (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                    FILE_ATTRIBUTE_REPARSE_POINT)) != 0 || links.nNumberOfLinks != 1U)
+                return false;
+            bytes[index] = ReadHandleBytes(files[index].get());
+        }
+        try
+        {
+            ValidatePe(bytes[0], false);
+            ValidatePe(bytes[1], true);
+            ValidatePe(bytes[2], false);
+            const size_t slash = slot.find_last_of(L"\\/");
+            const std::wstring leaf = slash == std::wstring::npos ? slot :
+                slot.substr(slash + 1U);
+            const size_t dash = leaf.find(L'-');
+            if (dash == std::wstring::npos || dash == 0)
+                return false;
+            const std::wstring versionText = leaf.substr(0, dash);
+            const ProductVersion version = FileProductVersion(paths[0]);
+            if (!version || version != FileProductVersion(paths[1]) ||
+                version != FileProductVersion(paths[2]) ||
+                VersionText(version) != versionText ||
+                !SlotNameMatchesPayload(leaf, PayloadSlotBase(versionText,
+                    bytes[0], bytes[1], bytes[2])))
+                return false;
+        }
+        catch (const InstallerFailure &)
+        {
+            return false;
+        }
+
+        for (UniqueHandle &file : files)
+        {
+            FILE_DISPOSITION_INFO_EX disposition = {};
+            disposition.Flags = FILE_DISPOSITION_FLAG_DELETE |
+                FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+                FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+            if (!SetFileInformationByHandle(file.get(), FileDispositionInfoEx,
+                    &disposition, sizeof(disposition)))
+            {
+                FILE_DISPOSITION_INFO fallback = { TRUE };
+                if (!SetFileInformationByHandle(file.get(), FileDispositionInfo,
+                        &fallback, sizeof(fallback)))
+                    return false;
+            }
+        }
+        for (UniqueHandle &file : files)
+            file.reset();
+
+        FILE_DISPOSITION_INFO_EX directoryDisposition = {};
+        directoryDisposition.Flags = FILE_DISPOSITION_FLAG_DELETE |
+            FILE_DISPOSITION_FLAG_POSIX_SEMANTICS |
+            FILE_DISPOSITION_FLAG_IGNORE_READONLY_ATTRIBUTE;
+        if (!SetFileInformationByHandle(directory.get(), FileDispositionInfoEx,
+                &directoryDisposition, sizeof(directoryDisposition)))
+        {
+            const DWORD error = GetLastError();
+            if (error != ERROR_DIR_NOT_EMPTY && error != ERROR_ALREADY_EXISTS)
+            {
+                FILE_DISPOSITION_INFO fallback = { TRUE };
+                if (!SetFileInformationByHandle(directory.get(), FileDispositionInfo,
+                        &fallback, sizeof(fallback)))
+                {
+                    const DWORD fallbackError = GetLastError();
+                    if (fallbackError != ERROR_DIR_NOT_EMPTY &&
+                        fallbackError != ERROR_ALREADY_EXISTS)
+                        return false;
+                }
+            }
+        }
+        return true;
     }
 
     void RemoveStagingBestEffort(const std::wstring &path)
@@ -1089,6 +1201,10 @@ namespace
         plan.versions.path = FullPath(Join(plan.root.path, kVersionsDirectory));
         plan.root.plannedAbsent = InspectPlannedDirectory(plan.root.path);
         plan.versions.plannedAbsent = InspectPlannedDirectory(plan.versions.path);
+        if (!plan.root.plannedAbsent)
+            plan.root.identity = PathIdentity(plan.root.path, true);
+        if (!plan.versions.plannedAbsent)
+            plan.versions.identity = PathIdentity(plan.versions.path, true);
         plan.slotBase = payloads.slotName;
         plan.hostSha256 = Hex(HashBytes(std::span(payloads.host.data, payloads.host.size)));
         plan.menuSha256 = Hex(HashBytes(std::span(payloads.menu.data, payloads.menu.size)));
@@ -1784,7 +1900,7 @@ namespace
                 return !record.plannedAbsent && record.phase == OwnedPathPhase::None &&
                     !record.identity.valid;
             if (!record.plannedAbsent)
-                return record.phase == OwnedPathPhase::None && !record.identity.valid;
+                return record.phase == OwnedPathPhase::None && record.identity.valid;
             return record.phase != OwnedPathPhase::None;
         };
         if (!phaseCoherent(journal.deployment.root) ||
@@ -1927,15 +2043,42 @@ namespace
                 L"Could not durably commit A4S Menu filesystem ownership.");
     }
 
-    void MaterializeOwnedDirectory(const wchar_t *journalPrefix,
-        OwnedPathRecord &record)
+    UniqueHandle OpenPinnedOwnedDirectory(const OwnedPathRecord &record,
+        bool allowRename)
+    {
+        const DWORD access = FILE_READ_ATTRIBUTES | FILE_LIST_DIRECTORY |
+            (allowRename ? DELETE : 0U);
+        // Deliberately omit FILE_SHARE_DELETE.  While this lease is alive the
+        // pathname cannot be renamed or replaced between identity validation,
+        // child materialization/enumeration, and the handle-based commit.
+        UniqueHandle directory(CreateFileW(record.path.c_str(), access,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
+        if (!directory)
+            FailLastError(L"Could not pin an A4S Menu deployment directory.");
+        FILE_ATTRIBUTE_TAG_INFO attributes = {};
+        if (!GetFileInformationByHandleEx(directory.get(), FileAttributeTagInfo,
+                &attributes, sizeof(attributes)) ||
+            (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+            Fail(ERROR_INVALID_STATE,
+                L"An A4S Menu deployment directory changed type.");
+        if (record.identity.valid &&
+            !SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity))
+            Fail(ERROR_INVALID_STATE,
+                L"An A4S Menu deployment directory changed identity.");
+        return directory;
+    }
+
+    UniqueHandle MaterializeOwnedDirectory(const wchar_t *journalPrefix,
+        OwnedPathRecord &record, bool allowRename = false)
     {
         if (!record.plannedAbsent)
         {
             if (InspectPlannedDirectory(record.path))
                 Fail(ERROR_PATH_NOT_FOUND,
                     L"A pre-existing A4S Menu deployment directory disappeared.");
-            return;
+            return OpenPinnedOwnedDirectory(record, allowRename);
         }
         if (!CreateDirectoryW(record.path.c_str(), nullptr))
         {
@@ -1949,9 +2092,11 @@ namespace
             }
             Fail(error, L"Could not create an owned A4S Menu deployment directory.");
         }
-        record.identity = PathIdentity(record.path, true);
+        UniqueHandle directory = OpenPinnedOwnedDirectory(record, allowRename);
+        record.identity = FileIdentityFromHandle(directory.get());
         record.phase = OwnedPathPhase::Materialized;
         PersistOwnedPathState(journalPrefix, record);
+        return directory;
     }
 
     void MaterializeDeployment(const PayloadSet &payloads,
@@ -1964,11 +2109,14 @@ namespace
         if (!plan.required)
             return;
 
-        MaterializeOwnedDirectory(L"DeploymentRoot", journal.deployment.root);
+        UniqueHandle rootLease = MaterializeOwnedDirectory(L"DeploymentRoot",
+            journal.deployment.root);
         plan.root = journal.deployment.root;
-        MaterializeOwnedDirectory(L"DeploymentVersions", journal.deployment.versions);
+        UniqueHandle versionsLease = MaterializeOwnedDirectory(L"DeploymentVersions",
+            journal.deployment.versions);
         plan.versions = journal.deployment.versions;
-        MaterializeOwnedDirectory(L"DeploymentStaging", journal.deployment.staging);
+        UniqueHandle stagingLease = MaterializeOwnedDirectory(L"DeploymentStaging",
+            journal.deployment.staging, true);
         plan.staging = journal.deployment.staging;
 
         WriteExactFile(Join(journal.deployment.staging.path, A4S_PRODUCT_HOST_FILENAME_W),
@@ -2000,6 +2148,12 @@ namespace
             }
             throw;
         }
+        // Keep the staging path pinned without share-delete through every
+        // child write and validation.  Close only for the atomic directory
+        // rename, while root and versions remain pinned; then bind the final
+        // pathname back to the exact staging identity before accepting it.
+        const FileIdentity stagingIdentity = FileIdentityFromHandle(stagingLease.get());
+        stagingLease.reset();
         if (!MoveFileExW(journal.deployment.staging.path.c_str(),
                 journal.deployment.finalSlot.path.c_str(), MOVEFILE_WRITE_THROUGH))
         {
@@ -2013,7 +2167,13 @@ namespace
             }
             Fail(error, L"Could not atomically commit the new A4S Menu version.");
         }
-        journal.deployment.finalSlot.identity = journal.deployment.staging.identity;
+        UniqueHandle finalLease = OpenPinnedOwnedDirectory(
+            journal.deployment.finalSlot, false);
+        journal.deployment.finalSlot.identity = FileIdentityFromHandle(finalLease.get());
+        if (!SameFileIdentity(journal.deployment.finalSlot.identity,
+                stagingIdentity))
+            Fail(ERROR_INVALID_STATE,
+                L"The deployed A4S Menu slot changed identity during commit.");
         journal.deployment.finalSlot.phase = OwnedPathPhase::Materialized;
         journal.deployment.staging.phase = OwnedPathPhase::Moved;
         {
@@ -2269,6 +2429,8 @@ namespace
     bool RemoveKnownSlot(const std::wstring &slot)
     {
         const std::wstring canonicalSlot = FullPath(slot);
+        if (!ValidateSlotBasic(canonicalSlot))
+            return false;
         const ExplorerModuleInspection inspection =
             InspectExplorerA4SModules(ExplorerProcessId());
         if (!CanPruneKnownSlot(inspection.complete,
@@ -2559,6 +2721,12 @@ namespace
                     (data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
                     continue;
                 const std::wstring slot = Join(versions, data.cFileName);
+                // A directory under versions is not ownership by itself.
+                // Preserve arbitrary/partial user content unless its name,
+                // payload bytes, PE types, and fixed versions form one exact
+                // immutable A4S slot.
+                if (!ValidateSlotBasic(slot))
+                    continue;
                 if (!RemoveKnownSlot(slot))
                     return false;
                 for (const wchar_t *name :
@@ -2633,7 +2801,7 @@ namespace
                     [&](const std::wstring &candidate) {
                         return !candidate.empty() && _wcsicmp(slot.c_str(), FullPath(candidate).c_str()) == 0;
                     });
-                if (!keep && !RemoveKnownSlot(slot))
+                if (!keep && ValidateSlotBasic(slot) && !RemoveKnownSlot(slot))
                     return;
             }
             while (FindNextFileW(find.get(), &data));
@@ -2687,7 +2855,8 @@ namespace
             plan.helper.phase = OwnedPathPhase::Intent;
         }
         else if ((attributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0 ||
-            !ExactFile(plan.helper.path, payloads.setup))
+            !ExactSingleLinkFile(plan.helper.path, payloads.setup, nullptr,
+                &plan.helper.identity))
             Fail(ERROR_SHARING_VIOLATION,
                 L"A different deferred-cleanup helper already owns the canonical path.");
         return plan;
@@ -2705,7 +2874,12 @@ namespace
 
     bool CleanupContinuationMatches(const OperationIdentity &identity)
     {
-        if (ReadLifecycleHighWater() != identity.sequence ||
+        // High-water is monotonic and is advanced before the next journal can
+        // be created.  A newer operation that aborts before BeginJournal, or
+        // rolls back exactly, legitimately leaves high-water above the last
+        // committed operation.  LastOperation is the cleanup CAS authority;
+        // only reject an impossible sequence regression or a different commit.
+        if (ReadLifecycleHighWater() < identity.sequence ||
             !LastOperationMatches(identity))
             return false;
         const std::wstring expected = CleanupCommand(CleanupHelperPath(), identity, 0, 0);
@@ -2718,6 +2892,28 @@ namespace
         if (command.size() >= 260U)
             Fail(ERROR_FILENAME_EXCED_RANGE, L"The servicing-recovery command exceeds the Windows RunOnce limit.");
         return command;
+    }
+
+    std::wstring RollbackRecoverySetup(const InstalledState &state)
+    {
+        const std::wstring targetSetup = Join(state.previousSlot, kSetupFilename);
+        if (FileProductVersion(targetSetup) >=
+            kDurableFilesystemJournalMinimumVersion)
+            return targetSetup;
+
+        // A rollback from 1.1 to the frozen 1.0 slot must not ask the old
+        // target binary to own schema-2 filesystem recovery.  The currently
+        // active 1.1 slot is retained as nextPrevious, so it is the durable
+        // coordinator until the transaction journal is gone.
+        if (ValidateSlotBasic(state.activeSlot))
+        {
+            const std::wstring activeSetup = Join(state.activeSlot, kSetupFilename);
+            if (FileProductVersion(activeSetup) >=
+                kDurableFilesystemJournalMinimumVersion)
+                return activeSetup;
+        }
+        Fail(ERROR_OLD_WIN_VERSION,
+            L"No installed A4S Menu setup understands the durable rollback journal.");
     }
 
     void QueueJournalRecovery(const std::wstring &command)
@@ -2771,7 +2967,9 @@ namespace
             journal.cleanupHelper.helper.phase = OwnedPathPhase::Materialized;
             PersistOwnedPathState(L"CleanupHelper", journal.cleanupHelper.helper);
         }
-        else if (!ExactFile(cleanup.helper, payloads.setup))
+        else if (!plan.helper.identity.valid ||
+            !ExactSingleLinkFile(cleanup.helper, payloads.setup,
+                &plan.helper.identity))
             Fail(ERROR_SHARING_VIOLATION,
                 L"A different deferred-cleanup helper already owns the canonical path.");
 
@@ -2894,12 +3092,13 @@ namespace
 
     bool RemoveOwnedSlotDirectory(const OwnedPathRecord &record,
         const FileIdentity &moveIdentity, const DeploymentPlan &deployment,
-        bool requireComplete, UniqueHandle *runningOwnedImage)
+        bool allowMissingFiles, bool allowJournaledPartial,
+        UniqueHandle *runningOwnedImage)
     {
         if (PathIsAbsent(record.path))
             return true;
         UniqueHandle directory(CreateFileW(record.path.c_str(), FILE_READ_ATTRIBUTES | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         if (!directory)
             return false;
@@ -2911,8 +3110,8 @@ namespace
             return false;
         const FileIdentity actualIdentity = FileIdentityFromHandle(directory.get());
         const FileIdentity &proof = record.identity.valid ? record.identity : moveIdentity;
-        const bool identityRequired = proof.valid;
-        const bool identityMatches = !identityRequired || SameFileIdentity(actualIdentity, proof);
+        const bool identityRequired = true;
+        const bool identityMatches = proof.valid && SameFileIdentity(actualIdentity, proof);
 
         bool knownContents = true;
         bool host = false;
@@ -2953,7 +3152,13 @@ namespace
                     knownContents = false;
             }
         }
-        if (requireComplete && (!host || !menu || !setup))
+        // A recovery attempt can be interrupted after any one of the three
+        // delete dispositions has committed.  Missing files are therefore an
+        // expected retry state for both staging and final slots.  Only staging
+        // may contain a journal-authorized partial payload; a final slot was
+        // validated before its atomic rename, so every surviving file must
+        // still match the durable payload hash.
+        if (!allowMissingFiles && (!host || !menu || !setup))
             knownContents = false;
         if (!CanDeleteOwnedPath(record.plannedAbsent, true, false, false,
                 knownContents, identityRequired, identityMatches))
@@ -2961,11 +3166,11 @@ namespace
 
         if (host && !DeleteOwnedRegularFile(Join(record.path,
                 A4S_PRODUCT_HOST_FILENAME_W), deployment.hostSha256, nullptr,
-                !requireComplete && identityMatches && identityRequired))
+                allowJournaledPartial && identityMatches && identityRequired))
             return false;
         if (menu && !DeleteOwnedRegularFile(Join(record.path,
                 A4S_PRODUCT_DLL_FILENAME_W), deployment.menuSha256, nullptr,
-                !requireComplete && identityMatches && identityRequired))
+                allowJournaledPartial && identityMatches && identityRequired))
             return false;
         if (setup)
         {
@@ -2982,7 +3187,7 @@ namespace
             {
                 setupRemoved = DeleteOwnedRegularFile(setupPath,
                     deployment.setupSha256, nullptr,
-                    !requireComplete && identityMatches && identityRequired);
+                    allowJournaledPartial && identityMatches && identityRequired);
             }
             if (!setupRemoved)
                 return false;
@@ -3013,20 +3218,36 @@ namespace
             PersistOwnedPathState(prefix, record);
             return;
         }
+        if (!record.identity.valid)
+        {
+            // A crash can occur after CreateDirectory succeeds but before its
+            // identity is flushed.  Intent alone is not proof that the object
+            // now at this canonical path is ours.  Preserve it and relinquish
+            // the cleanup claim instead of deleting by name.
+            record.phase = OwnedPathPhase::Released;
+            PersistOwnedPathState(prefix, record);
+            return;
+        }
         UniqueHandle directory(CreateFileW(record.path.c_str(), FILE_READ_ATTRIBUTES | DELETE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING,
             FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr));
         if (!directory)
             FailLastError(L"Could not inspect an owned A4S Menu directory for rollback.");
         FILE_ATTRIBUTE_TAG_INFO attributes = {};
         if (!GetFileInformationByHandleEx(directory.get(), FileAttributeTagInfo,
-                &attributes, sizeof(attributes)) ||
-            (attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+                &attributes, sizeof(attributes)))
+            FailLastError(L"Could not inspect an owned A4S Menu directory for rollback.");
+        if ((attributes.FileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
             (attributes.FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-            (record.identity.valid &&
-                !SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity)))
-            Fail(ERROR_INVALID_STATE,
-                L"An owned A4S Menu directory no longer matches its rollback proof.");
+            !SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity))
+        {
+            // A replacement at the same pathname is not ours.  Preserve it and
+            // release the claim so an unrelated object cannot block recovery.
+            directory.reset();
+            record.phase = OwnedPathPhase::Released;
+            PersistOwnedPathState(prefix, record);
+            return;
+        }
         bool empty = true;
         {
             WIN32_FIND_DATAW data = {};
@@ -3092,39 +3313,95 @@ namespace
     {
         if (!journal.deployment.planned || !journal.deployment.required)
             return;
-        const bool stagingOwned = journal.deployment.staging.phase != OwnedPathPhase::Released;
-        const bool finalOwned = journal.deployment.finalSlot.phase != OwnedPathPhase::Released;
+        bool stagingOwned = journal.deployment.staging.phase != OwnedPathPhase::Released;
+        bool finalOwned = journal.deployment.finalSlot.phase != OwnedPathPhase::Released;
         if ((stagingOwned && RegistrationReferencesPath(journal.deployment.staging.path)) ||
             (finalOwned && RegistrationReferencesPath(journal.deployment.finalSlot.path)))
             Fail(ERROR_INVALID_STATE,
                 L"Restored registration still references an owned deployment path.");
 
-        const DWORD explorer = ExplorerProcessId();
-        const ExplorerModuleInspection inspection = InspectExplorerA4SModules(explorer);
-        const bool inspectionComplete = !explorer || inspection.complete;
-        const bool mapped = explorer &&
-            ((stagingOwned && inspection.ProtectsSlot(journal.deployment.staging.path)) ||
-                (finalOwned && inspection.ProtectsSlot(journal.deployment.finalSlot.path)));
-        if (!CanDeleteOwnedPath(true, inspectionComplete,
-                explorer && inspection.unknownA4SModule, mapped, true, false, false))
-            Fail(ERROR_BUSY,
-                L"Explorer mapping inspection cannot prove the deployment safe to roll back.");
-
-        const bool stagingExists = stagingOwned &&
+        bool stagingExists = stagingOwned &&
             !PathIsAbsent(journal.deployment.staging.path);
-        const bool finalExists = finalOwned &&
+        bool finalExists = finalOwned &&
             !PathIsAbsent(journal.deployment.finalSlot.path);
-        if (stagingExists && finalExists)
-            Fail(ERROR_INVALID_STATE,
-                L"Both token-qualified deployment paths exist during rollback.");
-        const FileIdentity moveIdentity = journal.deployment.staging.identity.valid ?
-            journal.deployment.staging.identity : journal.deployment.finalSlot.identity;
+
+        // Identity is the deletion authority.  A durable Intent without an
+        // identity can mean either "we crashed just after create" or "another
+        // actor populated the planned path after our crash".  Those cases are
+        // intentionally indistinguishable and therefore preserve the object.
+        FileIdentity finalProof = journal.deployment.finalSlot.identity;
+        if (!finalProof.valid && !stagingExists)
+            finalProof = journal.deployment.staging.identity;
+        if (stagingExists && !journal.deployment.staging.identity.valid)
+        {
+            journal.deployment.staging.phase = OwnedPathPhase::Released;
+            stagingOwned = false;
+            stagingExists = false;
+        }
+        if (finalExists && !finalProof.valid)
+        {
+            journal.deployment.finalSlot.phase = OwnedPathPhase::Released;
+            finalOwned = false;
+            finalExists = false;
+        }
+        const auto relinquishIfIdentityChanged = [](OwnedPathRecord &record,
+            const FileIdentity &proof, bool &owned, bool &exists) {
+            if (!exists)
+                return;
+            bool matches = false;
+            try
+            {
+                matches = proof.valid &&
+                    SameFileIdentity(PathIdentity(record.path, true), proof);
+            }
+            catch (const InstallerFailure &)
+            {
+                matches = false;
+            }
+            if (!matches)
+            {
+                record.phase = OwnedPathPhase::Released;
+                owned = false;
+                exists = false;
+            }
+        };
+        relinquishIfIdentityChanged(journal.deployment.staging,
+            journal.deployment.staging.identity, stagingOwned, stagingExists);
+        relinquishIfIdentityChanged(journal.deployment.finalSlot,
+            finalProof, finalOwned, finalExists);
+        if (stagingOwned && !stagingExists)
+            journal.deployment.staging.phase = OwnedPathPhase::Released;
+        if (finalOwned && !finalExists)
+            journal.deployment.finalSlot.phase = OwnedPathPhase::Released;
+
+        if (stagingExists || finalExists)
+        {
+            const DWORD explorer = ExplorerProcessId();
+            const ExplorerModuleInspection inspection = InspectExplorerA4SModules(explorer);
+            // No taskbar PID is not proof that no Explorer image is mapped; it
+            // can also be the transient shell-restart window.  Fail closed and
+            // retry later instead of treating an unobservable process set as
+            // a complete inspection.
+            const bool inspectionComplete = explorer != 0 && inspection.complete;
+            const bool mapped = explorer &&
+                ((stagingExists && inspection.ProtectsSlot(
+                    journal.deployment.staging.path)) ||
+                    (finalExists && inspection.ProtectsSlot(
+                        journal.deployment.finalSlot.path)));
+            if (!CanDeleteOwnedPath(true, inspectionComplete,
+                    !explorer || inspection.unknownA4SModule, mapped, true,
+                    true, true))
+                Fail(ERROR_BUSY,
+                    L"Explorer mapping inspection cannot prove the deployment safe to roll back.");
+        }
+
         if (stagingExists && !RemoveOwnedSlotDirectory(journal.deployment.staging,
-                moveIdentity, journal.deployment, false, runningOwnedImage))
+                journal.deployment.staging.identity, journal.deployment, true,
+                true, runningOwnedImage))
             Fail(ERROR_INVALID_STATE,
                 L"The owned staging slot could not be verified for rollback.");
         if (finalExists && !RemoveOwnedSlotDirectory(journal.deployment.finalSlot,
-                moveIdentity, journal.deployment, true, runningOwnedImage))
+                finalProof, journal.deployment, true, false, runningOwnedImage))
             Fail(ERROR_INVALID_STATE,
                 L"The owned final slot could not be verified for rollback.");
         journal.deployment.staging.phase = OwnedPathPhase::Released;
@@ -3156,6 +3433,15 @@ namespace
             PersistOwnedPathState(L"CleanupHelper", helper);
             return;
         }
+        if (!helper.identity.valid)
+        {
+            // Intent is not file ownership.  If setup died between CREATE_NEW
+            // and the identity flush, preserve whatever now occupies the
+            // canonical helper path and relinquish only our journal claim.
+            helper.phase = OwnedPathPhase::Released;
+            PersistOwnedPathState(L"CleanupHelper", helper);
+            return;
+        }
         bool removed = false;
         if (runningCleanupImage && *runningCleanupImage)
         {
@@ -3169,10 +3455,26 @@ namespace
         }
         else
         {
+            bool identityMatches = false;
+            try
+            {
+                identityMatches = SameFileIdentity(
+                    PathIdentity(helper.path, false), helper.identity);
+            }
+            catch (const InstallerFailure &)
+            {
+                identityMatches = false;
+            }
+            if (!identityMatches)
+            {
+                helper.phase = OwnedPathPhase::Released;
+                PersistOwnedPathState(L"CleanupHelper", helper);
+                return;
+            }
             removed = DeleteOwnedRegularFile(helper.path,
                 journal.cleanupHelper.expectedSha256,
                 helper.identity.valid ? &helper.identity : nullptr,
-                helper.phase == OwnedPathPhase::Intent);
+                true);
         }
         if (!removed)
             Fail(ERROR_CANNOT_MAKE,
@@ -3202,14 +3504,17 @@ namespace
         }
         if (journal.resetSafety)
             ClearSafetyStateChecked();
+        // Journal deletion is the commit point.  A crash after it but before
+        // removing RunOnce leaves only an idempotent --reconcile invocation;
+        // the reverse order leaves a schema-2 journal that a rolled-back v1
+        // setup can see without its target-matching recovery value and causes
+        // that older coordinator to undo an already committed rollback.
+        DeleteJournalDurably();
         if (!journal.targetRecoveryCommand.empty())
         {
             DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue);
             FlushKeyChecked(kRunOnceKey, true);
         }
-        // The journal is the last durable record removed on both commit and
-        // rollback. Any preceding crash therefore remains reconcilable.
-        DeleteJournalDurably();
     }
 
     void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {
@@ -3409,7 +3714,7 @@ namespace
         const std::wstring nextPrevious = ValidateSlotBasic(state.activeSlot) ?
             state.activeSlot : L"";
         const std::wstring recoveryCommand = RecoveryCommand(
-            Join(state.previousSlot, kSetupFilename));
+            RollbackRecoverySetup(state));
         ServicingJournal journal = BeginJournal(JournalTarget::Installed,
             state.previousSlot, nextPrevious, L"", recoveryCommand, false, identity);
         const bool hostWasPresent = FindWindowW(A4S_HOST_WINDOW_CLASS_W,

@@ -1921,7 +1921,7 @@ function Get-ExpectedCleanupRunOnceForSnapshot {
             -Aggregate ([ordered]@{ Snapshot = $Snapshot }) `
             -Label 'pending cleanup identity'
         if (-not $operation.LastPresent -or
-            $operation.LastSequence -ne $operation.HighWater) {
+            $operation.LastSequence -gt $operation.HighWater) {
             return $null
         }
         $encoded = $operation.LastSequence.ToString('D20',

@@ -391,8 +391,8 @@ Assert-SourceOrder -Description 'Post-commit completion' -Source $completeSource
     'SetDword(key.get(), L"CompletionStarted", 1)',
     'RegFlushKey(key.get())',
     'ClearSafetyStateChecked()',
-    'DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue)',
-    'DeleteJournalDurably()')
+    'DeleteJournalDurably()',
+    'DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue)')
 
 $beginJournalSource = Get-SourceSection -Source $setupSource `
     -StartMarker 'ServicingJournal BeginJournal(' -EndMarker 'void PersistOwnedPathState('
@@ -439,6 +439,101 @@ foreach ($pureMarker in @(
         throw "Filesystem rollback decision coverage is missing '$pureMarker'."
     }
 }
+
+$pinnedDirectorySource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'UniqueHandle OpenPinnedOwnedDirectory(' `
+    -EndMarker 'UniqueHandle MaterializeOwnedDirectory('
+foreach ($marker in @('FILE_SHARE_READ | FILE_SHARE_WRITE',
+        'FILE_FLAG_OPEN_REPARSE_POINT',
+        'SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity)')) {
+    if ($pinnedDirectorySource.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Pinned deployment-directory ownership is missing '$marker'."
+    }
+}
+if ($pinnedDirectorySource.IndexOf('FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE',
+        [StringComparison]::Ordinal) -ge 0) {
+    throw 'Pinned deployment-directory leases still permit pathname replacement.'
+}
+
+$ownedReleaseSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void ReleaseOwnedDeployment(' `
+    -EndMarker 'void ReleaseOwnedCleanupHelper('
+foreach ($marker in @(
+        'stagingExists && !journal.deployment.staging.identity.valid',
+        'finalExists && !finalProof.valid',
+        'const bool inspectionComplete = explorer != 0 && inspection.complete',
+        '!explorer || inspection.unknownA4SModule')) {
+    if ($ownedReleaseSource.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Crash-safe deployment release is missing '$marker'."
+    }
+}
+$ownedSlotRemovalSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool RemoveOwnedSlotDirectory(' `
+    -EndMarker 'void ReleaseEmptyOwnedDirectory('
+foreach ($marker in @('bool allowMissingFiles, bool allowJournaledPartial',
+        'if (!allowMissingFiles && (!host || !menu || !setup))',
+        'allowJournaledPartial && identityMatches && identityRequired')) {
+    if ($ownedSlotRemovalSource.IndexOf($marker,
+            [StringComparison]::Ordinal) -lt 0) {
+        throw "Retry-safe owned-slot removal is missing '$marker'."
+    }
+}
+$normalizedOwnedReleaseSource = $ownedReleaseSource -replace '\s+', ' '
+foreach ($marker in @(
+        'journal.deployment.staging.identity, journal.deployment, true, true, runningOwnedImage)',
+        'finalProof, journal.deployment, true, false, runningOwnedImage)')) {
+    if ($normalizedOwnedReleaseSource.IndexOf($marker,
+            [StringComparison]::Ordinal) -lt 0) {
+        throw "Owned-slot recovery call contract is missing '$marker'."
+    }
+}
+$emptyOwnedDirectorySource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void ReleaseEmptyOwnedDirectory(' `
+    -EndMarker 'void ReleaseOwnedDeployment('
+foreach ($marker in @('if (!record.identity.valid)',
+        'FILE_SHARE_READ | FILE_SHARE_WRITE',
+        '!SameFileIdentity(FileIdentityFromHandle(directory.get()), record.identity)',
+        'record.phase = OwnedPathPhase::Released')) {
+    if ($emptyOwnedDirectorySource.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Exact empty-directory recovery is missing '$marker'."
+    }
+}
+$helperReleaseSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void ReleaseOwnedCleanupHelper(' `
+    -EndMarker 'void RollBackJournal('
+if ($helperReleaseSource.IndexOf('if (!helper.identity.valid)',
+        [StringComparison]::Ordinal) -lt 0) {
+    throw 'Intent-only cleanup-helper recovery can still delete without identity proof.'
+}
+$knownSlotCleanupSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool RemoveKnownSlotFilesUnchecked(' `
+    -EndMarker 'void RemoveStagingBestEffort('
+foreach ($marker in @('FILE_SHARE_READ | FILE_SHARE_WRITE',
+        'FILE_FLAG_OPEN_REPARSE_POINT', 'links.nNumberOfLinks != 1U',
+        'SlotNameMatchesPayload(leaf, PayloadSlotBase(',
+        'SetFileInformationByHandle(file.get(), FileDispositionInfoEx')) {
+    if ($knownSlotCleanupSource.IndexOf($marker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Exact known-slot cleanup is missing '$marker'."
+    }
+}
+$cleanupContinuationSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool CleanupContinuationMatches(' `
+    -EndMarker 'std::wstring RecoveryCommand('
+Assert-SourceOrder -Description 'Cleanup continuation CAS after rolled-back allocation' `
+    -Source $cleanupContinuationSource -Markers @(
+        'ReadLifecycleHighWater() < identity.sequence',
+        '!LastOperationMatches(identity)',
+        'StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, expected)')
+$rollbackRecoverySource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'std::wstring RollbackRecoverySetup(' `
+    -EndMarker 'void QueueJournalRecovery('
+Assert-SourceOrder -Description 'Frozen-v1 rollback schema coordinator' `
+    -Source $rollbackRecoverySource -Markers @(
+        'FileProductVersion(targetSetup)',
+        'kDurableFilesystemJournalMinimumVersion',
+        'ValidateSlotBasic(state.activeSlot)',
+        'FileProductVersion(activeSetup)',
+        'return activeSetup')
 
 $reconcileSource = Get-SourceSection -Source $setupSource `
     -StartMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {' `
