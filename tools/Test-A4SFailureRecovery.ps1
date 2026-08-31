@@ -1,5 +1,8 @@
 [CmdletBinding(DefaultParameterSetName = 'Offline')]
 param(
+    [Parameter(Mandatory, ParameterSetName = 'ContractLibrary')]
+    [switch] $ContractLibrary,
+
     [Parameter(Mandatory, ParameterSetName = 'Isolated')]
     [switch] $RunIsolatedDllFailures,
 
@@ -16,12 +19,19 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Recover')]
     [string] $RecoveryBundle,
 
+    [Parameter(Mandatory, ParameterSetName = 'Recover')]
+    [ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+    [string] $ExpectedCurrentHostSafetySha256,
+
     [Parameter(Mandatory, ParameterSetName = 'Isolated')]
     [Parameter(Mandatory, ParameterSetName = 'Live')]
     [string] $HostPath,
 
     [Parameter(Mandatory, ParameterSetName = 'Live')]
     [string] $DllPath,
+
+    [Parameter(Mandatory, ParameterSetName = 'Live')]
+    [string] $ReleaseRecordPath,
 
     [Parameter(ParameterSetName = 'Isolated')]
     [Parameter(ParameterSetName = 'Live')]
@@ -64,14 +74,48 @@ function Initialize-A4SFailureRecoveryNative {
 using System;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
+using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
 public static class A4SFailureRecoveryNative
 {
+    public sealed class ProductMutationBoundary : IDisposable
+    {
+        private Mutex setup;
+        private Mutex host;
+        private bool setupOwned;
+        private bool hostOwned;
+
+        internal ProductMutationBoundary(Mutex setup, bool setupOwned,
+            Mutex host, bool hostOwned, string setupName, string hostName)
+        {
+            this.setup = setup;
+            this.setupOwned = setupOwned;
+            this.host = host;
+            this.hostOwned = hostOwned;
+            SetupMutexName = setupName;
+            HostMutexName = hostName;
+        }
+
+        public string SetupMutexName { get; private set; }
+        public string HostMutexName { get; private set; }
+        public bool IsHeld { get { return setupOwned && hostOwned; } }
+
+        public void Dispose()
+        {
+            if (hostOwned) { host.ReleaseMutex(); hostOwned = false; }
+            if (host != null) { host.Dispose(); host = null; }
+            if (setupOwned) { setup.ReleaseMutex(); setupOwned = false; }
+            if (setup != null) { setup.Dispose(); setup = null; }
+        }
+    }
+
     public sealed class PathRecord
     {
         public string FinalPath { get; set; }
@@ -165,9 +209,120 @@ public static class A4SFailureRecoveryNative
     [DllImport("kernel32.dll")]
     private static extern bool CloseHandle(IntPtr handle);
 
+    [DllImport("kernel32.dll")]
+    private static extern uint GetCurrentThreadId();
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern IntPtr GetThreadDesktop(uint threadId);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern bool GetUserObjectInformationW(IntPtr objectHandle,
+        int index, IntPtr information, uint length, out uint needed);
+
     private const uint INVALID_FILE_ATTRIBUTES = 0xffffffff;
     private const uint FILE_ATTRIBUTE_DIRECTORY = 0x10;
     private const uint FILE_ATTRIBUTE_REPARSE_POINT = 0x400;
+
+    private static bool WaitMutex(Mutex mutex)
+    {
+        try { return mutex.WaitOne(0, false); }
+        catch (AbandonedMutexException) { return true; }
+    }
+
+    private static byte[] CurrentSidBytes()
+    {
+        SecurityIdentifier sid = WindowsIdentity.GetCurrent().User;
+        byte[] bytes = new byte[sid.BinaryLength];
+        sid.GetBinaryForm(bytes, 0);
+        return bytes;
+    }
+
+    private static string Hex(byte[] bytes)
+    {
+        StringBuilder text = new StringBuilder(bytes.Length * 2);
+        foreach (byte value in bytes)
+            text.Append(value.ToString("X2"));
+        return text.ToString();
+    }
+
+    private static string SetupMutexName()
+    {
+        using (SHA256 algorithm = SHA256.Create())
+            return @"Global\A4SMenu.Setup.v1." +
+                Hex(algorithm.ComputeHash(CurrentSidBytes())).Substring(0, 32);
+    }
+
+    private static string HostMutexName()
+    {
+        IntPtr desktop = GetThreadDesktop(GetCurrentThreadId());
+        if (desktop == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Could not identify the current desktop for host serialization.");
+        uint needed;
+        GetUserObjectInformationW(desktop, 2, IntPtr.Zero, 0, out needed);
+        if (needed == 0)
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Could not measure the current desktop name.");
+        IntPtr buffer = Marshal.AllocHGlobal((int)needed);
+        try
+        {
+            if (!GetUserObjectInformationW(desktop, 2, buffer, needed, out needed))
+                throw new Win32Exception(Marshal.GetLastWin32Error(),
+                    "Could not read the current desktop name.");
+            byte[] desktopBytes = new byte[needed];
+            Marshal.Copy(buffer, desktopBytes, 0, (int)needed);
+            ulong hash = 14695981039346656037UL;
+            unchecked
+            {
+                foreach (byte value in CurrentSidBytes())
+                {
+                    hash ^= value;
+                    hash *= 1099511628211UL;
+                }
+                foreach (byte value in desktopBytes)
+                {
+                    hash ^= value;
+                    hash *= 1099511628211UL;
+                }
+            }
+            return String.Format(@"Local\A4SMenu.Host.Instance.v1.{0}.{1:X16}",
+                Process.GetCurrentProcess().SessionId, hash);
+        }
+        finally { Marshal.FreeHGlobal(buffer); }
+    }
+
+    public static ProductMutationBoundary AcquireProductMutationBoundary()
+    {
+        string setupName = SetupMutexName();
+        string hostName = HostMutexName();
+        Mutex setup = null;
+        Mutex host = null;
+        bool setupOwned = false;
+        bool hostOwned = false;
+        try
+        {
+            setup = new Mutex(false, setupName);
+            setupOwned = WaitMutex(setup);
+            if (!setupOwned)
+                throw new InvalidOperationException(
+                    "The A4S product servicing mutex is already owned.");
+            host = new Mutex(false, hostName);
+            hostOwned = WaitMutex(host);
+            if (!hostOwned)
+                throw new InvalidOperationException(
+                    "The current desktop A4S host mutex is already owned.");
+            return new ProductMutationBoundary(setup, setupOwned,
+                host, hostOwned, setupName, hostName);
+        }
+        catch
+        {
+            if (hostOwned) host.ReleaseMutex();
+            if (host != null) host.Dispose();
+            if (setupOwned) setup.ReleaseMutex();
+            if (setup != null) setup.Dispose();
+            throw;
+        }
+    }
 
     private static string StripExtendedPrefix(string path)
     {
@@ -604,6 +759,73 @@ function Add-EvidenceCheckpoint {
     Save-Evidence
 }
 
+function Test-A4STemporaryCleanupAllowed {
+    param(
+        [Parameter(Mandatory)][bool] $AllHostsStopped,
+        [Parameter(Mandatory)][bool] $MappingInspectionSucceeded,
+        [Parameter(Mandatory)][int] $MappingCount,
+        [Parameter(Mandatory)][int] $WindowCount,
+        [Parameter(Mandatory)][bool] $SafetyRestored,
+        [bool] $CleanupRestartRequired = $false,
+        [bool] $CleanupRestartComplete = $true
+    )
+    return $AllHostsStopped -and $MappingInspectionSucceeded -and
+        $MappingCount -eq 0 -and $WindowCount -eq 0 -and $SafetyRestored -and
+        (-not $CleanupRestartRequired -or $CleanupRestartComplete)
+}
+
+function Set-RetainedTemporaryRootEvidence {
+    param(
+        [Parameter(Mandatory)][string] $Root,
+        [Parameter(Mandatory)][bool] $BackupPrepared,
+        [Parameter(Mandatory)][string] $Reason,
+        [string] $Bundle
+    )
+
+    if ($null -eq $script:Evidence.recovery) {
+        $script:Evidence.recovery = [ordered]@{}
+    }
+    $script:Evidence.recovery['retainedTemporaryRoot'] = [IO.Path]::GetFullPath($Root)
+    $script:Evidence.recovery['retentionReason'] = $Reason
+    if ($BackupPrepared) {
+        if (-not $script:Evidence.recovery.Contains('authorizedCurrentHostSafetySha256') -or
+            [string]::IsNullOrWhiteSpace(
+                [string]$script:Evidence.recovery.authorizedCurrentHostSafetySha256)) {
+            try {
+                $aggregate = Get-HostSafetyAggregateRecord
+                $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $aggregate.sha256
+            }
+            catch {
+                $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $null
+                [void]$script:Evidence.errors.Add(
+                    "Could not record a recovery authorization hash: $($_.Exception.Message)")
+            }
+        }
+        $authorizedHash = [string]$script:Evidence.recovery.authorizedCurrentHostSafetySha256
+        $recoveryStep = if ($authorizedHash -match '\A[A-Fa-f0-9]{64}\z') {
+            "run this harness with -RecoverHostSafety -RecoveryBundle '$Bundle' -ExpectedCurrentHostSafetySha256 '$authorizedHash'"
+        } else {
+            'do not run recovery because an exact current HostSafety aggregate hash could not be persisted'
+        }
+        $script:Evidence.recovery['cleanupInstructions'] =
+            "DO NOT DELETE '$([IO.Path]::GetFullPath($Root))'. Stop every same-user A4SMenuHost in every Windows session; verify the taskbar Explorer has zero A4SMenu.dll mappings and zero A4S menu windows; restart Explorer manually if an image remains pinned; then $recoveryStep. Recovery aborts if HostSafety differs from the persisted aggregate. Delete the retained root only after exact restoration and clean-state inspection."
+    }
+    else {
+        $script:Evidence.recovery['cleanupInstructions'] =
+            "DO NOT DELETE '$([IO.Path]::GetFullPath($Root))' until every same-user A4SMenuHost is stopped and Explorer is conclusively free of A4SMenu.dll mappings/windows. No HostSafety backup completed, so this bundle cannot authorize recovery."
+    }
+    Save-Evidence
+}
+
+function Clear-RetainedTemporaryRootEvidence {
+    if ($null -ne $script:Evidence.recovery) {
+        $script:Evidence.recovery['retainedTemporaryRoot'] = $null
+        $script:Evidence.recovery['retentionReason'] = $null
+        $script:Evidence.recovery['cleanupInstructions'] = $null
+        Save-Evidence
+    }
+}
+
 function New-EvidenceBundle {
     param(
         [Parameter(Mandatory)][string] $Mode,
@@ -640,16 +862,19 @@ function New-EvidenceBundle {
         -Description 'failure/recovery evidence bundle' -ExpectedParent $baseRecord.finalPath
     $script:EvidenceFile = Join-Path $bundleRecord.finalPath ([IO.Path]::GetFileName($file))
     Assert-NoShortPathAlias -Path $script:EvidenceFile
-    $sourceCommit = ((& git -C $repoRoot rev-parse HEAD 2>$null) | Out-String).Trim()
-    if ($sourceCommit -notmatch '\A[A-Fa-f0-9]{40,64}\z') {
-        throw 'Could not bind qualification evidence to an exact source commit.'
+    $repositoryHead = ((& git -C $repoRoot rev-parse HEAD 2>$null) | Out-String).Trim()
+    if ($repositoryHead -notmatch '\A[A-Fa-f0-9]{40,64}\z') {
+        throw 'Could not record the informational repository HEAD.'
     }
     $script:Evidence = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         mode = $Mode
         startedUtc = Get-UtcText
         updatedUtc = Get-UtcText
-        sourceCommit = $sourceCommit
+        sourceBinding = 'unverified'
+        verifiedSourceCommit = $null
+        repositoryHead = $repositoryHead
+        releaseRecord = $null
         sourceWorktree = @(& git -C $repoRoot status --porcelain=v1 2>$null)
         harnessSha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash
         machine = $env:COMPUTERNAME
@@ -736,8 +961,68 @@ function Compare-HostSafetySnapshot {
         [Parameter(Mandatory)][object] $Expected,
         [Parameter(Mandatory)][object] $Actual
     )
-    return (($Expected | ConvertTo-Json -Depth 8 -Compress) -ceq
-        ($Actual | ConvertTo-Json -Depth 8 -Compress))
+    return (($Expected | ConvertTo-Json -Depth 32 -Compress) -ceq
+        ($Actual | ConvertTo-Json -Depth 32 -Compress))
+}
+
+function Get-TextSha256 {
+    param([Parameter(Mandatory)][string] $Text)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($Text)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($algorithm.ComputeHash($bytes))).Replace('-', '') }
+    finally { $algorithm.Dispose() }
+}
+
+function Get-HostSafetyAggregateRecord {
+    param([object] $Snapshot)
+    if ($null -eq $Snapshot) { $Snapshot = Get-HostSafetySnapshot }
+    Assert-ValidRegistryTree -Tree $Snapshot -IsRoot $true
+    $json = $Snapshot | ConvertTo-Json -Depth 32 -Compress
+    return [ordered]@{
+        snapshot = $Snapshot
+        canonicalJson = $json
+        sha256 = Get-TextSha256 -Text $json
+    }
+}
+
+function Assert-AuthorizedHostSafetyAggregate {
+    param(
+        [Parameter(Mandatory)][object] $Current,
+        [object] $ExpectedSnapshot,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedSha256,
+        [Parameter(Mandatory)][string] $Boundary
+    )
+
+    if ($ExpectedSnapshot) {
+        $expected = Get-HostSafetyAggregateRecord -Snapshot $ExpectedSnapshot
+        if ($expected.sha256 -cne $ExpectedSha256.ToUpperInvariant()) {
+            throw "$Boundary expected snapshot does not match its authorized aggregate hash."
+        }
+        if (-not (Compare-HostSafetySnapshot -Expected $ExpectedSnapshot `
+            -Actual $Current.snapshot)) {
+            throw "$Boundary observed an intervening HostSafety aggregate; mutation is forbidden."
+        }
+    }
+    if ($Current.sha256 -cne $ExpectedSha256.ToUpperInvariant()) {
+        throw "$Boundary aggregate hash differs from the authorized immediate state; mutation is forbidden."
+    }
+    return $true
+}
+
+function Add-HostSafetyRestoreAuthorizationCheckpoint {
+    param([Parameter(Mandatory)][string] $Label)
+
+    $aggregate = Get-HostSafetyAggregateRecord
+    $script:Evidence.recovery['authorizedCurrentHostSafetySha256'] = $aggregate.sha256
+    Add-EvidenceCheckpoint ([ordered]@{
+        utc = Get-UtcText
+        label = $Label
+        mutation = 'HostSafety exact restore authorization'
+        authorizedCurrentHostSafetySha256 = $aggregate.sha256
+        hostSafety = $aggregate.snapshot
+    })
+    return $aggregate
 }
 
 function Assert-ExactPropertySet {
@@ -779,11 +1064,11 @@ function Assert-ValidRegistryTree {
         if ([string]$value.name -match '[\\/]') { throw 'HostSafety backup contains an invalid value name.' }
         if (-not $valueNames.Add([string]$value.name)) { throw 'HostSafety backup contains duplicate value names.' }
         $kind = [string]$value.kind
-        if ($kind -notin @('None', 'Unknown', 'String', 'ExpandString', 'Binary',
+        if ($kind -notin @('None', 'String', 'ExpandString', 'Binary',
                 'DWord', 'MultiString', 'QWord')) {
             throw "HostSafety backup contains unsupported registry kind '$kind'."
         }
-        if ($kind -in @('Binary', 'None', 'Unknown')) {
+        if ($kind -in @('Binary', 'None')) {
             if ($value.value -isnot [string]) {
                 throw "HostSafety backup $kind value is not an encoded string."
             }
@@ -874,8 +1159,8 @@ function Read-ValidatedHostSafetyBackup {
     catch { throw "HostSafety recovery manifest is not valid JSON: $($_.Exception.Message)" }
     Assert-ExactPropertySet -Object $manifest -Names @('schemaVersion', 'backupId',
         'createdUtc', 'registryHive', 'registryPath', 'registrySubKey', 'registryView',
-        'snapshot', 'regExport') -Description 'HostSafety recovery manifest'
-    if ($manifest.schemaVersion -ne 2 -or
+        'snapshot', 'snapshotSha256', 'regExport') -Description 'HostSafety recovery manifest'
+    if ($manifest.schemaVersion -ne 3 -or
         [string]$manifest.registryHive -cne 'HKEY_CURRENT_USER' -or
         [string]$manifest.registryPath -cne $hostSafetyRegPath -or
         [string]$manifest.registrySubKey -cne $hostSafetySubKey -or
@@ -896,6 +1181,11 @@ function Read-ValidatedHostSafetyBackup {
         throw 'HostSafety recovery manifest creation timestamp is not explicitly UTC.'
     }
     Assert-ValidRegistryTree -Tree $manifest.snapshot -IsRoot $true
+    $snapshotAggregate = Get-HostSafetyAggregateRecord -Snapshot $manifest.snapshot
+    if ([string]$manifest.snapshotSha256 -notmatch '\A[A-Fa-f0-9]{64}\z' -or
+        $snapshotAggregate.sha256 -cne ([string]$manifest.snapshotSha256).ToUpperInvariant()) {
+        throw 'HostSafety recovery manifest snapshot aggregate hash is invalid.'
+    }
     $regFile = $null
     if ([bool]$manifest.snapshot.exists) {
         if ($null -eq $manifest.regExport) { throw 'Existing HostSafety backup lacks a registry export record.' }
@@ -938,6 +1228,7 @@ function Read-ValidatedHostSafetyBackup {
         manifestIdentity = $manifestRecord.identity
         manifestSha256 = (Get-FileHash -LiteralPath $manifestRecord.finalPath -Algorithm SHA256).Hash
         manifest = $manifest
+        snapshotSha256 = $snapshotAggregate.sha256
         regFile = $regFile
     }
 }
@@ -952,6 +1243,7 @@ function Backup-HostSafety {
         throw 'Recovery backup assets must be fresh; overwrite is forbidden.'
     }
     $snapshot = Get-HostSafetySnapshot
+    $snapshotAggregate = Get-HostSafetyAggregateRecord -Snapshot $snapshot
     $snapshotRoundTrip = $snapshot | ConvertTo-Json -Depth 16 | ConvertFrom-Json
     Assert-ValidRegistryTree -Tree $snapshotRoundTrip -IsRoot $true
     $regExport = $null
@@ -980,7 +1272,7 @@ function Backup-HostSafety {
         throw 'HostSafety changed while its recovery bundle was being prepared; no Explorer crash is permitted.'
     }
     $manifest = [ordered]@{
-        schemaVersion = 2
+        schemaVersion = 3
         backupId = [Guid]::NewGuid().ToString('N')
         createdUtc = Get-UtcText
         registryHive = 'HKEY_CURRENT_USER'
@@ -988,9 +1280,10 @@ function Backup-HostSafety {
         registrySubKey = $hostSafetySubKey
         registryView = 'Registry64'
         snapshot = $snapshot
+        snapshotSha256 = $snapshotAggregate.sha256
         regExport = $regExport
     }
-    Write-DurableNewText -Path $manifestPath -Text ($manifest | ConvertTo-Json -Depth 16)
+    Write-DurableNewText -Path $manifestPath -Text ($manifest | ConvertTo-Json -Depth 32)
     return Read-ValidatedHostSafetyBackup -Bundle $bundleRecord.finalPath
 }
 
@@ -1001,82 +1294,347 @@ function Remove-HostSafetyRegistryTree {
     finally { $base.Dispose() }
 }
 
-function Import-ValidatedHostSafetyBackup {
+function Enter-A4SProductMutationBoundary {
+    $boundary = [A4SFailureRecoveryNative]::AcquireProductMutationBoundary()
+    if (-not $boundary -or -not $boundary.IsHeld) {
+        if ($boundary) { $boundary.Dispose() }
+        throw 'Could not acquire the exact product Setup/host mutation boundary.'
+    }
+    return $boundary
+}
+
+function Exit-A4SProductMutationBoundary {
+    param([object] $Boundary)
+    if ($Boundary) { $Boundary.Dispose() }
+}
+
+function Assert-A4SProductMutationBoundary {
     param(
-        [Parameter(Mandatory)][object] $Validated,
-        [string] $ProbeHost
+        [Parameter(Mandatory)][object] $Boundary,
+        [Parameter(Mandatory)][string] $Label
+    )
+    if (-not $Boundary.IsHeld -or
+        [string]$Boundary.SetupMutexName -notmatch '\AGlobal\\A4SMenu\.Setup\.v1\.[A-F0-9]{32}\z' -or
+        [string]$Boundary.HostMutexName -notmatch '\ALocal\\A4SMenu\.Host\.Instance\.v1\.[0-9]+\.[A-F0-9]{16}\z') {
+        throw "$Label does not hold the exact product Setup and current-desktop host mutexes."
+    }
+    Assert-AllTrackedHostsStopped
+    return $true
+}
+
+function Copy-RegistrySnapshotObject {
+    param([Parameter(Mandatory)][object] $Snapshot)
+    return ($Snapshot | ConvertTo-Json -Depth 32 | ConvertFrom-Json)
+}
+
+function Convert-RegistryValueForWrite {
+    param([Parameter(Mandatory)][object] $Record)
+    switch ([string]$Record.kind) {
+        'Binary' { return [Convert]::FromBase64String([string]$Record.value) }
+        'None' { return [Convert]::FromBase64String([string]$Record.value) }
+        'MultiString' { return [string[]]@($Record.value) }
+        'DWord' {
+            return [BitConverter]::ToInt32(
+                [BitConverter]::GetBytes([uint32]$Record.value), 0)
+        }
+        'QWord' {
+            return [BitConverter]::ToInt64(
+                [BitConverter]::GetBytes([uint64]$Record.value), 0)
+        }
+        'String' { return [string]$Record.value }
+        'ExpandString' { return [string]$Record.value }
+        default { throw "Unsupported exact registry-write kind '$($Record.kind)'." }
+    }
+}
+
+function Invoke-AuthorizedHostSafetyMutationStep {
+    param(
+        [Parameter(Mandatory)][object] $Boundary,
+        [Parameter(Mandatory)][object] $Before,
+        [Parameter(Mandatory)][object] $AfterSnapshot,
+        [Parameter(Mandatory)][scriptblock] $Mutation,
+        [Parameter(Mandatory)][ref] $MutationState,
+        [Parameter(Mandatory)][string] $Label
     )
 
-    if ($Validated.validated -ne $true) { throw 'Unvalidated HostSafety backup cannot be imported.' }
-    # Close the validation/use gap: validate the manifest, view, target, export
-    # identity, length, content target, and hash again before any deletion.
-    $current = Read-ValidatedHostSafetyBackup -Bundle $Validated.bundle
-    if ($current.bundleIdentity -cne $Validated.bundleIdentity -or
-        $current.manifestIdentity -cne $Validated.manifestIdentity -or
-        $current.manifestSha256 -cne $Validated.manifestSha256) {
-        throw 'HostSafety backup identity changed between validation and use.'
+    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label "$Label preflight")
+    $current = Get-HostSafetyAggregateRecord
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $current `
+        -ExpectedSnapshot $Before.snapshot -ExpectedSha256 $Before.sha256 `
+        -Boundary "$Label preflight")
+    $after = Get-HostSafetyAggregateRecord -Snapshot $AfterSnapshot
+    $MutationState.Value = [ordered]@{
+        label = $Label
+        inFlight = $true
+        allowed = @($Before, $after)
+        lastVerified = $Before
     }
-    Assert-AllTrackedHostsStopped -ProbeHost $ProbeHost
-    $beforeImport = Get-HostSafetySnapshot
-    if (Compare-HostSafetySnapshot -Expected $current.manifest.snapshot -Actual $beforeImport) {
-        return $beforeImport
+    & $Mutation
+    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label "$Label postflight")
+    $observed = Get-HostSafetyAggregateRecord
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $observed `
+        -ExpectedSnapshot $after.snapshot -ExpectedSha256 $after.sha256 `
+        -Boundary "$Label postflight")
+    $MutationState.Value = [ordered]@{
+        label = $Label
+        inFlight = $false
+        allowed = @($observed)
+        lastVerified = $observed
     }
-    Remove-HostSafetyRegistryTree
-    if ($current.manifest.snapshot.exists) {
-        $regExe = Resolve-RegularFile -Path (Join-Path $env:SystemRoot 'System32\reg.exe') `
-            -Description '64-bit Registry Console Tool'
-        $output = & $regExe import $current.regFile /reg:64 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            throw "Could not restore HostSafety.reg: $($output -join ' ')"
+    return $observed
+}
+
+function Set-HostSafetyTreeProgressively {
+    param(
+        [Parameter(Mandatory)][object] $Boundary,
+        [Parameter(Mandatory)][object] $DesiredNode,
+        [Parameter(Mandatory)][object] $ExpectedRoot,
+        [Parameter(Mandatory)][object] $ExpectedNode,
+        [Parameter(Mandatory)][string] $RelativePath,
+        [Parameter(Mandatory)][ref] $CurrentAggregate,
+        [Parameter(Mandatory)][ref] $MutationState
+    )
+
+    foreach ($value in @($DesiredNode.values)) {
+        $nextRoot = Copy-RegistrySnapshotObject -Snapshot $ExpectedRoot
+        $nextNode = $nextRoot
+        if (-not [string]::IsNullOrEmpty($RelativePath)) {
+            foreach ($component in $RelativePath.Split('\')) {
+                $matches = @($nextNode.subkeys | Where-Object { $_.name -ceq $component })
+                if ($matches.Count -ne 1) {
+                    throw "Exact restore model lost the unique '$component' subkey."
+                }
+                $nextNode = $matches[0]
+            }
         }
-        $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
-            [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
-        $restoredKey = $base.OpenSubKey($hostSafetySubKey, $true)
-        if ($null -eq $restoredKey) {
-            $base.Dispose()
-            throw 'HostSafety.reg import reported success but the registry key is absent.'
+        $nextNode.values = @($nextNode.values) + @(Copy-RegistrySnapshotObject -Snapshot $value)
+        $keyPath = if ([string]::IsNullOrEmpty($RelativePath)) {
+            $hostSafetySubKey
+        } else { "$hostSafetySubKey\$RelativePath" }
+        $record = $value
+        $CurrentAggregate.Value = Invoke-AuthorizedHostSafetyMutationStep `
+            -Boundary $Boundary -Before $CurrentAggregate.Value -AfterSnapshot $nextRoot `
+            -MutationState $MutationState -Label "set value '$keyPath\$($record.name)'" `
+            -Mutation {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
+                try {
+                    $key = $base.OpenSubKey($keyPath, $true)
+                    if ($null -eq $key) { throw "Registry key disappeared before exact write: $keyPath" }
+                    try {
+                        $kind = [Microsoft.Win32.RegistryValueKind][Enum]::Parse(
+                            [Microsoft.Win32.RegistryValueKind], [string]$record.kind, $false)
+                        $key.SetValue([string]$record.name,
+                            (Convert-RegistryValueForWrite -Record $record), $kind)
+                        $key.Flush()
+                    }
+                    finally { $key.Dispose() }
+                }
+                finally { $base.Dispose() }
+            }
+        $ExpectedRoot = $nextRoot
+        $ExpectedNode = $nextNode
+    }
+
+    foreach ($desiredChild in @($DesiredNode.subkeys)) {
+        $nextRoot = Copy-RegistrySnapshotObject -Snapshot $ExpectedRoot
+        $nextParent = $nextRoot
+        if (-not [string]::IsNullOrEmpty($RelativePath)) {
+            foreach ($component in $RelativePath.Split('\')) {
+                $matches = @($nextParent.subkeys | Where-Object { $_.name -ceq $component })
+                if ($matches.Count -ne 1) {
+                    throw "Exact restore model lost the unique '$component' subkey."
+                }
+                $nextParent = $matches[0]
+            }
         }
-        try { $restoredKey.Flush() } finally { $restoredKey.Dispose(); $base.Dispose() }
+        $emptyChild = [pscustomobject][ordered]@{
+            name = [string]$desiredChild.name
+            values = @()
+            subkeys = @()
+        }
+        $nextParent.subkeys = @($nextParent.subkeys) + @($emptyChild)
+        $childRelative = if ([string]::IsNullOrEmpty($RelativePath)) {
+            [string]$desiredChild.name
+        } else { "$RelativePath\$($desiredChild.name)" }
+        $childKeyPath = "$hostSafetySubKey\$childRelative"
+        $CurrentAggregate.Value = Invoke-AuthorizedHostSafetyMutationStep `
+            -Boundary $Boundary -Before $CurrentAggregate.Value -AfterSnapshot $nextRoot `
+            -MutationState $MutationState -Label "create subkey '$childKeyPath'" `
+            -Mutation {
+                $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                    [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
+                try {
+                    $key = $base.CreateSubKey($childKeyPath, $true)
+                    if ($null -eq $key) { throw "Could not create exact registry subkey: $childKeyPath" }
+                    try { $key.Flush() } finally { $key.Dispose() }
+                }
+                finally { $base.Dispose() }
+            }
+        $ExpectedRoot = $nextRoot
+        $ExpectedNode = $emptyChild
+        Set-HostSafetyTreeProgressively -Boundary $Boundary `
+            -DesiredNode $desiredChild -ExpectedRoot $ExpectedRoot `
+            -ExpectedNode $ExpectedNode -RelativePath $childRelative `
+            -CurrentAggregate $CurrentAggregate -MutationState $MutationState
+        $ExpectedRoot = $CurrentAggregate.Value.snapshot
     }
-    $restored = Get-HostSafetySnapshot
-    if (-not (Compare-HostSafetySnapshot -Expected $current.manifest.snapshot -Actual $restored)) {
-        throw 'HostSafety restore did not reproduce the exact pre-test value set.'
+}
+
+function Set-HostSafetySnapshotExactly {
+    param(
+        [Parameter(Mandatory)][object] $Boundary,
+        [Parameter(Mandatory)][object] $DesiredSnapshot,
+        [Parameter(Mandatory)][object] $ExpectedCurrent,
+        [Parameter(Mandatory)][ref] $MutationState
+    )
+
+    [void](Assert-A4SProductMutationBoundary -Boundary $Boundary -Label 'exact restore entry')
+    $current = Get-HostSafetyAggregateRecord
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $current `
+        -ExpectedSnapshot $ExpectedCurrent.snapshot -ExpectedSha256 $ExpectedCurrent.sha256 `
+        -Boundary 'exact restore entry')
+    $desired = Get-HostSafetyAggregateRecord -Snapshot $DesiredSnapshot
+    if ($current.sha256 -ceq $desired.sha256 -and
+        (Compare-HostSafetySnapshot -Expected $DesiredSnapshot -Actual $current.snapshot)) {
+        $MutationState.Value = [ordered]@{
+            label = 'already exact'; inFlight = $false
+            allowed = @($current); lastVerified = $current
+        }
+        return $current
     }
-    return $restored
+
+    $absent = [pscustomobject][ordered]@{ exists = $false; values = @(); subkeys = @() }
+    $current = Invoke-AuthorizedHostSafetyMutationStep -Boundary $Boundary `
+        -Before $current -AfterSnapshot $absent -MutationState $MutationState `
+        -Label 'delete prior HostSafety tree' -Mutation { Remove-HostSafetyRegistryTree }
+    if (-not [bool]$DesiredSnapshot.exists) { return $current }
+
+    $empty = [pscustomobject][ordered]@{ exists = $true; values = @(); subkeys = @() }
+    $current = Invoke-AuthorizedHostSafetyMutationStep -Boundary $Boundary `
+        -Before $current -AfterSnapshot $empty -MutationState $MutationState `
+        -Label 'create HostSafety root' -Mutation {
+            $base = [Microsoft.Win32.RegistryKey]::OpenBaseKey(
+                [Microsoft.Win32.RegistryHive]::CurrentUser, $hostSafetyRegistryView)
+            try {
+                $key = $base.CreateSubKey($hostSafetySubKey, $true)
+                if ($null -eq $key) { throw 'Could not create HostSafety root.' }
+                try { $key.Flush() } finally { $key.Dispose() }
+            }
+            finally { $base.Dispose() }
+        }
+    $currentReference = [ref]$current
+    Set-HostSafetyTreeProgressively -Boundary $Boundary -DesiredNode $DesiredSnapshot `
+        -ExpectedRoot $empty -ExpectedNode $empty -RelativePath '' `
+        -CurrentAggregate $currentReference -MutationState $MutationState
+    $final = Get-HostSafetyAggregateRecord
+    [void](Assert-AuthorizedHostSafetyAggregate -Current $final `
+        -ExpectedSnapshot $DesiredSnapshot -ExpectedSha256 $desired.sha256 `
+        -Boundary 'exact restore final aggregate')
+    return $final
+}
+
+function Get-KnownMutationAggregate {
+    param(
+        [Parameter(Mandatory)][object] $MutationState,
+        [Parameter(Mandatory)][object] $Current,
+        [Parameter(Mandatory)][string] $Boundary
+    )
+    foreach ($allowed in @($MutationState.allowed)) {
+        if ($allowed.sha256 -ceq $Current.sha256 -and
+            (Compare-HostSafetySnapshot -Expected $allowed.snapshot -Actual $Current.snapshot)) {
+            return $Current
+        }
+    }
+    throw "$Boundary observed an unknown/intervening HostSafety aggregate; rollback is forbidden to avoid overwriting external state."
 }
 
 function Restore-HostSafety {
     param(
         [Parameter(Mandatory)][string] $Bundle,
-        [string] $ProbeHost
+        [string] $ProbeHost,
+        [object] $AuthorizedCurrentSnapshot,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $AuthorizedCurrentSha256
     )
 
     Assert-AllTrackedHostsStopped -ProbeHost $ProbeHost
     $validated = Read-ValidatedHostSafetyBackup -Bundle $Bundle
-    $rollbackPath = Join-Path $validated.bundle ('Rollback-' + [Guid]::NewGuid().ToString('N'))
-    $rollbackRecord = New-SafeFreshDirectory -Path $rollbackPath `
-        -Description 'HostSafety transactional rollback bundle' -ExpectedParent $validated.bundle
-    $rollback = Backup-HostSafety -Bundle $rollbackRecord.finalPath
+    $boundary = Enter-A4SProductMutationBoundary
+    $rollback = $null
+    $mutationState = [ordered]@{ label = 'not started'; inFlight = $false; allowed = @(); lastVerified = $null }
     try {
-        $restored = Import-ValidatedHostSafetyBackup -Validated $validated -ProbeHost $ProbeHost
-        return [ordered]@{
-            snapshot = $restored
-            transaction = 'committed'
-            rollbackBundle = $rollback.bundle
-            rollbackManifestSha256 = $rollback.manifestSha256
+        [void](Assert-A4SProductMutationBoundary -Boundary $boundary -Label 'restore authorization')
+        $immediate = Get-HostSafetyAggregateRecord
+        [void](Assert-AuthorizedHostSafetyAggregate -Current $immediate `
+            -ExpectedSnapshot $AuthorizedCurrentSnapshot `
+            -ExpectedSha256 $AuthorizedCurrentSha256 -Boundary 'restore authorization')
+        $rollbackPath = Join-Path $validated.bundle ('Rollback-' + [Guid]::NewGuid().ToString('N'))
+        $rollbackRecord = New-SafeFreshDirectory -Path $rollbackPath `
+            -Description 'HostSafety transactional rollback bundle' -ExpectedParent $validated.bundle
+        $rollback = Backup-HostSafety -Bundle $rollbackRecord.finalPath
+        if ($rollback.snapshotSha256 -cne $immediate.sha256 -or
+            -not (Compare-HostSafetySnapshot -Expected $rollback.manifest.snapshot `
+                -Actual $immediate.snapshot)) {
+            throw 'Immediate rollback bundle differs from the authorized pre-restore aggregate.'
         }
-    }
-    catch {
-        $primary = $_
+        [void](Assert-A4SProductMutationBoundary -Boundary $boundary -Label 'post-backup authorization')
+        $postBackup = Get-HostSafetyAggregateRecord
+        [void](Assert-AuthorizedHostSafetyAggregate -Current $postBackup `
+            -ExpectedSnapshot $immediate.snapshot -ExpectedSha256 $immediate.sha256 `
+            -Boundary 'post-backup authorization')
         try {
-            Assert-AllTrackedHostsStopped -ProbeHost $ProbeHost
-            [void](Import-ValidatedHostSafetyBackup -Validated $rollback)
+            $restored = Set-HostSafetySnapshotExactly -Boundary $boundary `
+                -DesiredSnapshot $validated.manifest.snapshot -ExpectedCurrent $immediate `
+                -MutationState ([ref]$mutationState)
+            return [ordered]@{
+                snapshot = $restored.snapshot
+                snapshotSha256 = $restored.sha256
+                transaction = 'committed'
+                authorizedPreRestoreSha256 = $immediate.sha256
+                setupMutexName = $boundary.SetupMutexName
+                hostMutexName = $boundary.HostMutexName
+                rollbackBundle = $rollback.bundle
+                rollbackManifestSha256 = $rollback.manifestSha256
+            }
         }
         catch {
-            throw "HostSafety restore failed ('$($primary.Exception.Message)') and transactional rollback also failed ('$($_.Exception.Message)'). Both bundles were retained: '$($validated.bundle)' and '$($rollback.bundle)'."
+            $primary = $_
+            [void](Assert-A4SProductMutationBoundary -Boundary $boundary -Label 'rollback authorization')
+            $observed = Get-HostSafetyAggregateRecord
+            try { $known = Get-KnownMutationAggregate -MutationState $mutationState `
+                -Current $observed -Boundary 'rollback authorization' }
+            catch {
+                throw "HostSafety restore failed ('$($primary.Exception.Message)'). $($_.Exception.Message) Exact pre-restore rollback was not attempted. Bundles retained: '$($validated.bundle)' and '$($rollback.bundle)'."
+            }
+            $rollbackState = [ordered]@{
+                label = 'rollback not started'; inFlight = $false
+                allowed = @($known); lastVerified = $known
+            }
+            try {
+                $rolledBack = Set-HostSafetySnapshotExactly -Boundary $boundary `
+                    -DesiredSnapshot $rollback.manifest.snapshot -ExpectedCurrent $known `
+                    -MutationState ([ref]$rollbackState)
+                if ($rolledBack.sha256 -cne $immediate.sha256 -or
+                    -not (Compare-HostSafetySnapshot -Expected $immediate.snapshot `
+                        -Actual $rolledBack.snapshot)) {
+                    throw 'Rollback completed with a non-identical aggregate.'
+                }
+            }
+            catch {
+                $rollbackError = $_
+                $rollbackObserved = Get-HostSafetyAggregateRecord
+                try { [void](Get-KnownMutationAggregate -MutationState $rollbackState `
+                    -Current $rollbackObserved -Boundary 'rollback failure') }
+                catch {
+                    throw "HostSafety restore failed ('$($primary.Exception.Message)'); rollback failed ('$($rollbackError.Exception.Message)'); and an unknown/intervening aggregate was observed ('$($_.Exception.Message)'). No further mutation was attempted."
+                }
+                throw "HostSafety restore failed ('$($primary.Exception.Message)') and exact rollback failed ('$($rollbackError.Exception.Message)'). Known state was retained; both bundles remain."
+            }
+            throw "HostSafety restore failed but the exact authorized immediate state was rolled back successfully. Primary error: $($primary.Exception.Message). Rollback bundle retained at '$($rollback.bundle)'."
         }
-        throw "HostSafety restore failed but the exact immediate pre-restore state was rolled back successfully. Primary error: $($primary.Exception.Message). Rollback bundle retained at '$($rollback.bundle)'."
     }
+    finally { Exit-A4SProductMutationBoundary -Boundary $boundary }
 }
 
 function Get-A4SModuleRecords {
@@ -1172,6 +1730,146 @@ function Exit-A4SHarnessLease {
     }
 }
 
+function Assert-ValidA4SReleaseRecord {
+    param([Parameter(Mandatory)][object] $Record)
+
+    Assert-ExactPropertySet -Object $Record -Names @(
+        'schemaVersion', 'product', 'sourceCommit', 'hostSha256', 'dllSha256',
+        'hostFileVersion', 'dllFileVersion', 'hostReportedVersion') `
+        -Description 'A4S immutable release record'
+    if ($Record.schemaVersion -isnot [int32] -or [int]$Record.schemaVersion -ne 1 -or
+        $Record.product -isnot [string] -or [string]$Record.product -cne 'A4SMenu') {
+        throw 'The A4S release record has an unsupported schema or product identity.'
+    }
+    if ($Record.sourceCommit -isnot [string] -or
+        [string]$Record.sourceCommit -notmatch '\A[A-Fa-f0-9]{40,64}\z') {
+        throw 'The A4S release record source commit is invalid.'
+    }
+    foreach ($hashName in @('hostSha256', 'dllSha256')) {
+        if ($Record.$hashName -isnot [string] -or
+            [string]$Record.$hashName -notmatch '\A[A-Fa-f0-9]{64}\z') {
+            throw "The A4S release record $hashName is invalid."
+        }
+    }
+    foreach ($versionName in @('hostFileVersion', 'dllFileVersion', 'hostReportedVersion')) {
+        if ($Record.$versionName -isnot [string] -or
+            [string]::IsNullOrWhiteSpace([string]$Record.$versionName) -or
+            ([string]$Record.$versionName).Length -gt 256) {
+            throw "The A4S release record $versionName is invalid."
+        }
+    }
+    return $true
+}
+
+function Read-VerifiedA4SReleaseRecord {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $recordPath = Get-CanonicalPathRecord -Path $Path `
+        -Description 'A4S immutable release record' -Kind File
+    $repository = Get-CanonicalPathRecord -Path $repoRoot `
+        -Description 'A4S source repository' -Kind Directory
+    if (-not (Test-PathWithin -Path $recordPath.finalPath -Parent $repository.finalPath)) {
+        throw 'The A4S release record must be a tracked file inside this repository.'
+    }
+    $prefix = $repository.finalPath.TrimEnd('\') + '\'
+    $relative = $recordPath.finalPath.Substring($prefix.Length).Replace('\', '/')
+    if ([string]::IsNullOrWhiteSpace($relative) -or $relative.Contains(':') -or
+        $relative -match '(^|/)\.\.(/|$)' -or $relative.StartsWith('/')) {
+        throw 'The A4S release record has an unsafe repository-relative path.'
+    }
+    $stream = [IO.File]::Open($recordPath.finalPath, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        # The no-write/no-delete sharing boundary stays held from byte capture
+        # through the Git blob check, closing the parse/hash/path replacement race.
+        $lockedPath = Get-CanonicalPathRecord -Path $recordPath.finalPath `
+            -Description 'locked A4S immutable release record' -Kind File
+        if ($lockedPath.identity -cne $recordPath.identity -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                $lockedPath.finalPath, $recordPath.finalPath)) {
+            throw 'The A4S release record path identity changed before it could be locked.'
+        }
+        if ($stream.Length -le 0 -or $stream.Length -gt 1048576) {
+            throw 'The A4S release record must be between 1 byte and 1 MiB.'
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw 'The A4S release record ended during its locked read.' }
+            $offset += $read
+        }
+        $textOffset = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+            $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) { 3 } else { 0 }
+        try {
+            $raw = [Text.UTF8Encoding]::new($false, $true).GetString(
+                $bytes, $textOffset, $bytes.Length - $textOffset)
+        }
+        catch { throw "The A4S release record is not strict UTF-8: $($_.Exception.Message)" }
+        try { $record = $raw | ConvertFrom-Json -ErrorAction Stop }
+        catch { throw "The A4S release record is not valid JSON: $($_.Exception.Message)" }
+        [void](Assert-ValidA4SReleaseRecord -Record $record)
+
+        [void](& git -C $repository.finalPath ls-files --error-unmatch -- $relative 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw 'The A4S release record is not tracked by Git.' }
+        $recordCommit = ((& git -C $repository.finalPath log -1 --format=%H -- `
+            $relative 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $recordCommit -notmatch '\A[A-Fa-f0-9]{40,64}\z') {
+            throw 'Could not bind the release record to an immutable Git commit.'
+        }
+        [void](& git -C $repository.finalPath cat-file -e `
+            "$($record.sourceCommit)^{commit}" 2>$null)
+        if ($LASTEXITCODE -ne 0) { throw 'The release record source commit does not exist.' }
+        [void](& git -C $repository.finalPath merge-base --is-ancestor `
+            ([string]$record.sourceCommit) $recordCommit 2>$null)
+        if ($LASTEXITCODE -ne 0) {
+            throw 'The release record commit does not descend from its claimed source commit.'
+        }
+        $committedBlob = ((& git -C $repository.finalPath rev-parse `
+            "$recordCommit`:$relative" 2>$null) | Out-String).Trim()
+        $workingBlob = ((& git -C $repository.finalPath hash-object --no-filters -- `
+            $recordPath.finalPath 2>$null) | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $committedBlob -notmatch '\A[A-Fa-f0-9]{40,64}\z' -or
+            $workingBlob -cne $committedBlob) {
+            throw 'The locked release record is not byte-identical to its immutable committed blob.'
+        }
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $recordSha256 = ([BitConverter]::ToString(
+                $algorithm.ComputeHash($bytes))).Replace('-', '')
+        }
+        finally { $algorithm.Dispose() }
+        return [pscustomobject][ordered]@{
+            path = $recordPath.finalPath
+            pathIdentity = $recordPath.identity
+            gitRelativePath = $relative
+            recordCommit = $recordCommit
+            recordBlob = $committedBlob
+            recordSha256 = $recordSha256
+            record = $record
+        }
+    }
+    finally { $stream.Dispose() }
+}
+
+function Assert-BinaryBindingsMatchReleaseRecord {
+    param(
+        [Parameter(Mandatory)][object] $Release,
+        [Parameter(Mandatory)][object] $Host,
+        [Parameter(Mandatory)][object] $Dll
+    )
+
+    [void](Assert-ValidA4SReleaseRecord -Record $Release.record)
+    if ($Host.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
+        $Dll.sha256 -cne ([string]$Release.record.dllSha256).ToUpperInvariant() -or
+        $Host.fileVersion -cne [string]$Release.record.hostFileVersion -or
+        $Dll.fileVersion -cne [string]$Release.record.dllFileVersion -or
+        $Host.reportedVersion -cne [string]$Release.record.hostReportedVersion) {
+        throw 'The supplied host/DLL identities do not match the verified immutable release record.'
+    }
+    return $true
+}
+
 function Get-BinaryBinding {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -1180,26 +1878,45 @@ function Get-BinaryBinding {
     )
 
     $record = Get-CanonicalPathRecord -Path $Path -Description "$Role binary" -Kind File
-    $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($record.finalPath)
-    $reported = $null
-    if ($QueryHostVersion) {
-        $versionResult = Invoke-A4SHostCommand -Executable $record.finalPath -Argument '--version'
-        if ($versionResult.exitCode -ne 0) {
-            throw "$Role --version failed with exit $($versionResult.exitCode)."
+    $stream = [IO.File]::Open($record.finalPath, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $locked = Get-CanonicalPathRecord -Path $record.finalPath `
+            -Description "$Role locked binary" -Kind File
+        if ($locked.identity -cne $record.identity -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals(
+                $locked.finalPath, $record.finalPath)) {
+            throw "$Role binary path identity changed before it could be locked."
         }
-        $reported = $versionResult.stdout
+        $algorithm = [Security.Cryptography.SHA256]::Create()
+        try {
+            $sha256 = ([BitConverter]::ToString(
+                $algorithm.ComputeHash($stream))).Replace('-', '')
+        }
+        finally { $algorithm.Dispose() }
+        $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($record.finalPath)
+        $reported = $null
+        if ($QueryHostVersion) {
+            $versionResult = Invoke-A4SHostCommand -Executable $record.finalPath -Argument '--version'
+            if ($versionResult.exitCode -ne 0) {
+                throw "$Role --version failed with exit $($versionResult.exitCode)."
+            }
+            $reported = $versionResult.stdout
+        }
+        return [ordered]@{
+            role = $Role
+            path = $record.finalPath
+            pathIdentity = $record.identity
+            sha256 = $sha256
+            length = [uint64]$stream.Length
+            fileVersion = $version.FileVersion
+            productVersion = $version.ProductVersion
+            reportedVersion = $reported
+            sourceBinding = $script:Evidence.sourceBinding
+            verifiedSourceCommit = $script:Evidence.verifiedSourceCommit
+        }
     }
-    return [ordered]@{
-        role = $Role
-        path = $record.finalPath
-        pathIdentity = $record.identity
-        sha256 = (Get-FileHash -LiteralPath $record.finalPath -Algorithm SHA256).Hash
-        length = [uint64](Get-Item -LiteralPath $record.finalPath -Force).Length
-        fileVersion = $version.FileVersion
-        productVersion = $version.ProductVersion
-        reportedVersion = $reported
-        sourceCommit = $script:Evidence.sourceCommit
-    }
+    finally { $stream.Dispose() }
 }
 
 function Assert-BinaryCopyBinding {
@@ -1322,6 +2039,31 @@ function Set-TrackedHostStopped {
     throw "Stopped host PID $($Process.Id) was not registered by this harness."
 }
 
+function Assert-ExactHostObservation {
+    param(
+        [Parameter(Mandatory)][object] $Expected,
+        [Parameter(Mandatory)][object[]] $Residents,
+        [Parameter(Mandatory)][uint32] $SingletonPid,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    if ($Residents.Count -ne 1) {
+        throw "$Label expected exactly one same-user host across all sessions; found $($Residents.Count)."
+    }
+    $actual = $Residents[0]
+    if ([uint32]$actual.pid -ne [uint32]$Expected.pid -or
+        [int]$actual.sessionId -ne [int]$Expected.sessionId -or
+        [string]$actual.startTimeUtc -cne [string]$Expected.startTimeUtc -or
+        -not (Test-A4SPathEqual -First ([string]$actual.path) -Second ([string]$Expected.path)) -or
+        [string]$actual.sha256 -cne [string]$Expected.sha256) {
+        throw "$Label host PID/session/path/hash/start identity is not exact."
+    }
+    if ($SingletonPid -ne [uint32]$Expected.pid) {
+        throw "$Label singleton window belongs to PID $SingletonPid instead of exact host PID $($Expected.pid)."
+    }
+    return $actual
+}
+
 function Assert-ExactResidentHost {
     param(
         [Parameter(Mandatory)][Diagnostics.Process] $Process,
@@ -1331,19 +2073,17 @@ function Assert-ExactResidentHost {
     $expectedPath = Get-CanonicalPathRecord -Path $Executable `
         -Description "$Label expected host" -Kind File
     $expectedHash = (Get-FileHash -LiteralPath $expectedPath.finalPath -Algorithm SHA256).Hash
+    $expected = [ordered]@{
+        pid = $Process.Id
+        sessionId = $Process.SessionId
+        startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o')
+        path = $expectedPath.finalPath
+        sha256 = $expectedHash
+    }
     $resident = @(Get-SameUserA4SHostProcesses)
-    if ($resident.Count -ne 1 -or $resident[0].pid -ne $Process.Id -or
-        $resident[0].sessionId -ne $Process.SessionId -or
-        -not (Test-A4SPathEqual -First $resident[0].path -Second $expectedPath.finalPath) -or
-        $resident[0].sha256 -cne $expectedHash -or
-        $resident[0].startTimeUtc -cne $Process.StartTime.ToUniversalTime().ToString('o')) {
-        throw "$Label did not have exactly one same-user cross-session host with the expected PID/path/hash/start identity."
-    }
     $singletonPid = [A4SFailureRecoveryNative]::GetHostWindowProcessId()
-    if ($singletonPid -ne [uint32]$Process.Id) {
-        throw "$Label singleton window belongs to PID $singletonPid instead of exact host PID $($Process.Id)."
-    }
-    return $resident[0]
+    return Assert-ExactHostObservation -Expected $expected -Residents $resident `
+        -SingletonPid $singletonPid -Label $Label
 }
 
 function Assert-NoResidentA4SHost {
@@ -1552,6 +2292,56 @@ function Assert-ExactA4SMapping {
     }
 }
 
+function Assert-A4SReadyBoundary {
+    param(
+        [Parameter(Mandatory)][object] $Checkpoint,
+        [Parameter(Mandatory)][string] $ExpectedDll,
+        [Parameter(Mandatory)][Diagnostics.Process] $ResidentProcess,
+        [Parameter(Mandatory)][string] $HostExecutable,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    if ([int]$Checkpoint.host.statusExitCode -ne $hostStatusReadyExit) {
+        throw "$Label is not a READY host boundary."
+    }
+    Assert-ExactA4SMapping -Checkpoint $Checkpoint -ExpectedDll $ExpectedDll
+    $exactHost = Assert-ExactResidentHost -Process $ResidentProcess `
+        -Executable $HostExecutable -Label $Label
+    $Checkpoint.host['exactResident'] = $exactHost
+    $Checkpoint['mappingUniqueness'] = [ordered]@{
+        exactCount = 1
+        expectedDll = [IO.Path]::GetFullPath($ExpectedDll)
+        explorerPid = $Checkpoint.explorer.pid
+        exactHostPid = $exactHost.pid
+    }
+    return $Checkpoint
+}
+
+function Assert-A4SSafetyDisabledBoundary {
+    param(
+        [Parameter(Mandatory)][object] $Checkpoint,
+        [Parameter(Mandatory)][Diagnostics.Process] $ResidentProcess,
+        [Parameter(Mandatory)][string] $HostExecutable,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    if ([int]$Checkpoint.host.statusExitCode -ne $hostStatusSafetyDisabled -or
+        $Checkpoint.a4sMappings.Count -ne 0 -or
+        [int]$Checkpoint.visibleMenuWindowCount -ne 0) {
+        throw "$Label did not have the exact SAFETY_DISABLED zero-mapping/zero-window state."
+    }
+    $exactHost = Assert-ExactResidentHost -Process $ResidentProcess `
+        -Executable $HostExecutable -Label $Label
+    $Checkpoint.host['exactResident'] = $exactHost
+    $Checkpoint['mappingUniqueness'] = [ordered]@{
+        exactCount = 0
+        expectedState = 'SAFETY_DISABLED'
+        explorerPid = $Checkpoint.explorer.pid
+        exactHostPid = $exactHost.pid
+    }
+    return $Checkpoint
+}
+
 function Assert-RollingCrashGuardStage {
     param(
         [Parameter(Mandatory)][object] $Snapshot,
@@ -1643,6 +2433,8 @@ function Invoke-IsolatedDllFailureQualification {
     $backupPrepared = $false
     $hostsStopped = $false
     $noInjectionConclusive = $false
+    $finalMappingCount = -1
+    $finalWindowCount = -1
     $safetyRestored = $false
     $operationError = $null
     try {
@@ -1671,6 +2463,8 @@ function Invoke-IsolatedDllFailureQualification {
             preparedBeforeFirstHost = $true
             restored = $false
             retainedTemporaryRoot = $null
+            retentionReason = $null
+            authorizedCurrentHostSafetySha256 = $null
             cleanupInstructions = $null
         }
         Save-Evidence
@@ -1813,8 +2607,10 @@ function Invoke-IsolatedDllFailureQualification {
                     Assert-SameExplorerIdentity -Expected $initial.explorer -Actual $finalExplorer `
                         -Label 'isolated final no-injection proof'
                 }
-                [void](Assert-NoA4SMapping -Explorer $finalExplorer `
-                    -Label 'isolated final no-injection proof')
+                $finalInjection = Assert-NoA4SMapping -Explorer $finalExplorer `
+                    -Label 'isolated final no-injection proof'
+                $finalMappingCount = @($finalInjection.mappings).Count
+                $finalWindowCount = [int]$finalInjection.visibleMenuWindowCount
                 $noInjectionConclusive = $true
             }
             catch {
@@ -1826,7 +2622,11 @@ function Invoke-IsolatedDllFailureQualification {
         }
         if ($backupPrepared -and $hostsStopped) {
             try {
-                $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost
+                $restoreAuthorization = Add-HostSafetyRestoreAuthorizationCheckpoint `
+                    -Label 'isolated-restore-authorized'
+                $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost `
+                    -AuthorizedCurrentSnapshot $restoreAuthorization.snapshot `
+                    -AuthorizedCurrentSha256 $restoreAuthorization.sha256
                 $safetyRestored = $true
                 $script:Evidence.recovery.restored = $true
                 $script:Evidence.recovery.restoredUtc = Get-UtcText
@@ -1844,20 +2644,31 @@ function Invoke-IsolatedDllFailureQualification {
                 'HostSafety was not restored because every tracked host is not proven stopped.')
         }
 
-        if ($noInjectionConclusive -and $hostsStopped -and $safetyRestored) {
-            try { Remove-A4STemporaryRoot -Root $temporaryRoot }
+        $cleanupAllowed = Test-A4STemporaryCleanupAllowed `
+            -AllHostsStopped $hostsStopped `
+            -MappingInspectionSucceeded $noInjectionConclusive `
+            -MappingCount $finalMappingCount -WindowCount $finalWindowCount `
+            -SafetyRestored $safetyRestored
+        if ($cleanupAllowed) {
+            try {
+                Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                    -BackupPrepared $backupPrepared -Bundle $bundle `
+                    -Reason 'Validated recursive cleanup was authorized and is in progress.'
+                Remove-A4STemporaryRoot -Root $temporaryRoot
+                Clear-RetainedTemporaryRootEvidence
+            }
             catch {
                 [void]$script:Evidence.errors.Add("Temporary case cleanup failed: $($_.Exception.Message)")
+                Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                    -BackupPrepared $backupPrepared -Bundle $bundle `
+                    -Reason "Validated recursive cleanup threw or only partially removed the root: $($_.Exception.Message)"
                 if ($null -eq $operationError) { $operationError = $_ }
             }
         }
         else {
-            $script:Evidence.recovery.retainedTemporaryRoot = $temporaryRoot.finalPath
-            $script:Evidence.recovery.cleanupInstructions = if ($backupPrepared) {
-                "DO NOT DELETE '$($temporaryRoot.finalPath)' yet. Stop every A4SMenuHost with the matching host's --exit command; inspect Explorer for zero A4SMenu.dll mappings and zero A4S menu windows; if a mapping is pinned, restart Explorer manually; run -RecoverHostSafety -RecoveryBundle '$bundle'; only then delete the retained root manually."
-            } else {
-                "DO NOT DELETE '$($temporaryRoot.finalPath)' until every A4SMenuHost is stopped and Explorer is conclusively free of A4SMenu.dll mappings/windows. No HostSafety backup was completed, so do not use this bundle for recovery."
-            }
+            Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                -BackupPrepared $backupPrepared -Bundle $bundle `
+                -Reason 'Cleanup authorization was denied because host, mapping/window, or HostSafety restoration proof was incomplete.'
         }
         $script:Evidence.trackedHosts = @($script:TrackedHosts)
         $script:Evidence.outcome = if ($null -eq $operationError -and
@@ -1897,15 +2708,29 @@ function Request-ValidatedExplorerTermination {
             issuedFileTimeUtc = $issuedFileTime
             killReturnedFileTimeUtc = $killReturnedFileTime
             oldExplorer = $current
+            evidencePersisted = $false
             process = $process
         }
     }
     catch { $process.Dispose(); throw }
 }
 
+function Assert-TerminationRequestReadyForWait {
+    param([Parameter(Mandatory)][object] $Request)
+
+    if ($null -eq $Request.oldExplorer -or [uint32]$Request.oldExplorer.pid -eq 0 -or
+        [uint64]$Request.issuedFileTimeUtc -eq 0 -or
+        [uint64]$Request.killReturnedFileTimeUtc -lt [uint64]$Request.issuedFileTimeUtc -or
+        -not [bool]$Request.evidencePersisted) {
+        throw 'Explorer termination cannot be awaited before exact post-kill evidence is durably persisted.'
+    }
+    return $true
+}
+
 function Complete-ValidatedExplorerTermination {
     param([Parameter(Mandatory)][object] $Request)
     try {
+        [void](Assert-TerminationRequestReadyForWait -Request $Request)
         if (-not $Request.process.WaitForExit(15000)) {
             throw "$($Request.label) Explorer PID $($Request.oldExplorer.pid) did not exit after the explicit termination request."
         }
@@ -1953,28 +2778,68 @@ function Wait-ReplacementExplorer {
 function Invoke-OneMenuAssertion {
     param(
         [Parameter(Mandatory)][string] $Executable,
-        [Parameter(Mandatory)][uint32] $ExplorerProcessId
+        [Parameter(Mandatory)][string] $ExpectedDll,
+        [Parameter(Mandatory)][uint32] $ExplorerProcessId,
+        [Parameter(Mandatory)][Diagnostics.Process] $ResidentProcess
     )
 
+    $before = Get-A4SCheckpoint -Label 'one-menu-before-toggle' `
+        -HostExecutable $Executable -KnownHostProcessId $ResidentProcess.Id
+    if ($before.explorer.pid -ne $ExplorerProcessId -or
+        [int]$before.visibleMenuWindowCount -ne 0) {
+        throw 'One-menu assertion did not start at the expected Explorer with zero visible menus.'
+    }
+    [void](Assert-A4SReadyBoundary -Checkpoint $before -ExpectedDll $ExpectedDll `
+        -ResidentProcess $ResidentProcess -HostExecutable $Executable `
+        -Label 'one-menu pre-toggle boundary')
     $open = Invoke-A4SHostCommand -Executable $Executable -Argument '--toggle'
     if ($open.exitCode -ne 0 -or -not (Wait-A4SCondition -TimeoutSeconds 8 -Condition {
         [A4SFailureRecoveryNative]::CountVisibleMenuWindows($ExplorerProcessId) -eq 1
     })) {
         throw 'Reconnect toggle did not produce exactly one visible A4S menu window.'
     }
+    $visible = Get-A4SCheckpoint -Label 'one-menu-visible' `
+        -HostExecutable $Executable -KnownHostProcessId $ResidentProcess.Id
+    if ($visible.explorer.pid -ne $ExplorerProcessId -or
+        [int]$visible.visibleMenuWindowCount -ne 1) {
+        throw 'One-menu assertion lost the exact one-window state after opening.'
+    }
+    [void](Assert-A4SReadyBoundary -Checkpoint $visible -ExpectedDll $ExpectedDll `
+        -ResidentProcess $ResidentProcess -HostExecutable $Executable `
+        -Label 'one-menu visible boundary')
     $close = Invoke-A4SHostCommand -Executable $Executable -Argument '--toggle'
     if ($close.exitCode -ne 0 -or -not (Wait-A4SCondition -TimeoutSeconds 8 -Condition {
         [A4SFailureRecoveryNative]::CountVisibleMenuWindows($ExplorerProcessId) -eq 0
     })) {
         throw 'Reconnect toggle did not close the single A4S menu window.'
     }
-    return [ordered]@{ openExitCode = $open.exitCode; closeExitCode = $close.exitCode; exactWindowCount = 1 }
+    $closed = Get-A4SCheckpoint -Label 'one-menu-closed' `
+        -HostExecutable $Executable -KnownHostProcessId $ResidentProcess.Id
+    if ($closed.explorer.pid -ne $ExplorerProcessId -or
+        [int]$closed.visibleMenuWindowCount -ne 0) {
+        throw 'One-menu assertion did not return to the exact zero-window state.'
+    }
+    [void](Assert-A4SReadyBoundary -Checkpoint $closed -ExpectedDll $ExpectedDll `
+        -ResidentProcess $ResidentProcess -HostExecutable $Executable `
+        -Label 'one-menu closed boundary')
+    return [ordered]@{
+        openExitCode = $open.exitCode
+        closeExitCode = $close.exitCode
+        exactWindowCount = 1
+        exactMappingCount = 1
+        exactHostCount = 1
+        oneMenuOneHookObservable = $true
+        before = $before
+        visible = $visible
+        closed = $closed
+    }
 }
 
 function Invoke-LiveFailureRecoveryQualification {
     param(
         [Parameter(Mandatory)][string] $SourceHost,
         [Parameter(Mandatory)][string] $SourceDll,
+        [Parameter(Mandatory)][string] $VerifiedReleaseRecordPath,
         [string] $RequestedEvidencePath
     )
 
@@ -1992,12 +2857,31 @@ function Invoke-LiveFailureRecoveryQualification {
     $operationError = $null
     $allTrackedStopped = $false
     $noInjectionConclusive = $false
+    $finalMappingCount = -1
+    $finalWindowCount = -1
     $safetyRestored = $false
 
     try {
+        $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
         $sourceHostBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost' `
             -QueryHostVersion
         $sourceDllBinding = Get-BinaryBinding -Path $sourceDll -Role 'source A4SMenu.dll'
+        [void](Assert-BinaryBindingsMatchReleaseRecord -Release $release `
+            -Host $sourceHostBinding -Dll $sourceDllBinding)
+        $script:Evidence.sourceBinding = 'verified-release-record'
+        $script:Evidence.verifiedSourceCommit = ([string]$release.record.sourceCommit).ToLowerInvariant()
+        $script:Evidence.releaseRecord = [ordered]@{
+            path = $release.path
+            pathIdentity = $release.pathIdentity
+            gitRelativePath = $release.gitRelativePath
+            recordCommit = $release.recordCommit
+            recordBlob = $release.recordBlob
+            recordSha256 = $release.recordSha256
+        }
+        foreach ($binding in @($sourceHostBinding, $sourceDllBinding)) {
+            $binding['sourceBinding'] = $script:Evidence.sourceBinding
+            $binding['verifiedSourceCommit'] = $script:Evidence.verifiedSourceCommit
+        }
         $script:Evidence.binaries.sourceHost = $sourceHostBinding
         $script:Evidence.binaries.sourceDll = $sourceDllBinding
         Save-Evidence
@@ -2023,7 +2907,9 @@ function Invoke-LiveFailureRecoveryQualification {
             originalHostSafetyExists = [bool]$backup.manifest.snapshot.exists
             restored = $false
             retainedTemporaryRoot = $null
-            cleanupInstructions = "Run this script with -RecoverHostSafety -RecoveryBundle '$bundle' only after every same-user A4SMenuHost in every Windows session is stopped."
+            retentionReason = $null
+            authorizedCurrentHostSafetySha256 = $null
+            cleanupInstructions = $null
         }
         Save-Evidence
 
@@ -2085,7 +2971,11 @@ function Invoke-LiveFailureRecoveryQualification {
             -TimeoutSeconds $ReconnectTimeoutSeconds -ResidentProcess $resident)
         $ready = Get-A4SCheckpoint -Label 'initial-ready' -HostExecutable $runtimeHost `
             -KnownHostProcessId $resident.Id
-        Assert-ExactA4SMapping -Checkpoint $ready -ExpectedDll $runtimeDll
+        [void](Assert-A4SReadyBoundary -Checkpoint $ready -ExpectedDll $runtimeDll `
+            -ResidentProcess $resident -HostExecutable $runtimeHost -Label 'initial-ready')
+        $ready.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
+            -ExpectedDll $runtimeDll -ExplorerProcessId $ready.explorer.pid `
+            -ResidentProcess $resident
         Add-EvidenceCheckpoint $ready
 
         $crashBoundaries = [Collections.ArrayList]::new()
@@ -2093,10 +2983,9 @@ function Invoke-LiveFailureRecoveryQualification {
         for ($crashIndex = 1; $crashIndex -le $crashThreshold; $crashIndex++) {
             $before = Get-A4SCheckpoint -Label "crash-$crashIndex-armed" `
                 -HostExecutable $runtimeHost -KnownHostProcessId $resident.Id
-            Assert-ExactA4SMapping -Checkpoint $before -ExpectedDll $runtimeDll
-            if ($before.host.statusExitCode -ne $hostStatusReadyExit) {
-                throw "Host was not READY before guarded crash $crashIndex."
-            }
+            [void](Assert-A4SReadyBoundary -Checkpoint $before -ExpectedDll $runtimeDll `
+                -ResidentProcess $resident -HostExecutable $runtimeHost `
+                -Label "crash-$crashIndex-armed")
             Add-EvidenceCheckpoint $before
 
             # Persist intent before the destructive boundary. If PowerShell is
@@ -2126,6 +3015,7 @@ function Invoke-LiveFailureRecoveryQualification {
                     hostProcessId = $resident.Id
                     recoveryManifestSha256 = $script:Evidence.recovery.manifestSha256
                 })
+                $terminationRequest.evidencePersisted = $true
             }
             catch {
                 $terminationRequest.process.Dispose()
@@ -2144,14 +3034,15 @@ function Invoke-LiveFailureRecoveryQualification {
                     -ResidentProcess $resident)
                 $after = Get-A4SCheckpoint -Label "crash-$crashIndex-reconnected" `
                     -HostExecutable $runtimeHost -KnownHostProcessId $resident.Id
-                Assert-ExactA4SMapping -Checkpoint $after -ExpectedDll $runtimeDll
+                [void](Assert-A4SReadyBoundary -Checkpoint $after -ExpectedDll $runtimeDll `
+                    -ResidentProcess $resident -HostExecutable $runtimeHost `
+                    -Label "crash-$crashIndex-reconnected")
                 if ($after.explorer.pid -ne $replacement.explorer.pid) {
                     throw "Guarded crash $crashIndex status and replacement taskbar refer to different Explorer processes."
                 }
-                if ($crashIndex -eq 1) {
-                    $after.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
-                        -ExplorerProcessId $after.explorer.pid
-                }
+                $after.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
+                    -ExpectedDll $runtimeDll -ExplorerProcessId $after.explorer.pid `
+                    -ResidentProcess $resident
             }
             else {
                 [void](Wait-A4SHostStatus -Executable $runtimeHost `
@@ -2159,10 +3050,12 @@ function Invoke-LiveFailureRecoveryQualification {
                     -TimeoutSeconds $ReconnectTimeoutSeconds -ResidentProcess $resident)
                 $after = Get-A4SCheckpoint -Label 'crash-3-safety-disabled' `
                     -HostExecutable $runtimeHost -KnownHostProcessId $resident.Id
-                if ($after.explorer.pid -ne $replacement.explorer.pid -or
-                    $after.a4sMappings.Count -ne 0 -or $after.visibleMenuWindowCount -ne 0) {
+                if ($after.explorer.pid -ne $replacement.explorer.pid) {
                     throw 'The third crash did not leave the replacement Explorer uninjected and without A4S UI.'
                 }
+                [void](Assert-A4SSafetyDisabledBoundary -Checkpoint $after `
+                    -ResidentProcess $resident -HostExecutable $runtimeHost `
+                    -Label 'crash-3-safety-disabled')
                 $after.nativeStart = [ordered]@{
                     status = 'manual-deferred'
                     mechanicalPassPermitted = $false
@@ -2203,10 +3096,15 @@ function Invoke-LiveFailureRecoveryQualification {
             -TimeoutSeconds $ReconnectTimeoutSeconds -ResidentProcess $resident)
         $recovered = Get-A4SCheckpoint -Label 'safety-reset-recovered-ready' `
             -HostExecutable $runtimeHost -KnownHostProcessId $resident.Id
-        Assert-ExactA4SMapping -Checkpoint $recovered -ExpectedDll $runtimeDll
+        [void](Assert-A4SReadyBoundary -Checkpoint $recovered -ExpectedDll $runtimeDll `
+            -ResidentProcess $resident -HostExecutable $runtimeHost `
+            -Label 'safety-reset-recovered-ready')
         if ($recovered.hostSafety.exists) {
             throw '--reset-safety recovered injection but retained crash-guard registry state.'
         }
+        $recovered.oneMenuAssertion = Invoke-OneMenuAssertion -Executable $runtimeHost `
+            -ExpectedDll $runtimeDll -ExplorerProcessId $recovered.explorer.pid `
+            -ResidentProcess $resident
         Add-EvidenceCheckpoint $recovered
 
         [void](Stop-A4STestHost -Executable $runtimeHost -ResidentProcess $resident)
@@ -2233,6 +3131,7 @@ function Invoke-LiveFailureRecoveryQualification {
                 hostState = 'proven-stopped'
                 recoveryManifestSha256 = $script:Evidence.recovery.manifestSha256
             })
+            $cleanupRequest.evidencePersisted = $true
         }
         catch {
             $cleanupRequest.process.Dispose()
@@ -2295,8 +3194,10 @@ function Invoke-LiveFailureRecoveryQualification {
                 $current = Get-TaskbarExplorerIdentity
                 $finalInjection = Assert-NoA4SMapping -Explorer $current `
                     -Label 'live final no-injection proof'
-                $noInjectionConclusive = $finalInjection.mappings.Count -eq 0 -and
-                    $finalInjection.visibleMenuWindowCount -eq 0
+                $finalMappingCount = @($finalInjection.mappings).Count
+                $finalWindowCount = [int]$finalInjection.visibleMenuWindowCount
+                $noInjectionConclusive = $finalMappingCount -eq 0 -and
+                    $finalWindowCount -eq 0
             }
             catch {
                 $noInjectionConclusive = $false
@@ -2332,7 +3233,11 @@ function Invoke-LiveFailureRecoveryQualification {
 
         if ($backupPrepared -and $allTrackedStopped) {
             try {
-                $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost
+                $restoreAuthorization = Add-HostSafetyRestoreAuthorizationCheckpoint `
+                    -Label 'live-restore-authorized'
+                $restoreResult = Restore-HostSafety -Bundle $bundle -ProbeHost $sourceHost `
+                    -AuthorizedCurrentSnapshot $restoreAuthorization.snapshot `
+                    -AuthorizedCurrentSha256 $restoreAuthorization.sha256
                 $safetyRestored = $true
                 $script:Evidence.recovery.restored = $true
                 $script:Evidence.recovery.restoredUtc = Get-UtcText
@@ -2350,21 +3255,32 @@ function Invoke-LiveFailureRecoveryQualification {
                 'HostSafety was not restored because every tracked same-user host is not proven stopped; use the durable recovery command in evidence.')
         }
 
-        if ($cleanupRestartComplete -and $noInjectionConclusive -and
-            $allTrackedStopped -and $safetyRestored) {
-            try { Remove-A4STemporaryRoot -Root $temporaryRoot }
+        $cleanupAllowed = Test-A4STemporaryCleanupAllowed `
+            -AllHostsStopped $allTrackedStopped `
+            -MappingInspectionSucceeded $noInjectionConclusive `
+            -MappingCount $finalMappingCount -WindowCount $finalWindowCount `
+            -SafetyRestored $safetyRestored -CleanupRestartRequired $true `
+            -CleanupRestartComplete $cleanupRestartComplete
+        if ($cleanupAllowed) {
+            try {
+                Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                    -BackupPrepared $backupPrepared -Bundle $bundle `
+                    -Reason 'Validated post-restart recursive cleanup was authorized and is in progress.'
+                Remove-A4STemporaryRoot -Root $temporaryRoot
+                Clear-RetainedTemporaryRootEvidence
+            }
             catch {
                 [void]$script:Evidence.errors.Add("Temporary runtime cleanup failed: $($_.Exception.Message)")
+                Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                    -BackupPrepared $backupPrepared -Bundle $bundle `
+                    -Reason "Validated post-restart cleanup threw or only partially removed the root: $($_.Exception.Message)"
                 if ($null -eq $operationError) { $operationError = $_ }
             }
         }
         else {
-            $script:Evidence.recovery.retainedTemporaryRoot = $temporaryRoot.finalPath
-            $script:Evidence.recovery.cleanupInstructions = if ($backupPrepared) {
-                "DO NOT DELETE '$($temporaryRoot.finalPath)' yet. Stop every same-user A4SMenuHost in every Windows session through --exit; verify the taskbar Explorer has zero A4SMenu.dll mappings and zero A4S menu windows; if a mapping is pinned or inspection is inconclusive, restart Explorer manually; run -RecoverHostSafety -RecoveryBundle '$bundle'; only then delete the retained root manually."
-            } else {
-                "DO NOT DELETE '$($temporaryRoot.finalPath)' until every same-user A4SMenuHost is stopped and Explorer is conclusively free of A4SMenu.dll mappings/windows. No HostSafety backup was completed, so do not use this bundle for recovery."
-            }
+            Set-RetainedTemporaryRootEvidence -Root $temporaryRoot.finalPath `
+                -BackupPrepared $backupPrepared -Bundle $bundle `
+                -Reason 'Cleanup authorization was denied because restart, host, mapping/window, or HostSafety restoration proof was incomplete.'
         }
 
         $script:Evidence.trackedHosts = @($script:TrackedHosts)
@@ -2380,11 +3296,16 @@ function Invoke-LiveFailureRecoveryQualification {
     Write-Host "Evidence: $script:EvidenceFile"
 }
 
-if ($PSCmdlet.ParameterSetName -eq 'Offline') {
+if ($PSCmdlet.ParameterSetName -eq 'ContractLibrary') {
+    # Dot-sourced by the offline companion so its executable negative cases call
+    # the exact production validators without loading native code or mutating state.
+    return
+}
+elseif ($PSCmdlet.ParameterSetName -eq 'Offline') {
     & (Join-Path $PSScriptRoot 'Test-A4SFailureRecoveryContracts.ps1')
     Write-Host 'OFFLINE GO: no runtime, registry, Explorer, staging, or evidence changes were made.'
     Write-Host 'ISOLATED/LIVE NO-GO: neither executable mode was run; both remain deferred pending explicit review and authorization.'
-    Write-Host 'Live N6/N9 additionally requires the conspicuous crash switch and exact confirmation text.'
+    Write-Host 'Live N6/N9 additionally requires the conspicuous crash switch, exact confirmation text, and a verified immutable release record.'
     Write-Host 'Native Start UI behavior is a manual/deferred observation, never a mechanical harness PASS.'
 }
 else {
@@ -2402,13 +3323,15 @@ else {
                     throw 'The exact destructive Explorer confirmation was not supplied.'
                 }
                 Invoke-LiveFailureRecoveryQualification -SourceHost $HostPath `
-                    -SourceDll $DllPath -RequestedEvidencePath $EvidencePath
+                    -SourceDll $DllPath -VerifiedReleaseRecordPath $ReleaseRecordPath `
+                    -RequestedEvidencePath $EvidencePath
             }
             'Recover' {
                 # Initialize-A4SFailureRecoveryNative above enforces x64 before
                 # recovery validation, process checks, or registry deletion.
                 Assert-AllTrackedHostsStopped
-                $restoreResult = Restore-HostSafety -Bundle $RecoveryBundle
+                $restoreResult = Restore-HostSafety -Bundle $RecoveryBundle `
+                    -AuthorizedCurrentSha256 $ExpectedCurrentHostSafetySha256
                 Write-Host "HostSafety restored transactionally from the validated Registry64 bundle: $RecoveryBundle"
                 Write-Host "Immediate pre-restore rollback bundle retained at: $($restoreResult.rollbackBundle)"
             }
