@@ -117,11 +117,18 @@ try {
     Assert-Contract ($harness -match
         '\[Parameter\(Mandatory, ParameterSetName = ''Recover''\)\][\s\S]*?\$ExpectedManifestSha256') `
         'Recover does not require an expected manifest SHA-256'
+    Assert-Contract (([Regex]::Matches($harness,
+        '\[Parameter\(Mandatory, ParameterSetName = ''(?:Isolated|Live)''\)\]\s*\r?\n\s*\[Parameter\(Mandatory, ParameterSetName = ''(?:Isolated|Live)''\)\]\s*\r?\n\s*\[string\] \$ReleaseRecordPath')).Count -eq 1) `
+        'Isolated and Live do not both require an immutable release record'
+    Assert-Contract ($harness -notmatch 'QueryHostVersion') `
+        'a caller binary can still be executed during static binding'
 
     $native = Get-FunctionText 'Initialize-A4SFailureRecoveryNative'
     foreach ($required in @('GetFinalPathNameByHandleW', 'GetDriveTypeW', 'QueryDosDeviceW',
             'FILE_ATTRIBUTE_REPARSE_POINT', 'GetFileInformationByHandle',
-            'AcquireProductMutationBoundary', 'SetupMutexName', 'HostMutexName')) {
+            'AcquireProductMutationBoundary', 'LifecycleMutexName', 'SetupMutexName',
+            'HostSafetyMutexName', 'HostMutexName', 'MutationContext',
+            'ValidateMutationContext', 'GetTaskbarWindowRecord')) {
         Assert-Contract ($native -match [Regex]::Escape($required)) `
             "native safety layer omits $required"
     }
@@ -131,6 +138,14 @@ try {
     Assert-Contract ($identity -match
         'A4S_HOST_MUTEX_PREFIX_W\s+L"Local\\\\A4SMenu\.Host\.Instance\.v1"') `
         'host mutex identity no longer matches the harness boundary'
+    Assert-InOrder -Text $native -Markers @('lifecycle = new Mutex',
+        'setup = new Mutex', 'safety = new Mutex', 'host = new Mutex') `
+        -Message 'product mutation locks are not acquired Lifecycle/Setup/HostSafety/Host'
+    foreach ($exactMutex in @('Global\A4SMenu.Lifecycle.v1.',
+            'Global\A4SMenu.HostSafety.v1.')) {
+        Assert-Contract ($native -match [Regex]::Escape($exactMutex)) `
+            "native boundary omits raw-SID mutex $exactMutex"
+    }
 
     $tempCleanup = Get-FunctionText 'Remove-A4STemporaryRoot'
     foreach ($required in @('allowedDirectories', 'allowedDirectoryFiles',
@@ -174,19 +189,49 @@ try {
     $transaction = Get-FunctionText 'Invoke-A4SRegistrySnapshotTransaction'
     $journalStep = Get-FunctionText 'Invoke-A4SRegistryJournaledStep'
     $undoJournal = Get-FunctionText 'Undo-A4SRegistryJournal'
+    $primitive = Get-FunctionText 'Invoke-A4SRegistryPrimitive'
     foreach ($required in @('ContractRegistrySandbox', 'ExpectedCurrent',
             'A4S_UNKNOWN_REGISTRY_STATE', 'Undo-A4SRegistryJournal',
             'InjectFailureAfterStep', 'mutationStepCount', 'ProductBoundary',
-            'forbids a caller-supplied validator')) {
+            'forbids a caller-supplied validator',
+            'New-A4SRegistryTransactionDescriptor', 'RollbackManifestSha256',
+            'CreateProductMutationContext', 'CreateContractMutationContext',
+            'A4S_SIMULATED_HARD_INTERRUPTION')) {
         Assert-Contract ($transaction -match [Regex]::Escape($required)) `
             "registry transaction omits $required"
     }
+    Assert-InOrder -Text $transaction -Markers @(
+        "effectiveBoundaryValidator 'registry transaction entry'",
+        'CreateProductMutationContext') `
+        -Message 'product mutation context can be created before boundary validation'
     Assert-InOrder -Text $journalStep -Markers @('preflight', 'Get-RegistryAggregateRecord',
-        'Invoke-A4SRegistryPrimitive', 'postflight', 'Get-RegistryAggregateRecord',
+        "phase='before-primitive'", 'Invoke-A4SRegistryPrimitive', 'postflight',
+        'Get-RegistryAggregateRecord', "phase='after-primitive'",
         'Journal.Add') -Message 'journal step is not CAS-checked before and after mutation'
-    Assert-InOrder -Text $undoJournal -Markers @('entry.after',
-        'Invoke-A4SRegistryPrimitive', 'entry.before') `
+    Assert-InOrder -Text $undoJournal -Markers @('entry.after', "phase='before-rollback'",
+        'Invoke-A4SRegistryPrimitive', 'entry.before', "phase='after-rollback'") `
         -Message 'journal rollback does not verify exact after and before aggregates'
+    Assert-InOrder -Text $primitive -Markers @('ValidateMutationContext',
+        'OpenBaseKey') -Message 'a registry primitive can open HKCU before opaque-context validation'
+    Assert-InOrder -Text $primitive -Markers @('Assert-A4SProductMutationMode',
+        'ValidateMutationContext', 'OpenBaseKey') `
+        -Message 'ContractLibrary can reach product registry before mode/context validation'
+
+    $binaryBinding = Get-FunctionText 'Get-BinaryBinding'
+    foreach ($required in @('FileShare]::Read', 'Assert-StaticPeImageBytes',
+            'ComputeHash', 'FileVersionInfo]::GetVersionInfo',
+            'static-locked-pe-resource')) {
+        Assert-Contract ($binaryBinding -match [Regex]::Escape($required)) `
+            "static binary authentication omits $required"
+    }
+    Assert-Contract ($binaryBinding -notmatch 'Invoke-A4SHostCommand') `
+        'static binding executes the candidate image'
+    $reportedVersion = Get-FunctionText 'Confirm-A4SAuthenticatedHostReportedVersion'
+    Assert-InOrder -Text $reportedVersion -Markers @(
+        'Assert-HostBindingMatchesReleaseRecord', 'FileShare]::Read',
+        'Get-BinaryBinding', 'Assert-BinaryCopyBinding',
+        'Assert-HostBindingMatchesReleaseRecord', 'Invoke-A4SHostCommand') `
+        -Message 'host --version runs before locked static/release authentication'
 
     $isolated = Get-FunctionText 'Invoke-IsolatedDllFailureQualification'
     $live = Get-FunctionText 'Invoke-LiveFailureRecoveryQualification'
@@ -198,6 +243,15 @@ try {
                 "qualification flow omits authorized-state contract $required"
         }
     }
+    Assert-InOrder -Text $isolated -Markers @('Read-VerifiedA4SReleaseRecord',
+        'Get-BinaryBinding', 'Assert-HostBindingMatchesReleaseRecord',
+        'Confirm-A4SAuthenticatedHostReportedVersion', 'New-EvidenceBundle') `
+        -Message 'isolated mode executes or creates state before caller host authentication'
+    Assert-InOrder -Text $live -Markers @('Read-VerifiedA4SReleaseRecord',
+        'Get-BinaryBinding', 'Get-BinaryBinding',
+        'Assert-BinaryBindingsMatchReleaseRecord',
+        'Confirm-A4SAuthenticatedHostReportedVersion', 'New-EvidenceBundle') `
+        -Message 'live mode executes or creates state before exact host/DLL authentication'
     foreach ($required in @('Confirm-A4SResetSafetyTransition',
             'Confirm-A4SCrashGuardTransition', 'preCrashAuthorizedSha256',
             'preRecoveryResetAuthorizedSha256')) {
@@ -238,6 +292,22 @@ try {
     })) 'real overlap predicate accepted siblings'
     Assert-Throws { & $library { Assert-NoShortPathAlias -Path 'C:\PROGRA~1\A4S' } } `
         'real short-alias validator accepted an 8.3 path'
+
+    $currentPowerShellPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    $staticPeBinding = & $library {
+        param($path)
+        Get-BinaryBinding -Path $path -Role 'read-only contract PE fixture'
+    } $currentPowerShellPath
+    Assert-Contract ($staticPeBinding.pe.machine -ceq 'AMD64' -and
+        $staticPeBinding.fixedVersionReadMode -ceq 'static-locked-pe-resource' -and
+        $null -eq $staticPeBinding.reportedVersion) `
+        'real static PE authentication did not remain non-executing and x64-bound'
+    Assert-Throws {
+        & $library {
+            Assert-StaticPeImageBytes -Bytes ([byte[]]::new(256)) `
+                -Role 'invalid contract PE fixture'
+        }
+    } 'static PE parser accepted zero-filled non-PE bytes'
 
     $absent = [pscustomobject][ordered]@{ exists=$false; values=@(); subkeys=@() }
     $preState = [pscustomobject][ordered]@{
@@ -365,6 +435,38 @@ try {
         } (Join-Path $runtimeCleanupDirectory.finalPath $fileName) 'contract-cleanup-fixture'
     }
 
+    function New-ContractTransactionAssets {
+        param([Parameter(Mandatory)][object] $ExpectedAggregate)
+
+        $directory = & $library {
+            param($path, $parent)
+            New-SafeFreshDirectory -Path $path `
+                -Description 'contract registry transaction directory' `
+                -ExpectedParent $parent
+        } (Join-Path $temporaryRoot.finalPath (
+            'contract-transaction-' + [Guid]::NewGuid().ToString('N'))) `
+            $temporaryRoot.finalPath
+        $rollbackManifest = [ordered]@{
+            schemaVersion=1
+            createdUtc=[DateTime]::UtcNow.ToString('o')
+            registrySubKey=$sandboxSubKey
+            snapshot=$ExpectedAggregate.snapshot
+            snapshotSha256=$ExpectedAggregate.sha256
+        }
+        $rollbackText = $rollbackManifest | ConvertTo-Json -Depth 32
+        $rollbackSha = & $library {
+            param($text) Get-TextSha256 -Text $text
+        } $rollbackText
+        & $library {
+            param($path, $text) Write-DurableNewText -Path $path -Text $text
+        } (Join-Path $directory.finalPath 'A4SRegistryRollback.json') $rollbackText
+        return [pscustomobject][ordered]@{
+            bundle=$directory.finalPath
+            rollbackManifestSha256=$rollbackSha
+            descriptorPath=(Join-Path $directory.finalPath 'A4SRegistryTransaction.json')
+        }
+    }
+
     # Execute the production journal/CAS engine against one random, isolated
     # HKCU subtree. The production HostSafety target remains hard-locked and is
     # never selected by this contract seam.
@@ -378,7 +480,7 @@ try {
                 -ValidateBoundary $validator
         } $absent $snapshotAggregate $boundary
     } 'product HostSafety transaction accepted a contract validator' `
-        'real product boundary object'
+        'forbidden outside|real product boundary object'
     $sandboxAuthorized = & $library {
         param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
     } $sandboxSubKey
@@ -386,18 +488,87 @@ try {
         'fresh random registry contract subtree unexpectedly exists'
     $sandboxOwnershipEstablished = $true
 
+    # Opaque mutation capabilities cannot be forged, retargeted, or replayed
+    # with a different nonce. All negative operations target only random HKCU
+    # contract names and are rejected before OpenBaseKey.
+    $contextNonce = [Guid]::NewGuid().ToString('N')
+    $contractContext = & $library {
+        param($key, $nonce)
+        [A4SFailureRecoveryNative]::CreateContractMutationContext($key, $nonce)
+    } $sandboxSubKey $contextNonce
+    Assert-Throws {
+        & $library {
+            param($key)
+            Invoke-A4SRegistryPrimitive -RegistrySubKey $key -Operation CreateKey
+        } $sandboxSubKey
+    } 'registry primitive accepted a call without an opaque mutation context'
+    Assert-Throws {
+        & $library {
+            param($key, $context, $nonce)
+            Invoke-A4SRegistryPrimitive -RegistrySubKey $key `
+                -MutationContext $context -ContextNonce $nonce -Operation CreateKey
+        } $sandboxSubKey $contractContext ([Guid]::NewGuid().ToString('N'))
+    } 'registry primitive accepted a replayed context with a different nonce' `
+        'nonce|context'
+    $otherSandboxSubKey = 'Software\A4SMenuFailureRecoveryContract_' +
+        [Guid]::NewGuid().ToString('N')
+    Assert-Throws {
+        & $library {
+            param($key, $context, $nonce)
+            Invoke-A4SRegistryPrimitive -RegistrySubKey $key `
+                -MutationContext $context -ContextNonce $nonce -Operation CreateKey
+        } $otherSandboxSubKey $contractContext $contextNonce
+    } 'registry primitive accepted a context for a different exact target' `
+        'target|context'
+    Assert-Throws {
+        & $library {
+            param($nonce)
+            [A4SFailureRecoveryNative]::CreateContractMutationContext(
+                'Software\A4SMenu\HostSafety', $nonce)
+        } $contextNonce
+    } 'ContractLibrary forged a sandbox capability against product HostSafety' `
+        'cannot target product'
+    Assert-Throws {
+        & $library {
+            Invoke-A4SRegistryPrimitive `
+                -RegistrySubKey 'Software\A4SMenu\HostSafety' `
+                -MutationContext ([pscustomobject]@{}) `
+                -ContextNonce ([Guid]::NewGuid().ToString('N')) `
+                -Operation CreateKey
+        }
+    } 'ContractLibrary reached a product primitive' `
+        'forbidden outside'
+    Assert-Throws {
+        & $library { Enter-A4SProductMutationBoundary }
+    } 'ContractLibrary acquired a product mutation boundary' `
+        'unavailable in ContractLibrary'
+    $postBypassState = & $library {
+        param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+    } $sandboxSubKey
+    $otherPostBypassState = & $library {
+        param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
+    } $otherSandboxSubKey
+    Assert-Contract (-not $postBypassState.snapshot.exists -and
+        -not $otherPostBypassState.snapshot.exists) `
+        'opaque-context bypass negatives mutated a registry sandbox'
+
     function Invoke-SandboxTransition {
         param(
             [Parameter(Mandatory)][object] $Desired,
             [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0
         )
+        $assets = New-ContractTransactionAssets -ExpectedAggregate $sandboxAuthorized
         $result = & $library {
-            param($key, $desired, $expected, $validator, $inject)
+            param($key, $desired, $expected, $validator, $inject, $assets)
             Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
                 -DesiredSnapshot $desired -ExpectedCurrent $expected `
                 -ValidateBoundary $validator -ContractRegistrySandbox `
+                -TransactionDescriptorPath $assets.descriptorPath `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
                 -InjectFailureAfterStep $inject
-        } $sandboxSubKey $Desired $sandboxAuthorized $boundary $InjectFailureAfterStep
+        } $sandboxSubKey $Desired $sandboxAuthorized $boundary `
+            $InjectFailureAfterStep $assets
         $script:sandboxAuthorized = [pscustomobject][ordered]@{
             snapshot=$result.snapshot; sha256=$result.snapshotSha256
         }
@@ -453,6 +624,63 @@ try {
                 "$($scenario.name) failure injection step $step did not roll back exactly"
         }
     }
+
+    # A real durable descriptor must make every interruption phase recoverable.
+    foreach ($hardPhase in @('prepared', 'before-primitive', 'after-primitive',
+            'committed', 'before-rollback', 'after-rollback', 'rolled-back')) {
+        [void](Invoke-SandboxTransition -Desired $absent)
+        $beforeHard = $sandboxAuthorized
+        $assets = New-ContractTransactionAssets -ExpectedAggregate $beforeHard
+        $ordinaryFailureStep = if ($hardPhase -in @(
+            'before-rollback', 'after-rollback', 'rolled-back')) { 1 } else { 0 }
+        Assert-Throws {
+            & $library {
+                param($key, $desired, $expected, $validator, $assets,
+                    $hardPhase, $ordinaryFailureStep)
+                Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
+                    -DesiredSnapshot $desired -ExpectedCurrent $expected `
+                    -ValidateBoundary $validator -ContractRegistrySandbox `
+                    -TransactionDescriptorPath $assets.descriptorPath `
+                    -RollbackBundle $assets.bundle `
+                    -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                    -InjectFailureAfterStep $ordinaryFailureStep `
+                    -InjectHardInterruptionPhase $hardPhase
+            } $sandboxSubKey $desiredState $beforeHard $boundary $assets `
+                $hardPhase $ordinaryFailureStep
+        } "hard interruption phase $hardPhase did not interrupt" `
+            'A4S_SIMULATED_HARD_INTERRUPTION'
+        $durable = & $library {
+            param($key, $assets)
+            Read-A4SRegistryTransactionDescriptor -Path $assets.descriptorPath `
+                -RegistrySubKey $key -TargetKind contract-sandbox `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                -CaptureSha256
+        } $sandboxSubKey $assets
+        Assert-Contract ([string]$durable.value.phase -ceq $hardPhase) `
+            "hard interruption $hardPhase was not durably phase-marked"
+        $recovered = & $library {
+            param($key, $validator, $assets, $descriptorSha256)
+            Invoke-A4SRegistryTransactionRecovery -RegistrySubKey $key `
+                -TransactionDescriptorPath $assets.descriptorPath `
+                -ExpectedTransactionDescriptorSha256 $descriptorSha256 `
+                -RollbackBundle $assets.bundle `
+                -RollbackManifestSha256 $assets.rollbackManifestSha256 `
+                -ValidateBoundary $validator -ContractRegistrySandbox
+        } $sandboxSubKey $boundary $assets $durable.sha256
+        $script:sandboxAuthorized = [pscustomobject][ordered]@{
+            snapshot=$recovered.snapshot; sha256=$recovered.snapshotSha256
+        }
+        $expectedRecovered = if ($hardPhase -in @('prepared', 'committed')) {
+            & $library {
+                param($key, $snapshot)
+                Get-RegistryAggregateRecord -RegistrySubKey $key -Snapshot $snapshot
+            } $sandboxSubKey $desiredState
+        }
+        else { $beforeHard }
+        Assert-Contract ($sandboxAuthorized.sha256 -ceq $expectedRecovered.sha256) `
+            "hard interruption $hardPhase did not deterministically resume or exact-CAS rollback"
+    }
     [void](Invoke-SandboxTransition -Desired $absent)
     $sandboxFinal = & $library {
         param($key) Get-RegistryAggregateRecord -RegistrySubKey $key
@@ -498,6 +726,53 @@ try {
         } $missingEvidence
     } 'real termination gate accepted wait-before-evidence'
 
+    $expectedExplorerIdentity = [pscustomobject][ordered]@{
+        pid=[uint32]400; startTimeUtc='2026-01-01T00:00:00.0000000Z'
+        path='C:\Windows\explorer.exe'; pathIdentity='00000001:00000002:00000003'
+        sessionId=1; threadId=[uint32]900; taskbarWindowHandle=[int64]1200
+    }
+    $retainedExplorerIdentity = [pscustomobject][ordered]@{
+        pid=[uint32]400; startTimeUtc='2026-01-01T00:00:00.0000000Z'
+        path='C:\Windows\explorer.exe'; pathIdentity='00000001:00000002:00000003'
+        sessionId=1; processHandleValue=[int64]44
+    }
+    $immediateTaskbarIdentity = $expectedExplorerIdentity | ConvertTo-Json | ConvertFrom-Json
+    [void](& $library {
+        param($expected, $retained, $taskbar)
+        Assert-ExplorerTerminationIdentityPredicate -Expected $expected `
+            -RetainedProcess $retained -ImmediateTaskbarOwner $taskbar `
+            -Label 'contract exact Explorer kill identity'
+    } $expectedExplorerIdentity $retainedExplorerIdentity $immediateTaskbarIdentity)
+    foreach ($mutation in @(
+        [pscustomobject]@{side='retained';field='pid';value=401},
+        [pscustomobject]@{side='retained';field='startTimeUtc';value='2026-01-01T00:00:01.0000000Z'},
+        [pscustomobject]@{side='retained';field='path';value='C:\Windows\not-explorer.exe'},
+        [pscustomobject]@{side='retained';field='pathIdentity';value='different'},
+        [pscustomobject]@{side='retained';field='sessionId';value=2},
+        [pscustomobject]@{side='retained';field='processHandleValue';value=0},
+        [pscustomobject]@{side='taskbar';field='pid';value=401},
+        [pscustomobject]@{side='taskbar';field='threadId';value=901},
+        [pscustomobject]@{side='taskbar';field='taskbarWindowHandle';value=1201},
+        [pscustomobject]@{side='taskbar';field='pathIdentity';value='different'},
+        [pscustomobject]@{side='taskbar';field='sessionId';value=2}
+    )) {
+        $retainedCopy = $retainedExplorerIdentity | ConvertTo-Json | ConvertFrom-Json
+        $taskbarCopy = $immediateTaskbarIdentity | ConvertTo-Json | ConvertFrom-Json
+        if ($mutation.side -ceq 'retained') {
+            $retainedCopy.($mutation.field) = $mutation.value
+        } else {
+            $taskbarCopy.($mutation.field) = $mutation.value
+        }
+        Assert-Throws {
+            & $library {
+                param($expected, $retained, $taskbar)
+                Assert-ExplorerTerminationIdentityPredicate -Expected $expected `
+                    -RetainedProcess $retained -ImmediateTaskbarOwner $taskbar `
+                    -Label 'contract mismatched Explorer kill identity'
+            } $expectedExplorerIdentity $retainedCopy $taskbarCopy
+        } "Explorer kill predicate accepted mismatched $($mutation.side).$($mutation.field)"
+    }
+
     Assert-Contract (& $library {
         Test-A4STemporaryCleanupAllowed -AllHostsStopped $true `
             -MappingInspectionSucceeded $true -MappingCount 0 -WindowCount 0 `
@@ -506,7 +781,12 @@ try {
     }) 'real conclusive cleanup predicate denied deletion'
 
     function New-CrashGuardFixture {
-        param([int] $Count, [bool] $Disabled, [uint64[]] $Times)
+        param(
+            [int] $Count,
+            [bool] $Disabled,
+            [uint64[]] $Times,
+            [uint64] $WindowStart = 0
+        )
         $bytes = [byte[]]::new(24)
         for ($index = 0; $index -lt $Times.Count; $index++) {
             [BitConverter]::GetBytes([uint64]$Times[$index]).CopyTo($bytes, $index * 8)
@@ -516,6 +796,8 @@ try {
             values=@(
                 [pscustomobject]@{name='AbnormalExplorerExitCount';kind='DWord';value=$Count},
                 [pscustomobject]@{name='AbnormalExplorerExitTimes';kind='Binary';value=[Convert]::ToBase64String($bytes)},
+                [pscustomobject]@{name='AbnormalExplorerWindowStart';kind='QWord';value=$(
+                    if ($WindowStart) { $WindowStart } else { [uint64]$Times[0] })},
                 [pscustomobject]@{name='InjectionDisabled';kind='DWord';value=$(if ($Disabled) {1} else {0})},
                 [pscustomobject]@{name='LastExplorerExitCode';kind='DWord';value=1})
             subkeys=@()
@@ -537,16 +819,56 @@ try {
             $stage ($stage -eq 3) @($bounds | Select-Object -First $stage) $prior
         [uint64[]]$prior = @($result.timestamps100ns)
     }
+    $validCrash = New-CrashGuardFixture -Count 1 -Disabled $false `
+        -Times @([uint64]15)
+    foreach ($invalidCrash in @(
+        (& {
+            $copy = $validCrash | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            $copy.values = @($copy.values | Where-Object {
+                $_.name -cne 'AbnormalExplorerWindowStart' })
+            $copy
+        }),
+        (& {
+            $copy = $validCrash | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            $copy.values += [pscustomobject]@{name='Unexpected';kind='DWord';value=0}
+            $copy
+        }),
+        (& {
+            $copy = $validCrash | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            ($copy.values | Where-Object name -eq 'AbnormalExplorerWindowStart').kind='DWord'
+            $copy
+        }),
+        (& {
+            $copy = $validCrash | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            ($copy.values | Where-Object name -eq 'AbnormalExplorerWindowStart').value=14
+            $copy
+        }),
+        (& {
+            $copy = $validCrash | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+            ($copy.values | Where-Object name -eq 'AbnormalExplorerExitTimes').value=
+                [Convert]::ToBase64String([byte[]]::new(16))
+            $copy
+        }))) {
+        Assert-Throws {
+            & $library {
+                param($snapshot, $boundaries)
+                Assert-RollingCrashGuardStage -Snapshot $snapshot `
+                    -ExpectedCount 1 -ExpectedDisabled $false `
+                    -Boundaries $boundaries
+            } $invalidCrash @($bounds[0])
+        } 'exact five-value crash-guard schema accepted an invalid fixture'
+    }
 
     & $library { param($root) Remove-A4STemporaryRoot -Root $root } $temporaryRoot
     Assert-Contract (-not (Test-Path -LiteralPath $temporaryRoot.finalPath)) `
         'real flat temporary cleanup retained its validated root'
     $temporaryRoot = $null
 
-    Write-Host ('A4S failure/recovery offline contracts passed: locked manifest bytes, ' +
-        'flat schema, stale-CAS rejection, every journal mutation failure point, exact ' +
-        'rollback, transactional sandbox cleanup, authorized action sequencing, and ' +
-        'non-recursive temporary cleanup were executed.')
+    Write-Host ('A4S failure/recovery offline contracts passed: locked static PE/manifest ' +
+        'ordering, exact crash schema, retained Explorer identity predicates, opaque ' +
+        'mutation capabilities, stale-CAS rejection, every journal failure point, all ' +
+        'durable hard-interruption phases, deterministic recovery/rollback, and ' +
+        'non-recursive cleanup were executed.')
 }
 catch {
     $primaryError = $_
@@ -564,12 +886,20 @@ finally {
                     exists=$false; values=@(); subkeys=@()
                 }
                 $cleanupBoundary = { param([string] $Label) return $true }
+                if (-not (Get-Command New-ContractTransactionAssets `
+                    -CommandType Function -ErrorAction SilentlyContinue)) {
+                    throw 'Contract cleanup cannot create its required durable transaction assets.'
+                }
+                $cleanupAssets = New-ContractTransactionAssets -ExpectedAggregate $actual
                 [void](& $library {
-                    param($key, $desired, $expected, $validator)
+                    param($key, $desired, $expected, $validator, $assets)
                     Invoke-A4SRegistrySnapshotTransaction -RegistrySubKey $key `
                         -DesiredSnapshot $desired -ExpectedCurrent $expected `
-                        -ValidateBoundary $validator -ContractRegistrySandbox
-                } $sandboxSubKey $absentCleanup $actual $cleanupBoundary)
+                        -ValidateBoundary $validator -ContractRegistrySandbox `
+                        -TransactionDescriptorPath $assets.descriptorPath `
+                        -RollbackBundle $assets.bundle `
+                        -RollbackManifestSha256 $assets.rollbackManifestSha256
+                } $sandboxSubKey $absentCleanup $actual $cleanupBoundary $cleanupAssets)
             }
             $confirmedAbsent = & $library {
                 param($key) Get-RegistryAggregateRecord -RegistrySubKey $key

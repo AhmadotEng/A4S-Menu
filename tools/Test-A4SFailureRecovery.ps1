@@ -34,6 +34,7 @@ param(
     [Parameter(Mandatory, ParameterSetName = 'Live')]
     [string] $DllPath,
 
+    [Parameter(Mandatory, ParameterSetName = 'Isolated')]
     [Parameter(Mandatory, ParameterSetName = 'Live')]
     [string] $ReleaseRecordPath,
 
@@ -68,6 +69,7 @@ $script:Evidence = $null
 $script:EvidenceFile = $null
 $script:HarnessLease = $null
 $script:TrackedHosts = [Collections.ArrayList]::new()
+$script:A4SInvocationParameterSet = $PSCmdlet.ParameterSetName
 
 function Initialize-A4SFailureRecoveryNative {
     if (-not [Environment]::Is64BitProcess) {
@@ -84,6 +86,7 @@ using System.Runtime.InteropServices;
 using System.Security.Principal;
 using System.Security.Cryptography;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Threading;
 using Microsoft.Win32.SafeHandles;
 
@@ -91,32 +94,68 @@ public static class A4SFailureRecoveryNative
 {
     public sealed class ProductMutationBoundary : IDisposable
     {
+        private Mutex lifecycle;
         private Mutex setup;
+        private Mutex safety;
         private Mutex host;
+        private bool lifecycleOwned;
         private bool setupOwned;
+        private bool safetyOwned;
         private bool hostOwned;
 
-        internal ProductMutationBoundary(Mutex setup, bool setupOwned,
-            Mutex host, bool hostOwned, string setupName, string hostName)
+        internal ProductMutationBoundary(Mutex lifecycle, bool lifecycleOwned,
+            Mutex setup, bool setupOwned, Mutex safety, bool safetyOwned,
+            Mutex host, bool hostOwned, string lifecycleName, string setupName,
+            string safetyName, string hostName)
         {
+            this.lifecycle = lifecycle;
+            this.lifecycleOwned = lifecycleOwned;
             this.setup = setup;
             this.setupOwned = setupOwned;
+            this.safety = safety;
+            this.safetyOwned = safetyOwned;
             this.host = host;
             this.hostOwned = hostOwned;
+            LifecycleMutexName = lifecycleName;
             SetupMutexName = setupName;
+            HostSafetyMutexName = safetyName;
             HostMutexName = hostName;
         }
 
+        public string LifecycleMutexName { get; private set; }
         public string SetupMutexName { get; private set; }
+        public string HostSafetyMutexName { get; private set; }
         public string HostMutexName { get; private set; }
-        public bool IsHeld { get { return setupOwned && hostOwned; } }
+        public bool IsHeld { get { return lifecycleOwned && setupOwned &&
+            safetyOwned && hostOwned; } }
 
         public void Dispose()
         {
             if (hostOwned) { host.ReleaseMutex(); hostOwned = false; }
             if (host != null) { host.Dispose(); host = null; }
+            if (safetyOwned) { safety.ReleaseMutex(); safetyOwned = false; }
+            if (safety != null) { safety.Dispose(); safety = null; }
             if (setupOwned) { setup.ReleaseMutex(); setupOwned = false; }
             if (setup != null) { setup.Dispose(); setup = null; }
+            if (lifecycleOwned) { lifecycle.ReleaseMutex(); lifecycleOwned = false; }
+            if (lifecycle != null) { lifecycle.Dispose(); lifecycle = null; }
+        }
+    }
+
+    public sealed class MutationContext
+    {
+        internal ProductMutationBoundary Boundary { get; private set; }
+        public string TargetIdentifier { get; private set; }
+        public string Nonce { get; private set; }
+        public string Kind { get; private set; }
+
+        internal MutationContext(ProductMutationBoundary boundary, string target,
+            string nonce, string kind)
+        {
+            Boundary = boundary;
+            TargetIdentifier = target;
+            Nonce = nonce;
+            Kind = kind;
         }
     }
 
@@ -127,6 +166,13 @@ public static class A4SFailureRecoveryNative
         public uint Attributes { get; set; }
         public uint DriveType { get; set; }
         public string DosDeviceTarget { get; set; }
+    }
+
+    public sealed class TaskbarWindowRecord
+    {
+        public uint ProcessId { get; set; }
+        public uint ThreadId { get; set; }
+        public long WindowHandle { get; set; }
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -259,6 +305,18 @@ public static class A4SFailureRecoveryNative
                 Hex(algorithm.ComputeHash(CurrentSidBytes())).Substring(0, 32);
     }
 
+    private static string LifecycleMutexName()
+    {
+        return @"Global\A4SMenu.Lifecycle.v1." +
+            WindowsIdentity.GetCurrent().User.Value;
+    }
+
+    private static string HostSafetyMutexName()
+    {
+        return @"Global\A4SMenu.HostSafety.v1." +
+            WindowsIdentity.GetCurrent().User.Value;
+    }
+
     private static string HostMutexName()
     {
         IntPtr desktop = GetThreadDesktop(GetCurrentThreadId());
@@ -300,35 +358,113 @@ public static class A4SFailureRecoveryNative
 
     public static ProductMutationBoundary AcquireProductMutationBoundary()
     {
+        string lifecycleName = LifecycleMutexName();
         string setupName = SetupMutexName();
+        string safetyName = HostSafetyMutexName();
         string hostName = HostMutexName();
+        Mutex lifecycle = null;
         Mutex setup = null;
+        Mutex safety = null;
         Mutex host = null;
+        bool lifecycleOwned = false;
         bool setupOwned = false;
+        bool safetyOwned = false;
         bool hostOwned = false;
         try
         {
+            // Fixed global order shared with product servicing:
+            // Lifecycle -> Setup -> HostSafety -> current-desktop Host.
+            lifecycle = new Mutex(false, lifecycleName);
+            lifecycleOwned = WaitMutex(lifecycle);
+            if (!lifecycleOwned)
+                throw new InvalidOperationException(
+                    "The A4S product lifecycle mutex is already owned.");
             setup = new Mutex(false, setupName);
             setupOwned = WaitMutex(setup);
             if (!setupOwned)
                 throw new InvalidOperationException(
                     "The A4S product servicing mutex is already owned.");
+            safety = new Mutex(false, safetyName);
+            safetyOwned = WaitMutex(safety);
+            if (!safetyOwned)
+                throw new InvalidOperationException(
+                    "The A4S HostSafety mutation mutex is already owned.");
             host = new Mutex(false, hostName);
             hostOwned = WaitMutex(host);
             if (!hostOwned)
                 throw new InvalidOperationException(
                     "The current desktop A4S host mutex is already owned.");
-            return new ProductMutationBoundary(setup, setupOwned,
-                host, hostOwned, setupName, hostName);
+            return new ProductMutationBoundary(lifecycle, lifecycleOwned,
+                setup, setupOwned, safety, safetyOwned, host, hostOwned,
+                lifecycleName, setupName, safetyName, hostName);
         }
         catch
         {
             if (hostOwned) host.ReleaseMutex();
             if (host != null) host.Dispose();
+            if (safetyOwned) safety.ReleaseMutex();
+            if (safety != null) safety.Dispose();
             if (setupOwned) setup.ReleaseMutex();
             if (setup != null) setup.Dispose();
+            if (lifecycleOwned) lifecycle.ReleaseMutex();
+            if (lifecycle != null) lifecycle.Dispose();
             throw;
         }
+    }
+
+    private static bool IsContractTarget(string target)
+    {
+        return Regex.IsMatch(target ?? String.Empty,
+            @"\ASoftware\\A4SMenuFailureRecoveryContract_[A-Fa-f0-9]{32}\z",
+            RegexOptions.CultureInvariant);
+    }
+
+    public static MutationContext CreateProductMutationContext(
+        ProductMutationBoundary boundary, string target, string nonce)
+    {
+        if (boundary == null || !boundary.IsHeld)
+            throw new InvalidOperationException(
+                "A held product boundary is required for a mutation context.");
+        if (!String.Equals(target, @"Software\A4SMenu\HostSafety",
+            StringComparison.Ordinal))
+            throw new InvalidOperationException("The product mutation target is not exact.");
+        if (!Regex.IsMatch(nonce ?? String.Empty, @"\A[A-Fa-f0-9]{32}\z"))
+            throw new InvalidOperationException("The mutation-context nonce is invalid.");
+        return new MutationContext(boundary, target, nonce, "product");
+    }
+
+    public static MutationContext CreateContractMutationContext(string target,
+        string nonce)
+    {
+        if (!IsContractTarget(target))
+            throw new InvalidOperationException(
+                "A contract mutation context cannot target product HostSafety.");
+        if (!Regex.IsMatch(nonce ?? String.Empty, @"\A[A-Fa-f0-9]{32}\z"))
+            throw new InvalidOperationException("The mutation-context nonce is invalid.");
+        return new MutationContext(null, target, nonce, "contract-sandbox");
+    }
+
+    public static void ValidateMutationContext(MutationContext context,
+        string target, string expectedNonce, bool requireProductBoundary)
+    {
+        if (context == null || !String.Equals(context.TargetIdentifier, target,
+                StringComparison.Ordinal) ||
+            !String.Equals(context.Nonce, expectedNonce, StringComparison.Ordinal))
+            throw new InvalidOperationException(
+                "The opaque mutation context target or nonce is invalid.");
+        if (requireProductBoundary)
+        {
+            if (!String.Equals(context.Kind, "product", StringComparison.Ordinal) ||
+                context.Boundary == null || !context.Boundary.IsHeld ||
+                !String.Equals(target, @"Software\A4SMenu\HostSafety",
+                    StringComparison.Ordinal))
+                throw new InvalidOperationException(
+                    "The product mutation context no longer holds every required mutex.");
+        }
+        else if (!String.Equals(context.Kind, "contract-sandbox",
+                StringComparison.Ordinal) || !IsContractTarget(target))
+            throw new InvalidOperationException(
+                "The contract mutation context is invalid or targets production.");
     }
 
     private static string StripExtendedPrefix(string path)
@@ -452,16 +588,26 @@ public static class A4SFailureRecoveryNative
         finally { CloseHandle(process); }
     }
 
-    public static uint GetTaskbarProcessId()
+    public static TaskbarWindowRecord GetTaskbarWindowRecord()
     {
         IntPtr taskbar = FindWindowW("Shell_TrayWnd", null);
         if (taskbar == IntPtr.Zero)
             throw new InvalidOperationException("Shell_TrayWnd was not found.");
         uint processId;
-        if (GetWindowThreadProcessId(taskbar, out processId) == 0 || processId == 0)
+        uint threadId = GetWindowThreadProcessId(taskbar, out processId);
+        if (threadId == 0 || processId == 0)
             throw new Win32Exception(Marshal.GetLastWin32Error(),
                 "Could not resolve the taskbar Explorer process.");
-        return processId;
+        return new TaskbarWindowRecord {
+            ProcessId = processId,
+            ThreadId = threadId,
+            WindowHandle = taskbar.ToInt64()
+        };
+    }
+
+    public static uint GetTaskbarProcessId()
+    {
+        return GetTaskbarWindowRecord().ProcessId;
     }
 
     public static uint GetHostWindowProcessId()
@@ -698,6 +844,11 @@ function Remove-A4STemporaryRoot {
 
     foreach ($child in @(Get-ChildItem -LiteralPath $safe.finalPath -Force -ErrorAction Stop)) {
         if ($child.PSIsContainer) {
+            if ([string]$child.Name -match '\Acontract-transaction-[A-Fa-f0-9]{32}\z') {
+                $allowedDirectoryFiles[[string]$child.Name] = @(
+                    'A4SRegistryRollback.json', 'A4SRegistryTransaction.json')
+                $allowedDirectories = @($allowedDirectoryFiles.Keys)
+            }
             if ([string]$child.Name -notin $allowedDirectories) {
                 throw "Temporary cleanup found an unknown direct directory: $($child.FullName)"
             }
@@ -1338,7 +1489,9 @@ function Get-A4SConfirmedRecoveryAuthorization {
             authorizedSequence = $State.sequence
             authorizedAction = $State.lastAction
             observedUtc = Get-UtcText
+            lifecycleMutexName = $boundary.LifecycleMutexName
             setupMutexName = $boundary.SetupMutexName
+            hostSafetyMutexName = $boundary.HostSafetyMutexName
             hostMutexName = $boundary.HostMutexName
         }
     }
@@ -1700,12 +1853,25 @@ function Backup-HostSafety {
 }
 
 function Enter-A4SProductMutationBoundary {
+    if ([string]$script:A4SInvocationParameterSet -notin @(
+        'Isolated', 'Live', 'Recover')) {
+        throw 'Product mutation authority is unavailable in ContractLibrary and Offline modes.'
+    }
     $boundary = [A4SFailureRecoveryNative]::AcquireProductMutationBoundary()
     if (-not $boundary -or -not $boundary.IsHeld) {
         if ($boundary) { $boundary.Dispose() }
-        throw 'Could not acquire the exact product Setup/host mutation boundary.'
+        throw 'Could not acquire the exact Lifecycle/Setup/HostSafety/host mutation boundary.'
     }
     return $boundary
+}
+
+function Assert-A4SProductMutationMode {
+    param([Parameter(Mandatory)][string] $Label)
+    if ([string]$script:A4SInvocationParameterSet -notin @(
+        'Isolated', 'Live', 'Recover')) {
+        throw "$Label is forbidden outside an explicitly selected product execution mode."
+    }
+    return $true
 }
 
 function Exit-A4SProductMutationBoundary {
@@ -1722,9 +1888,13 @@ function Assert-A4SProductMutationBoundary {
         $Boundary.GetType().FullName -cne
             'A4SFailureRecoveryNative+ProductMutationBoundary' -or
         -not $Boundary.IsHeld -or
+        [string]$Boundary.LifecycleMutexName -notmatch
+            '\AGlobal\\A4SMenu\.Lifecycle\.v1\.S-\d-(?:\d+-)+\d+\z' -or
         [string]$Boundary.SetupMutexName -notmatch '\AGlobal\\A4SMenu\.Setup\.v1\.[A-F0-9]{32}\z' -or
+        [string]$Boundary.HostSafetyMutexName -notmatch
+            '\AGlobal\\A4SMenu\.HostSafety\.v1\.S-\d-(?:\d+-)+\d+\z' -or
         [string]$Boundary.HostMutexName -notmatch '\ALocal\\A4SMenu\.Host\.Instance\.v1\.[0-9]+\.[A-F0-9]{16}\z') {
-        throw "$Label does not hold the exact product Setup and current-desktop host mutexes."
+        throw "$Label does not hold the exact product Lifecycle, Setup, HostSafety, and current-desktop host mutexes."
     }
     Assert-AllTrackedHostsStopped
     return $true
@@ -1764,6 +1934,342 @@ function Test-RegistryAggregateEqual {
         (Compare-HostSafetySnapshot -Expected $First.snapshot -Actual $Second.snapshot)
 }
 
+function Read-A4SRegistryRollbackBinding {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][string] $Bundle,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedManifestSha256
+    )
+
+    if ($TargetKind -ceq 'product') {
+        if (-not [StringComparer]::Ordinal.Equals($RegistrySubKey, $hostSafetySubKey)) {
+            throw 'A product rollback binding must target the exact HostSafety key.'
+        }
+        $validated = Read-ValidatedHostSafetyBackup -Bundle $Bundle `
+            -ExpectedManifestSha256 $ExpectedManifestSha256
+        return [pscustomobject][ordered]@{
+            bundle = $validated.bundle
+            manifestPath = $validated.manifestPath
+            manifestSha256 = $validated.manifestSha256
+            snapshot = Copy-RegistrySnapshotObject -Snapshot $validated.manifest.snapshot
+            snapshotSha256 = $validated.snapshotSha256
+        }
+    }
+
+    if ($RegistrySubKey -notmatch
+        '\ASoftware\\A4SMenuFailureRecoveryContract_[A-Fa-f0-9]{32}\z') {
+        throw 'A contract rollback binding cannot target product HostSafety.'
+    }
+    $bundleRecord = Get-CanonicalPathRecord -Path $Bundle `
+        -Description 'contract registry rollback bundle' -Kind Directory
+    $temporary = Get-CanonicalPathRecord -Path ([IO.Path]::GetTempPath()) `
+        -Description 'OS temporary directory' -Kind Directory
+    if (-not (Test-PathWithin -Path $bundleRecord.finalPath -Parent $temporary.finalPath)) {
+        throw 'A contract registry rollback bundle must remain below the OS temporary directory.'
+    }
+    Assert-PathOutsideRepository -Path $bundleRecord.finalPath `
+        -Description 'contract registry rollback bundle'
+    $manifestPath = Join-Path $bundleRecord.finalPath 'A4SRegistryRollback.json'
+    $locked = Read-LockedUtf8JsonRecord -Path $manifestPath `
+        -Description 'contract registry rollback manifest' `
+        -ExpectedSha256 $ExpectedManifestSha256
+    if (-not (Test-PathWithin -Path $locked.path -Parent $bundleRecord.finalPath)) {
+        throw 'The contract rollback manifest escaped its validated bundle.'
+    }
+    Assert-ExactPropertySet -Object $locked.value -Names @(
+        'schemaVersion', 'createdUtc', 'registrySubKey', 'snapshot',
+        'snapshotSha256') -Description 'contract registry rollback manifest'
+    if ($locked.value.schemaVersion -ne 1 -or
+        [string]$locked.value.registrySubKey -cne $RegistrySubKey) {
+        throw 'The contract rollback manifest has an unsupported schema or target.'
+    }
+    $created = [DateTime]::MinValue
+    if (-not [DateTime]::TryParse([string]$locked.value.createdUtc,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind, [ref]$created) -or
+        $created.Kind -ne [DateTimeKind]::Utc) {
+        throw 'The contract rollback manifest timestamp is not explicitly UTC.'
+    }
+    $aggregate = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $locked.value.snapshot
+    if ([string]$locked.value.snapshotSha256 -notmatch '\A[A-Fa-f0-9]{64}\z' -or
+        [string]$locked.value.snapshotSha256 -cne $aggregate.sha256) {
+        throw 'The contract rollback manifest snapshot hash is invalid.'
+    }
+    return [pscustomobject][ordered]@{
+        bundle = $bundleRecord.finalPath
+        manifestPath = $locked.path
+        manifestSha256 = $locked.sha256
+        snapshot = Copy-RegistrySnapshotObject -Snapshot $locked.value.snapshot
+        snapshotSha256 = $aggregate.sha256
+    }
+}
+
+function Assert-A4SRegistryTransactionDescriptorObject {
+    param(
+        [Parameter(Mandatory)][object] $Descriptor,
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][object] $RollbackBinding
+    )
+
+    Assert-ExactPropertySet -Object $Descriptor -Names @(
+        'schemaVersion', 'transactionId', 'createdUtc', 'updatedUtc',
+        'targetIdentifier', 'targetKind', 'rollbackBundle',
+        'rollbackManifestSha256', 'rollbackSnapshot', 'rollbackSha256',
+        'originalDesiredSnapshot', 'originalDesiredSha256', 'desiredSnapshot',
+        'desiredSha256', 'expectedSnapshot', 'expectedSha256', 'recoveryIntent',
+        'phase', 'step', 'authorizedBeforeSnapshot', 'authorizedBeforeSha256',
+        'authorizedAfterSnapshot', 'authorizedAfterSha256') `
+        -Description 'registry transaction descriptor'
+    $transactionId = [Guid]::Empty
+    if ($Descriptor.schemaVersion -ne 1 -or
+        -not [Guid]::TryParseExact([string]$Descriptor.transactionId, 'N',
+            [ref]$transactionId) -or
+        [string]$Descriptor.targetIdentifier -cne $RegistrySubKey -or
+        [string]$Descriptor.targetKind -cne $TargetKind) {
+        throw 'The registry transaction descriptor has an unsupported schema, ID, or target.'
+    }
+    foreach ($property in @('createdUtc', 'updatedUtc')) {
+        $timestamp = [DateTime]::MinValue
+        if (-not [DateTime]::TryParse([string]$Descriptor.$property,
+            [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$timestamp) -or
+            $timestamp.Kind -ne [DateTimeKind]::Utc) {
+            throw "The registry transaction descriptor $property is not explicitly UTC."
+        }
+    }
+    if (-not (Test-A4SPathEqual -First ([string]$Descriptor.rollbackBundle) `
+        -Second ([string]$RollbackBinding.bundle)) -or
+        [string]$Descriptor.rollbackManifestSha256 -cne
+            [string]$RollbackBinding.manifestSha256) {
+        throw 'The registry transaction descriptor is not bound to its locked rollback manifest.'
+    }
+    foreach ($pair in @(
+        @('rollbackSnapshot', 'rollbackSha256'),
+        @('originalDesiredSnapshot', 'originalDesiredSha256'),
+        @('desiredSnapshot', 'desiredSha256'),
+        @('expectedSnapshot', 'expectedSha256'))) {
+        $aggregate = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+            -Snapshot $Descriptor.($pair[0])
+        if ([string]$Descriptor.($pair[1]) -notmatch '\A[A-Fa-f0-9]{64}\z' -or
+            [string]$Descriptor.($pair[1]) -cne $aggregate.sha256) {
+            throw "The registry transaction descriptor $($pair[1]) is invalid."
+        }
+    }
+    if ([string]$Descriptor.rollbackSha256 -cne
+        [string]$RollbackBinding.snapshotSha256 -or
+        -not (Compare-HostSafetySnapshot -Expected $Descriptor.rollbackSnapshot `
+            -Actual $RollbackBinding.snapshot)) {
+        throw 'The descriptor rollback aggregate differs from its locked manifest.'
+    }
+    if ([string]$Descriptor.recoveryIntent -notin @(
+        'apply-desired', 'resume-desired', 'rollback-immediate') -or
+        [string]$Descriptor.phase -notin @(
+        'prepared', 'recovery-prepared', 'before-primitive', 'after-primitive',
+        'before-rollback', 'after-rollback', 'committed', 'rolled-back') -or
+        [int]$Descriptor.step -lt 0) {
+        throw 'The registry transaction descriptor has an unsupported intent, phase, or step.'
+    }
+    $authorizationNull = $null -eq $Descriptor.authorizedBeforeSnapshot -and
+        $null -eq $Descriptor.authorizedBeforeSha256 -and
+        $null -eq $Descriptor.authorizedAfterSnapshot -and
+        $null -eq $Descriptor.authorizedAfterSha256
+    if (-not $authorizationNull) {
+        if ($null -eq $Descriptor.authorizedBeforeSnapshot -or
+            $null -eq $Descriptor.authorizedAfterSnapshot) {
+            throw 'The descriptor contains a partial primitive authorization.'
+        }
+        foreach ($pair in @(
+            @('authorizedBeforeSnapshot', 'authorizedBeforeSha256'),
+            @('authorizedAfterSnapshot', 'authorizedAfterSha256'))) {
+            $aggregate = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+                -Snapshot $Descriptor.($pair[0])
+            if ([string]$Descriptor.($pair[1]) -cne $aggregate.sha256) {
+                throw "The registry transaction descriptor $($pair[1]) is invalid."
+            }
+        }
+    }
+    return $true
+}
+
+function Read-A4SRegistryTransactionDescriptor {
+    [CmdletBinding(DefaultParameterSetName='Capture')]
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][string] $RollbackBundle,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $RollbackManifestSha256,
+        [Parameter(Mandatory, ParameterSetName='Expected')]
+        [ValidatePattern('\A[A-Fa-f0-9]{64}\z')][string] $ExpectedDescriptorSha256,
+        [Parameter(Mandatory, ParameterSetName='Capture')][switch] $CaptureSha256
+    )
+
+    $rollback = Read-A4SRegistryRollbackBinding -RegistrySubKey $RegistrySubKey `
+        -TargetKind $TargetKind -Bundle $RollbackBundle `
+        -ExpectedManifestSha256 $RollbackManifestSha256
+    $requestedDescriptor = [IO.Path]::GetFullPath($Path)
+    $descriptorParent = Get-CanonicalPathRecord `
+        -Path (Split-Path -Parent $requestedDescriptor) `
+        -Description 'registry transaction descriptor parent' -Kind Directory
+    $expectedName = if ($TargetKind -ceq 'product') {
+        'HostSafetyTransaction.json'
+    } else { 'A4SRegistryTransaction.json' }
+    if (-not (Test-A4SPathEqual -First $descriptorParent.finalPath `
+        -Second $rollback.bundle) -or
+        [IO.Path]::GetFileName($requestedDescriptor) -cne $expectedName) {
+        throw 'The transaction descriptor is not the exact direct child of its rollback bundle.'
+    }
+    $locked = if ($PSCmdlet.ParameterSetName -ceq 'Expected') {
+        Read-LockedUtf8JsonRecord -Path $Path `
+            -Description 'registry transaction descriptor' `
+            -ExpectedSha256 $ExpectedDescriptorSha256
+    } else {
+        $raw = Read-LockedFileBytesRecord -Path $Path `
+            -Description 'registry transaction descriptor' -CaptureSha256 `
+            -MaximumBytes 1048576
+        $offset = if ($raw.bytes.Length -ge 3 -and $raw.bytes[0] -eq 0xEF -and
+            $raw.bytes[1] -eq 0xBB -and $raw.bytes[2] -eq 0xBF) { 3 } else { 0 }
+        try {
+            $text = [Text.UTF8Encoding]::new($false, $true).GetString(
+                $raw.bytes, $offset, $raw.bytes.Length - $offset)
+            $value = $text | ConvertFrom-Json -ErrorAction Stop
+        }
+        catch { throw "Registry transaction descriptor is invalid UTF-8 JSON: $($_.Exception.Message)" }
+        $raw | Add-Member -NotePropertyName value -NotePropertyValue $value
+        $raw
+    }
+    if (-not (Test-PathWithin -Path $locked.path -Parent $rollback.bundle) -or
+        -not (Test-A4SPathEqual -First (Split-Path -Parent $locked.path) `
+            -Second $rollback.bundle)) {
+        throw 'The registry transaction descriptor escaped its rollback bundle.'
+    }
+    [void](Assert-A4SRegistryTransactionDescriptorObject -Descriptor $locked.value `
+        -RegistrySubKey $RegistrySubKey -TargetKind $TargetKind `
+        -RollbackBinding $rollback)
+    return [pscustomobject][ordered]@{
+        path = $locked.path
+        pathIdentity = $locked.pathIdentity
+        sha256 = $locked.sha256
+        value = $locked.value
+        rollback = $rollback
+    }
+}
+
+function New-A4SRegistryTransactionDescriptor {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][object] $Desired,
+        [Parameter(Mandatory)][object] $Expected,
+        [Parameter(Mandatory)][object] $RollbackBinding
+    )
+
+    $rollbackAggregate = [pscustomobject]@{
+        snapshot=$RollbackBinding.snapshot
+        sha256=$RollbackBinding.snapshotSha256
+    }
+    if (-not (Test-RegistryAggregateEqual -First $Expected `
+        -Second $rollbackAggregate)) {
+        throw 'The transaction expected aggregate differs from its locked immediate rollback manifest.'
+    }
+    $fullDescriptorPath = [IO.Path]::GetFullPath($Path)
+    $descriptorParent = Get-CanonicalPathRecord `
+        -Path (Split-Path -Parent $fullDescriptorPath) `
+        -Description 'new registry transaction descriptor parent' -Kind Directory
+    $expectedName = if ($TargetKind -ceq 'product') {
+        'HostSafetyTransaction.json'
+    } else { 'A4SRegistryTransaction.json' }
+    if (-not (Test-A4SPathEqual -First $descriptorParent.finalPath `
+        -Second $RollbackBinding.bundle) -or
+        [IO.Path]::GetFileName($fullDescriptorPath) -cne $expectedName) {
+        throw 'A new transaction descriptor must be the exact direct child of its locked rollback bundle.'
+    }
+    $now = Get-UtcText
+    $descriptor = [ordered]@{
+        schemaVersion = 1
+        transactionId = [Guid]::NewGuid().ToString('N')
+        createdUtc = $now
+        updatedUtc = $now
+        targetIdentifier = $RegistrySubKey
+        targetKind = $TargetKind
+        rollbackBundle = $RollbackBinding.bundle
+        rollbackManifestSha256 = $RollbackBinding.manifestSha256
+        rollbackSnapshot = Copy-RegistrySnapshotObject -Snapshot $RollbackBinding.snapshot
+        rollbackSha256 = $RollbackBinding.snapshotSha256
+        originalDesiredSnapshot = Copy-RegistrySnapshotObject -Snapshot $Desired.snapshot
+        originalDesiredSha256 = $Desired.sha256
+        desiredSnapshot = Copy-RegistrySnapshotObject -Snapshot $Desired.snapshot
+        desiredSha256 = $Desired.sha256
+        expectedSnapshot = Copy-RegistrySnapshotObject -Snapshot $Expected.snapshot
+        expectedSha256 = $Expected.sha256
+        recoveryIntent = 'apply-desired'
+        phase = 'prepared'
+        step = 0
+        authorizedBeforeSnapshot = $null
+        authorizedBeforeSha256 = $null
+        authorizedAfterSnapshot = $null
+        authorizedAfterSha256 = $null
+    }
+    Write-DurableNewText -Path $fullDescriptorPath `
+        -Text ($descriptor | ConvertTo-Json -Depth 32)
+    return Read-A4SRegistryTransactionDescriptor -Path $fullDescriptorPath `
+        -RegistrySubKey $RegistrySubKey -TargetKind $TargetKind `
+        -RollbackBundle $RollbackBinding.bundle `
+        -RollbackManifestSha256 $RollbackBinding.manifestSha256 -CaptureSha256
+}
+
+function Set-A4SRegistryTransactionDescriptor {
+    param(
+        [Parameter(Mandatory)][object] $Record,
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][hashtable] $Changes
+    )
+
+    $current = Read-A4SRegistryTransactionDescriptor -Path $Record.path `
+        -RegistrySubKey $RegistrySubKey -TargetKind $TargetKind `
+        -RollbackBundle $Record.rollback.bundle `
+        -RollbackManifestSha256 $Record.rollback.manifestSha256 `
+        -ExpectedDescriptorSha256 $Record.sha256
+    $next = $current.value | ConvertTo-Json -Depth 32 | ConvertFrom-Json
+    foreach ($name in $Changes.Keys) {
+        if ($name -notin @($next.PSObject.Properties.Name)) {
+            throw "A descriptor update tried to add unsupported property '$name'."
+        }
+        $next.$name = $Changes[$name]
+    }
+    $next.updatedUtc = Get-UtcText
+    [void](Assert-A4SRegistryTransactionDescriptorObject -Descriptor $next `
+        -RegistrySubKey $RegistrySubKey -TargetKind $TargetKind `
+        -RollbackBinding $current.rollback)
+    Write-DurableText -Path $current.path -Text ($next | ConvertTo-Json -Depth 32)
+    return Read-A4SRegistryTransactionDescriptor -Path $current.path `
+        -RegistrySubKey $RegistrySubKey -TargetKind $TargetKind `
+        -RollbackBundle $current.rollback.bundle `
+        -RollbackManifestSha256 $current.rollback.manifestSha256 -CaptureSha256
+}
+
+function Throw-A4SSimulatedHardInterruption {
+    param(
+        [Parameter(Mandatory)][string] $ConfiguredPhase,
+        [Parameter(Mandatory)][string] $CurrentPhase
+    )
+    if ($ConfiguredPhase -ceq $CurrentPhase) {
+        throw "A4S_SIMULATED_HARD_INTERRUPTION:$CurrentPhase"
+    }
+}
+
 function Assert-A4SRegistryTransactionTarget {
     param(
         [Parameter(Mandatory)][string] $RegistrySubKey,
@@ -1785,11 +2291,20 @@ function Assert-A4SRegistryTransactionTarget {
 function Invoke-A4SRegistryPrimitive {
     param(
         [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][object] $MutationContext,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{32}\z')]
+        [string] $ContextNonce,
         [Parameter(Mandatory)][ValidateSet('CreateKey', 'DeleteKey', 'SetValue', 'DeleteValue')]
         [string] $Operation,
         [object] $ValueRecord
     )
 
+    if ([StringComparer]::Ordinal.Equals($RegistrySubKey, $hostSafetySubKey)) {
+        [void](Assert-A4SProductMutationMode -Label 'HostSafety registry primitive')
+    }
+    [A4SFailureRecoveryNative]::ValidateMutationContext($MutationContext,
+        $RegistrySubKey, $ContextNonce,
+        [StringComparer]::Ordinal.Equals($RegistrySubKey, $hostSafetySubKey))
     $separator = $RegistrySubKey.LastIndexOf('\')
     if ($separator -le 0 -or $separator -ge $RegistrySubKey.Length - 1) {
         throw "Registry transaction target is not an exact child key: $RegistrySubKey"
@@ -1880,6 +2395,12 @@ function Invoke-A4SRegistryPrimitive {
 function Invoke-A4SRegistryJournaledStep {
     param(
         [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][object] $MutationContext,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{32}\z')]
+        [string] $ContextNonce,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][ref] $DescriptorRecord,
         [Parameter(Mandatory)][ref] $CurrentAggregate,
         [Parameter(Mandatory)][object] $AfterSnapshot,
         [Parameter(Mandatory)][ValidateSet('CreateKey', 'DeleteKey', 'SetValue', 'DeleteValue')]
@@ -1891,11 +2412,14 @@ function Invoke-A4SRegistryJournaledStep {
         [Parameter(Mandatory)][AllowEmptyCollection()][Collections.ArrayList] $Journal,
         [Parameter(Mandatory)][ref] $StepNumber,
         [Parameter(Mandatory)][scriptblock] $ValidateBoundary,
-        [int] $InjectFailureAfterStep = 0
+        [int] $InjectFailureAfterStep = 0,
+        [string] $InjectHardInterruptionPhase = 'none'
     )
 
     $StepNumber.Value = [int]$StepNumber.Value + 1
     $step = [int]$StepNumber.Value
+    [A4SFailureRecoveryNative]::ValidateMutationContext($MutationContext,
+        $RegistrySubKey, $ContextNonce, $TargetKind -ceq 'product')
     [void](& $ValidateBoundary "registry mutation step $step preflight")
     $before = $CurrentAggregate.Value
     $observedBefore = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
@@ -1914,18 +2438,41 @@ function Invoke-A4SRegistryJournaledStep {
         before = $before
         after = $after
     }
+    $DescriptorRecord.Value = Set-A4SRegistryTransactionDescriptor `
+        -Record $DescriptorRecord.Value -RegistrySubKey $RegistrySubKey `
+        -TargetKind $TargetKind -Changes @{
+            phase='before-primitive'; step=$step
+            authorizedBeforeSnapshot=(Copy-RegistrySnapshotObject -Snapshot $before.snapshot)
+            authorizedBeforeSha256=$before.sha256
+            authorizedAfterSnapshot=(Copy-RegistrySnapshotObject -Snapshot $after.snapshot)
+            authorizedAfterSha256=$after.sha256
+        }
+    Throw-A4SSimulatedHardInterruption `
+        -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'before-primitive'
     $journaled = $false
     try {
         Invoke-A4SRegistryPrimitive -RegistrySubKey $RegistrySubKey `
+            -MutationContext $MutationContext -ContextNonce $ContextNonce `
             -Operation $Operation -ValueRecord $ValueRecord
         [void](& $ValidateBoundary "registry mutation step $step postflight")
         $observedAfter = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
         if (-not (Test-RegistryAggregateEqual -First $after -Second $observedAfter)) {
             throw "A4S_UNKNOWN_REGISTRY_STATE: step $step produced an unplanned aggregate."
         }
+        $DescriptorRecord.Value = Set-A4SRegistryTransactionDescriptor `
+            -Record $DescriptorRecord.Value -RegistrySubKey $RegistrySubKey `
+            -TargetKind $TargetKind -Changes @{
+                phase='after-primitive'; step=$step
+                authorizedBeforeSnapshot=(Copy-RegistrySnapshotObject -Snapshot $before.snapshot)
+                authorizedBeforeSha256=$before.sha256
+                authorizedAfterSnapshot=(Copy-RegistrySnapshotObject -Snapshot $after.snapshot)
+                authorizedAfterSha256=$after.sha256
+            }
         [void]$Journal.Add($entry)
         $journaled = $true
         $CurrentAggregate.Value = $observedAfter
+        Throw-A4SSimulatedHardInterruption `
+            -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'after-primitive'
         if ($InjectFailureAfterStep -eq $step) {
             throw "A4S_INJECTED_REGISTRY_FAILURE: after mutation step $step"
         }
@@ -1951,20 +2498,41 @@ function Invoke-A4SRegistryJournaledStep {
 function Undo-A4SRegistryJournal {
     param(
         [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][object] $MutationContext,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{32}\z')]
+        [string] $ContextNonce,
+        [Parameter(Mandatory)][ValidateSet('product', 'contract-sandbox')]
+        [string] $TargetKind,
+        [Parameter(Mandatory)][ref] $DescriptorRecord,
         [Parameter(Mandatory)][AllowEmptyCollection()][Collections.ArrayList] $Journal,
-        [Parameter(Mandatory)][scriptblock] $ValidateBoundary
+        [Parameter(Mandatory)][scriptblock] $ValidateBoundary,
+        [string] $InjectHardInterruptionPhase = 'none'
     )
 
     for ($index = $Journal.Count - 1; $index -ge 0; $index--) {
         $entry = $Journal[$index]
+        [A4SFailureRecoveryNative]::ValidateMutationContext($MutationContext,
+            $RegistrySubKey, $ContextNonce, $TargetKind -ceq 'product')
         [void](& $ValidateBoundary "registry rollback step $($entry.step) preflight")
         $current = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
         if (-not (Test-RegistryAggregateEqual -First $entry.after -Second $current)) {
             throw "A4S_UNKNOWN_REGISTRY_STATE: rollback step $($entry.step) would overwrite an intervening aggregate."
         }
+        $DescriptorRecord.Value = Set-A4SRegistryTransactionDescriptor `
+            -Record $DescriptorRecord.Value -RegistrySubKey $RegistrySubKey `
+            -TargetKind $TargetKind -Changes @{
+                phase='before-rollback'; step=[int]$entry.step
+                authorizedBeforeSnapshot=(Copy-RegistrySnapshotObject -Snapshot $entry.after.snapshot)
+                authorizedBeforeSha256=$entry.after.sha256
+                authorizedAfterSnapshot=(Copy-RegistrySnapshotObject -Snapshot $entry.before.snapshot)
+                authorizedAfterSha256=$entry.before.sha256
+            }
+        Throw-A4SSimulatedHardInterruption `
+            -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'before-rollback'
         $inverseError = $null
         try {
             Invoke-A4SRegistryPrimitive -RegistrySubKey $RegistrySubKey `
+                -MutationContext $MutationContext -ContextNonce $ContextNonce `
                 -Operation $entry.inverseOperation -ValueRecord $entry.inverseValueRecord
         }
         catch { $inverseError = $_ }
@@ -1972,10 +2540,31 @@ function Undo-A4SRegistryJournal {
         $restored = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
         if (-not (Test-RegistryAggregateEqual -First $entry.before -Second $restored)) {
             $detail = if ($inverseError) { $inverseError.Exception.Message } else { 'no primitive error' }
-            throw "Registry rollback step $($entry.step) did not restore its exact before aggregate ($detail)."
+                throw "Registry rollback step $($entry.step) did not restore its exact before aggregate ($detail)."
         }
+        $DescriptorRecord.Value = Set-A4SRegistryTransactionDescriptor `
+            -Record $DescriptorRecord.Value -RegistrySubKey $RegistrySubKey `
+            -TargetKind $TargetKind -Changes @{
+                phase='after-rollback'; step=[int]$entry.step
+                authorizedBeforeSnapshot=(Copy-RegistrySnapshotObject -Snapshot $entry.after.snapshot)
+                authorizedBeforeSha256=$entry.after.sha256
+                authorizedAfterSnapshot=(Copy-RegistrySnapshotObject -Snapshot $entry.before.snapshot)
+                authorizedAfterSha256=$entry.before.sha256
+            }
+        Throw-A4SSimulatedHardInterruption `
+            -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'after-rollback'
     }
-    return Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+    $final = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+    $DescriptorRecord.Value = Set-A4SRegistryTransactionDescriptor `
+        -Record $DescriptorRecord.Value -RegistrySubKey $RegistrySubKey `
+        -TargetKind $TargetKind -Changes @{
+            phase='rolled-back'; step=0
+            authorizedBeforeSnapshot=$null; authorizedBeforeSha256=$null
+            authorizedAfterSnapshot=$null; authorizedAfterSha256=$null
+        }
+    Throw-A4SSimulatedHardInterruption `
+        -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'rolled-back'
+    return $final
 }
 
 function Invoke-A4SRegistrySnapshotTransaction {
@@ -1986,12 +2575,20 @@ function Invoke-A4SRegistrySnapshotTransaction {
         [object] $ProductBoundary,
         [scriptblock] $ValidateBoundary,
         [switch] $ContractRegistrySandbox,
-        [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0
+        [string] $TransactionDescriptorPath,
+        [string] $RollbackBundle,
+        [ValidatePattern('\A[A-Fa-f0-9]{64}\z')][string] $RollbackManifestSha256,
+        [object] $ExistingDescriptorRecord,
+        [ValidateRange(0, 1024)][int] $InjectFailureAfterStep = 0,
+        [ValidateSet('none', 'prepared', 'before-primitive', 'after-primitive',
+            'committed', 'before-rollback', 'after-rollback', 'rolled-back')]
+        [string] $InjectHardInterruptionPhase = 'none'
     )
 
     $targetKind = Assert-A4SRegistryTransactionTarget -RegistrySubKey $RegistrySubKey `
         -ContractRegistrySandbox:$ContractRegistrySandbox
     if ($targetKind -ceq 'product') {
+        [void](Assert-A4SProductMutationMode -Label 'HostSafety registry transaction')
         if ($null -eq $ProductBoundary -or $null -ne $ValidateBoundary) {
             throw 'A product transaction requires the real product boundary object and forbids a caller-supplied validator.'
         }
@@ -2019,8 +2616,55 @@ function Invoke-A4SRegistrySnapshotTransaction {
         return [pscustomobject][ordered]@{
             snapshot=$initial.snapshot; snapshotSha256=$initial.sha256
             mutationStepCount=0; journalEntryCount=0; transaction='committed'
+            transactionDescriptorPath=$null
+            transactionDescriptorSha256=$null
         }
     }
+
+    if ([string]::IsNullOrWhiteSpace($TransactionDescriptorPath) -or
+        [string]::IsNullOrWhiteSpace($RollbackBundle) -or
+        $RollbackManifestSha256 -notmatch '\A[A-Fa-f0-9]{64}\z') {
+        throw 'Every mutating registry transaction requires a durable descriptor path and a locked rollback-manifest binding.'
+    }
+    $rollbackBinding = Read-A4SRegistryRollbackBinding `
+        -RegistrySubKey $RegistrySubKey -TargetKind $targetKind `
+        -Bundle $RollbackBundle -ExpectedManifestSha256 $RollbackManifestSha256
+    $nonce = [Guid]::NewGuid().ToString('N')
+    $mutationContext = if ($targetKind -ceq 'product') {
+        [A4SFailureRecoveryNative]::CreateProductMutationContext(
+            $ProductBoundary, $RegistrySubKey, $nonce)
+    }
+    else {
+        [A4SFailureRecoveryNative]::CreateContractMutationContext(
+            $RegistrySubKey, $nonce)
+    }
+    [A4SFailureRecoveryNative]::ValidateMutationContext($mutationContext,
+        $RegistrySubKey, $nonce, $targetKind -ceq 'product')
+
+    $descriptor = if ($null -eq $ExistingDescriptorRecord) {
+        New-A4SRegistryTransactionDescriptor -Path $TransactionDescriptorPath `
+            -RegistrySubKey $RegistrySubKey -TargetKind $targetKind `
+            -Desired $desired -Expected $initial -RollbackBinding $rollbackBinding
+    }
+    else {
+        $existing = Read-A4SRegistryTransactionDescriptor `
+            -Path $TransactionDescriptorPath -RegistrySubKey $RegistrySubKey `
+            -TargetKind $targetKind -RollbackBundle $RollbackBundle `
+            -RollbackManifestSha256 $RollbackManifestSha256 `
+            -ExpectedDescriptorSha256 $ExistingDescriptorRecord.sha256
+        $descriptorExpected = Get-RegistryAggregateRecord `
+            -RegistrySubKey $RegistrySubKey -Snapshot $existing.value.expectedSnapshot
+        $descriptorDesired = Get-RegistryAggregateRecord `
+            -RegistrySubKey $RegistrySubKey -Snapshot $existing.value.desiredSnapshot
+        if (-not (Test-RegistryAggregateEqual -First $initial -Second $descriptorExpected) -or
+            -not (Test-RegistryAggregateEqual -First $desired -Second $descriptorDesired) -or
+            [string]$existing.value.phase -cne 'recovery-prepared') {
+            throw 'The existing recovery descriptor does not authorize this exact expected-to-desired transaction.'
+        }
+        $existing
+    }
+    Throw-A4SSimulatedHardInterruption `
+        -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'prepared'
 
     $journal = [Collections.ArrayList]::new()
     $current = $initial
@@ -2033,63 +2677,92 @@ function Invoke-A4SRegistrySnapshotTransaction {
                     [string]$_.name, [string]$value.name)
             })
             [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                -MutationContext $mutationContext -ContextNonce $nonce `
+                -TargetKind $targetKind -DescriptorRecord ([ref]$descriptor) `
                 -CurrentAggregate ([ref]$current) -AfterSnapshot $afterSnapshot `
                 -Operation DeleteValue -ValueRecord $value `
                 -InverseOperation SetValue -InverseValueRecord $value `
                 -Journal $journal -StepNumber ([ref]$step) `
                 -ValidateBoundary $effectiveBoundaryValidator `
-                -InjectFailureAfterStep $InjectFailureAfterStep)
+                -InjectFailureAfterStep $InjectFailureAfterStep `
+                -InjectHardInterruptionPhase $InjectHardInterruptionPhase)
         }
         if ([bool]$current.snapshot.exists -and -not [bool]$DesiredSnapshot.exists) {
             $absent = [pscustomobject][ordered]@{ exists=$false; values=@(); subkeys=@() }
             [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                -MutationContext $mutationContext -ContextNonce $nonce `
+                -TargetKind $targetKind -DescriptorRecord ([ref]$descriptor) `
                 -CurrentAggregate ([ref]$current) -AfterSnapshot $absent `
                 -Operation DeleteKey -InverseOperation CreateKey `
                 -Journal $journal -StepNumber ([ref]$step) `
                 -ValidateBoundary $effectiveBoundaryValidator `
-                -InjectFailureAfterStep $InjectFailureAfterStep)
+                -InjectFailureAfterStep $InjectFailureAfterStep `
+                -InjectHardInterruptionPhase $InjectHardInterruptionPhase)
         }
         elseif ([bool]$DesiredSnapshot.exists) {
             if (-not [bool]$current.snapshot.exists) {
                 $empty = [pscustomobject][ordered]@{ exists=$true; values=@(); subkeys=@() }
                 [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                    -MutationContext $mutationContext -ContextNonce $nonce `
+                    -TargetKind $targetKind -DescriptorRecord ([ref]$descriptor) `
                     -CurrentAggregate ([ref]$current) -AfterSnapshot $empty `
                     -Operation CreateKey -InverseOperation DeleteKey `
                     -Journal $journal -StepNumber ([ref]$step) `
                     -ValidateBoundary $effectiveBoundaryValidator `
-                    -InjectFailureAfterStep $InjectFailureAfterStep)
+                    -InjectFailureAfterStep $InjectFailureAfterStep `
+                    -InjectHardInterruptionPhase $InjectHardInterruptionPhase)
             }
             foreach ($value in @($DesiredSnapshot.values)) {
                 $afterSnapshot = Copy-RegistrySnapshotObject -Snapshot $current.snapshot
                 $afterSnapshot.values = @($afterSnapshot.values) + @(
                     Copy-RegistrySnapshotObject -Snapshot $value)
                 [void](Invoke-A4SRegistryJournaledStep -RegistrySubKey $RegistrySubKey `
+                    -MutationContext $mutationContext -ContextNonce $nonce `
+                    -TargetKind $targetKind -DescriptorRecord ([ref]$descriptor) `
                     -CurrentAggregate ([ref]$current) -AfterSnapshot $afterSnapshot `
                     -Operation SetValue -ValueRecord $value `
                     -InverseOperation DeleteValue -InverseValueRecord $value `
                     -Journal $journal -StepNumber ([ref]$step) `
                     -ValidateBoundary $effectiveBoundaryValidator `
-                    -InjectFailureAfterStep $InjectFailureAfterStep)
+                    -InjectFailureAfterStep $InjectFailureAfterStep `
+                    -InjectHardInterruptionPhase $InjectHardInterruptionPhase)
             }
         }
         $final = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
         if (-not (Test-RegistryAggregateEqual -First $desired -Second $final)) {
             throw 'A4S_UNKNOWN_REGISTRY_STATE: transaction final aggregate differs from the desired snapshot.'
         }
+        $descriptor = Set-A4SRegistryTransactionDescriptor -Record $descriptor `
+            -RegistrySubKey $RegistrySubKey -TargetKind $targetKind -Changes @{
+                phase='committed'; step=$step
+                authorizedBeforeSnapshot=$null; authorizedBeforeSha256=$null
+                authorizedAfterSnapshot=$null; authorizedAfterSha256=$null
+            }
+        Throw-A4SSimulatedHardInterruption `
+            -ConfiguredPhase $InjectHardInterruptionPhase -CurrentPhase 'committed'
         return [pscustomobject][ordered]@{
             snapshot=$final.snapshot; snapshotSha256=$final.sha256
             mutationStepCount=$step; journalEntryCount=$journal.Count; transaction='committed'
+            transactionDescriptorPath=$descriptor.path
+            transactionDescriptorSha256=$descriptor.sha256
         }
     }
     catch {
         $primary = $_
+        if ($primary.Exception.Message.StartsWith('A4S_SIMULATED_HARD_INTERRUPTION:',
+            [StringComparison]::Ordinal)) {
+            throw $primary
+        }
         if ($primary.Exception.Message.StartsWith('A4S_UNKNOWN_REGISTRY_STATE:',
             [StringComparison]::Ordinal)) {
             throw $primary
         }
         try {
             $rolledBack = Undo-A4SRegistryJournal -RegistrySubKey $RegistrySubKey `
-                -Journal $journal -ValidateBoundary $effectiveBoundaryValidator
+                -MutationContext $mutationContext -ContextNonce $nonce `
+                -TargetKind $targetKind -DescriptorRecord ([ref]$descriptor) `
+                -Journal $journal -ValidateBoundary $effectiveBoundaryValidator `
+                -InjectHardInterruptionPhase $InjectHardInterruptionPhase
         }
         catch {
             throw "Registry transaction failed ('$($primary.Exception.Message)') and deterministic journal rollback failed ('$($_.Exception.Message)')."
@@ -2099,6 +2772,210 @@ function Invoke-A4SRegistrySnapshotTransaction {
         }
         throw "Registry transaction failed and journal rollback restored the exact immediate prestate: $($primary.Exception.Message)"
     }
+}
+
+function Invoke-A4SRegistryTransactionRecovery {
+    param(
+        [Parameter(Mandatory)][string] $RegistrySubKey,
+        [Parameter(Mandatory)][string] $TransactionDescriptorPath,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $ExpectedTransactionDescriptorSha256,
+        [Parameter(Mandatory)][string] $RollbackBundle,
+        [Parameter(Mandatory)][ValidatePattern('\A[A-Fa-f0-9]{64}\z')]
+        [string] $RollbackManifestSha256,
+        [object] $ProductBoundary,
+        [scriptblock] $ValidateBoundary,
+        [switch] $ContractRegistrySandbox,
+        [ValidateSet('none', 'prepared', 'before-primitive', 'after-primitive',
+            'committed', 'before-rollback', 'after-rollback', 'rolled-back')]
+        [string] $InjectHardInterruptionPhase = 'none'
+    )
+
+    $targetKind = Assert-A4SRegistryTransactionTarget -RegistrySubKey $RegistrySubKey `
+        -ContractRegistrySandbox:$ContractRegistrySandbox
+    if ($targetKind -ceq 'product') {
+        [void](Assert-A4SProductMutationMode -Label 'HostSafety transaction recovery')
+        if ($null -eq $ProductBoundary -or $null -ne $ValidateBoundary) {
+            throw 'Product transaction recovery requires the real product boundary and forbids a caller validator.'
+        }
+        $effectiveBoundaryValidator = {
+            param([string] $Label)
+            Assert-A4SProductMutationBoundary -Boundary $ProductBoundary -Label $Label
+        }.GetNewClosure()
+    }
+    else {
+        if ($null -ne $ProductBoundary -or $null -eq $ValidateBoundary) {
+            throw 'Contract transaction recovery requires only its explicit sandbox validator.'
+        }
+        $effectiveBoundaryValidator = $ValidateBoundary
+    }
+    [void](& $effectiveBoundaryValidator 'registry recovery descriptor discovery')
+    $descriptor = Read-A4SRegistryTransactionDescriptor `
+        -Path $TransactionDescriptorPath -RegistrySubKey $RegistrySubKey `
+        -TargetKind $targetKind -RollbackBundle $RollbackBundle `
+        -RollbackManifestSha256 $RollbackManifestSha256 `
+        -ExpectedDescriptorSha256 $ExpectedTransactionDescriptorSha256
+    $current = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey
+    $expected = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $descriptor.value.expectedSnapshot
+    $desired = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $descriptor.value.desiredSnapshot
+    $originalDesired = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $descriptor.value.originalDesiredSnapshot
+    $rollback = Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+        -Snapshot $descriptor.value.rollbackSnapshot
+    $phase = [string]$descriptor.value.phase
+    $intent = [string]$descriptor.value.recoveryIntent
+
+    if ($phase -ceq 'committed') {
+        if (-not (Test-RegistryAggregateEqual -First $desired -Second $current)) {
+            throw 'A4S_UNKNOWN_REGISTRY_STATE: committed descriptor does not match current state.'
+        }
+        return [pscustomobject][ordered]@{
+            snapshot=$current.snapshot; snapshotSha256=$current.sha256
+            mutationStepCount=0; journalEntryCount=0; transaction='committed'
+            recoveryDisposition='already-committed'
+        }
+    }
+    if ($phase -ceq 'rolled-back') {
+        if (-not (Test-RegistryAggregateEqual -First $rollback -Second $current)) {
+            throw 'A4S_UNKNOWN_REGISTRY_STATE: rolled-back descriptor does not match its locked immediate prestate.'
+        }
+        return [pscustomobject][ordered]@{
+            snapshot=$current.snapshot; snapshotSha256=$current.sha256
+            mutationStepCount=0; journalEntryCount=0; transaction='rolled-back'
+            recoveryDisposition='already-rolled-back'
+        }
+    }
+
+    $allowed = @($expected)
+    if ($null -ne $descriptor.value.authorizedBeforeSnapshot) {
+        $allowed += Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+            -Snapshot $descriptor.value.authorizedBeforeSnapshot
+        $allowed += Get-RegistryAggregateRecord -RegistrySubKey $RegistrySubKey `
+            -Snapshot $descriptor.value.authorizedAfterSnapshot
+    }
+    if (@($allowed | Where-Object {
+            Test-RegistryAggregateEqual -First $_ -Second $current
+        }).Count -eq 0) {
+        throw 'A4S_UNKNOWN_REGISTRY_STATE: recovery state is outside every descriptor-authorized aggregate.'
+    }
+
+    if ($phase -ceq 'prepared') {
+        $goal = $originalDesired
+        $nextIntent = 'resume-desired'
+    }
+    elseif ($phase -ceq 'recovery-prepared' -or $intent -in @(
+        'resume-desired', 'rollback-immediate')) {
+        $goal = $desired
+        $nextIntent = $intent
+    }
+    else {
+        # An interrupted initial apply never guesses how far it progressed:
+        # exact-CAS it back to the manifest-bound immediate prestate.
+        $goal = $rollback
+        $nextIntent = 'rollback-immediate'
+    }
+    [void](& $effectiveBoundaryValidator 'registry recovery exact CAS')
+    if (Test-RegistryAggregateEqual -First $goal -Second $current) {
+        $terminal = if ($nextIntent -ceq 'rollback-immediate') {
+            'rolled-back'
+        } else { 'committed' }
+        $descriptor = Set-A4SRegistryTransactionDescriptor -Record $descriptor `
+            -RegistrySubKey $RegistrySubKey -TargetKind $targetKind -Changes @{
+                desiredSnapshot=(Copy-RegistrySnapshotObject -Snapshot $goal.snapshot)
+                desiredSha256=$goal.sha256
+                expectedSnapshot=(Copy-RegistrySnapshotObject -Snapshot $current.snapshot)
+                expectedSha256=$current.sha256
+                recoveryIntent=$nextIntent; phase=$terminal; step=0
+                authorizedBeforeSnapshot=$null; authorizedBeforeSha256=$null
+                authorizedAfterSnapshot=$null; authorizedAfterSha256=$null
+            }
+        return [pscustomobject][ordered]@{
+            snapshot=$current.snapshot; snapshotSha256=$current.sha256
+            mutationStepCount=0; journalEntryCount=0; transaction=$terminal
+            recoveryDisposition=$nextIntent
+            transactionDescriptorSha256=$descriptor.sha256
+        }
+    }
+    $descriptor = Set-A4SRegistryTransactionDescriptor -Record $descriptor `
+        -RegistrySubKey $RegistrySubKey -TargetKind $targetKind -Changes @{
+            desiredSnapshot=(Copy-RegistrySnapshotObject -Snapshot $goal.snapshot)
+            desiredSha256=$goal.sha256
+            expectedSnapshot=(Copy-RegistrySnapshotObject -Snapshot $current.snapshot)
+            expectedSha256=$current.sha256
+            recoveryIntent=$nextIntent; phase='recovery-prepared'; step=0
+            authorizedBeforeSnapshot=$null; authorizedBeforeSha256=$null
+            authorizedAfterSnapshot=$null; authorizedAfterSha256=$null
+        }
+    $result = Invoke-A4SRegistrySnapshotTransaction `
+        -RegistrySubKey $RegistrySubKey -DesiredSnapshot $goal.snapshot `
+        -ExpectedCurrent $current -ProductBoundary $ProductBoundary `
+        -ValidateBoundary $ValidateBoundary `
+        -ContractRegistrySandbox:$ContractRegistrySandbox `
+        -TransactionDescriptorPath $descriptor.path `
+        -RollbackBundle $descriptor.rollback.bundle `
+        -RollbackManifestSha256 $descriptor.rollback.manifestSha256 `
+        -ExistingDescriptorRecord $descriptor `
+        -InjectHardInterruptionPhase $InjectHardInterruptionPhase
+    $result | Add-Member -NotePropertyName recoveryDisposition `
+        -NotePropertyValue $nextIntent
+    return $result
+}
+
+function Read-A4SDiscoveredHostSafetyTransaction {
+    param([Parameter(Mandatory)][string] $Path)
+
+    $raw = Read-LockedFileBytesRecord -Path $Path `
+        -Description 'discovered HostSafety transaction descriptor' `
+        -CaptureSha256 -MaximumBytes 1048576
+    try {
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($raw.bytes)
+        $candidate = $text | ConvertFrom-Json -ErrorAction Stop
+    }
+    catch { throw "Discovered HostSafety descriptor is invalid UTF-8 JSON: $($_.Exception.Message)" }
+    if ([string]$candidate.targetIdentifier -cne $hostSafetySubKey -or
+        [string]$candidate.targetKind -cne 'product' -or
+        [string]$candidate.rollbackManifestSha256 -notmatch '\A[A-Fa-f0-9]{64}\z') {
+        throw 'A discovered transaction descriptor does not identify exact product HostSafety.'
+    }
+    $parent = Get-CanonicalPathRecord -Path (Split-Path -Parent $raw.path) `
+        -Description 'discovered transaction rollback directory' -Kind Directory
+    if (-not (Test-A4SPathEqual -First $parent.finalPath `
+        -Second ([string]$candidate.rollbackBundle))) {
+        throw 'A discovered transaction descriptor names a different rollback directory.'
+    }
+    return Read-A4SRegistryTransactionDescriptor -Path $raw.path `
+        -RegistrySubKey $hostSafetySubKey -TargetKind product `
+        -RollbackBundle $parent.finalPath `
+        -RollbackManifestSha256 ([string]$candidate.rollbackManifestSha256) `
+        -ExpectedDescriptorSha256 $raw.sha256
+}
+
+function Get-A4SPendingHostSafetyTransaction {
+    param([Parameter(Mandatory)][string] $RecoveryBundle)
+
+    $bundle = Get-ValidatedRecoveryBundle -Bundle $RecoveryBundle
+    $pending = [Collections.ArrayList]::new()
+    foreach ($child in @(Get-ChildItem -LiteralPath $bundle.finalPath -Directory -Force `
+        -ErrorAction Stop | Where-Object { $_.Name -match '\ARollback-[A-Fa-f0-9]{32}\z' })) {
+        $record = Get-CanonicalPathRecord -Path $child.FullName `
+            -Description 'HostSafety rollback transaction directory' -Kind Directory
+        if (-not (Test-PathWithin -Path $record.finalPath -Parent $bundle.finalPath)) {
+            throw 'A rollback transaction directory escaped the recovery bundle.'
+        }
+        $descriptorPath = Join-Path $record.finalPath 'HostSafetyTransaction.json'
+        if (Test-Path -LiteralPath $descriptorPath -PathType Leaf) {
+            $descriptor = Read-A4SDiscoveredHostSafetyTransaction -Path $descriptorPath
+            if ([string]$descriptor.value.phase -notin @('committed', 'rolled-back')) {
+                [void]$pending.Add($descriptor)
+            }
+        }
+    }
+    if ($pending.Count -gt 1) {
+        throw 'Multiple nonterminal HostSafety transactions exist; automatic recovery is ambiguous.'
+    }
+    return if ($pending.Count -eq 1) { $pending[0] } else { $null }
 }
 
 function Restore-HostSafety {
@@ -2117,6 +2994,8 @@ function Restore-HostSafety {
     # the product mutation boundary is entered or any registry state can change.
     $validated = Read-ValidatedHostSafetyBackup -Bundle $Bundle `
         -ExpectedManifestSha256 $ExpectedManifestSha256
+    $pending = Get-A4SPendingHostSafetyTransaction `
+        -RecoveryBundle $validated.bundle
     $boundary = Enter-A4SProductMutationBoundary
     $rollback = $null
     try {
@@ -2126,6 +3005,38 @@ function Restore-HostSafety {
             -ExpectedSnapshot $ExpectedCurrentHostSafetySnapshot `
             -ExpectedSha256 $ExpectedCurrentHostSafetySha256 `
             -Boundary 'restore authorization')
+        if ($null -ne $pending) {
+            $originalDesired = Get-HostSafetyAggregateRecord `
+                -Snapshot $pending.value.originalDesiredSnapshot
+            if ($originalDesired.sha256 -cne $validated.snapshotSha256 -or
+                -not (Compare-HostSafetySnapshot -Expected $validated.manifest.snapshot `
+                    -Actual $pending.value.originalDesiredSnapshot)) {
+                throw 'Pending HostSafety transaction is not bound to the requested desired backup.'
+            }
+            $recovered = Invoke-A4SRegistryTransactionRecovery `
+                -RegistrySubKey $hostSafetySubKey `
+                -TransactionDescriptorPath $pending.path `
+                -ExpectedTransactionDescriptorSha256 $pending.sha256 `
+                -RollbackBundle $pending.rollback.bundle `
+                -RollbackManifestSha256 $pending.rollback.manifestSha256 `
+                -ProductBoundary $boundary
+            return [ordered]@{
+                snapshot = $recovered.snapshot
+                snapshotSha256 = $recovered.snapshotSha256
+                transaction = $recovered.transaction
+                recoveryDisposition = $recovered.recoveryDisposition
+                authorizedPreRestoreSha256 = $immediate.sha256
+                manifestSha256 = $validated.manifestSha256
+                mutationStepCount = $recovered.mutationStepCount
+                lifecycleMutexName = $boundary.LifecycleMutexName
+                setupMutexName = $boundary.SetupMutexName
+                hostSafetyMutexName = $boundary.HostSafetyMutexName
+                hostMutexName = $boundary.HostMutexName
+                rollbackBundle = $pending.rollback.bundle
+                rollbackManifestSha256 = $pending.rollback.manifestSha256
+                transactionDescriptorPath = $pending.path
+            }
+        }
         $rollbackPath = Join-Path $validated.bundle ('Rollback-' + [Guid]::NewGuid().ToString('N'))
         $rollbackRecord = New-SafeFreshDirectory -Path $rollbackPath `
             -Description 'HostSafety transactional rollback bundle' -ExpectedParent $validated.bundle
@@ -2143,7 +3054,10 @@ function Restore-HostSafety {
         $restored = Invoke-A4SRegistrySnapshotTransaction `
             -RegistrySubKey $hostSafetySubKey `
             -DesiredSnapshot $validated.manifest.snapshot `
-            -ExpectedCurrent $immediate -ProductBoundary $boundary
+            -ExpectedCurrent $immediate -ProductBoundary $boundary `
+            -TransactionDescriptorPath (Join-Path $rollback.bundle 'HostSafetyTransaction.json') `
+            -RollbackBundle $rollback.bundle `
+            -RollbackManifestSha256 $rollback.manifestSha256
         return [ordered]@{
             snapshot = $restored.snapshot
             snapshotSha256 = $restored.snapshotSha256
@@ -2151,10 +3065,14 @@ function Restore-HostSafety {
             authorizedPreRestoreSha256 = $immediate.sha256
             manifestSha256 = $validated.manifestSha256
             mutationStepCount = $restored.mutationStepCount
+            lifecycleMutexName = $boundary.LifecycleMutexName
             setupMutexName = $boundary.SetupMutexName
+            hostSafetyMutexName = $boundary.HostSafetyMutexName
             hostMutexName = $boundary.HostMutexName
             rollbackBundle = $rollback.bundle
             rollbackManifestSha256 = $rollback.manifestSha256
+            transactionDescriptorPath = $restored.transactionDescriptorPath
+            transactionDescriptorSha256 = $restored.transactionDescriptorSha256
         }
     }
     finally { Exit-A4SProductMutationBoundary -Boundary $boundary }
@@ -2179,14 +3097,17 @@ function Get-A4SModuleRecords {
 }
 
 function Get-TaskbarExplorerIdentity {
-    $processId = [A4SFailureRecoveryNative]::GetTaskbarProcessId()
+    $taskbar = [A4SFailureRecoveryNative]::GetTaskbarWindowRecord()
+    $processId = [uint32]$taskbar.ProcessId
     $process = [Diagnostics.Process]::GetProcessById([int]$processId)
     try {
         $process.Refresh()
         if ($process.HasExited -or $process.ProcessName -ine 'explorer') {
             throw "Taskbar PID $processId is not a live Explorer process."
         }
-        $path = [IO.Path]::GetFullPath($process.MainModule.FileName)
+        $pathRecord = Get-CanonicalPathRecord -Path $process.MainModule.FileName `
+            -Description 'taskbar Explorer image' -Kind File
+        $path = $pathRecord.finalPath
         $expectedPath = [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe'))
         if (-not [StringComparer]::OrdinalIgnoreCase.Equals($path, $expectedPath)) {
             throw "Taskbar PID $processId is not the canonical Windows Explorer: $path"
@@ -2195,11 +3116,14 @@ function Get-TaskbarExplorerIdentity {
         if ($process.SessionId -ne $currentSession) {
             throw "Taskbar Explorer belongs to session $($process.SessionId), not current session $currentSession."
         }
-        return [ordered]@{
+        return [pscustomobject][ordered]@{
             pid = [uint32]$process.Id
             startTimeUtc = $process.StartTime.ToUniversalTime().ToString('o')
             path = $path
+            pathIdentity = $pathRecord.identity
             sessionId = $process.SessionId
+            threadId = [uint32]$taskbar.ThreadId
+            taskbarWindowHandle = [int64]$taskbar.WindowHandle
         }
     }
     finally { $process.Dispose() }
@@ -2211,9 +3135,64 @@ function Assert-SameExplorerIdentity {
         [Parameter(Mandatory)][object] $Actual,
         [Parameter(Mandatory)][string] $Label
     )
-    if ($Expected.pid -ne $Actual.pid -or $Expected.startTimeUtc -cne $Actual.startTimeUtc) {
-        throw "$Label changed Explorer identity: PID/start '$($Expected.pid)/$($Expected.startTimeUtc)' -> '$($Actual.pid)/$($Actual.startTimeUtc)'."
+    if ([uint32]$Expected.pid -ne [uint32]$Actual.pid -or
+        [string]$Expected.startTimeUtc -cne [string]$Actual.startTimeUtc -or
+        [int]$Expected.sessionId -ne [int]$Actual.sessionId -or
+        [uint32]$Expected.threadId -ne [uint32]$Actual.threadId -or
+        [string]$Expected.pathIdentity -cne [string]$Actual.pathIdentity -or
+        -not (Test-A4SPathEqual -First $Expected.path -Second $Actual.path)) {
+        throw "$Label changed the exact Explorer PID/start/path/session/taskbar-thread identity."
     }
+}
+
+function Get-RetainedExplorerProcessIdentity {
+    param([Parameter(Mandatory)][Diagnostics.Process] $Process)
+
+    $Process.Refresh()
+    if ($Process.HasExited -or $Process.ProcessName -ine 'explorer') {
+        throw 'The retained Explorer process handle no longer identifies a live Explorer.'
+    }
+    $handleValue = $Process.Handle.ToInt64()
+    $path = Get-CanonicalPathRecord -Path $Process.MainModule.FileName `
+        -Description 'retained Explorer process image' -Kind File
+    return [pscustomobject][ordered]@{
+        pid = [uint32]$Process.Id
+        startTimeUtc = $Process.StartTime.ToUniversalTime().ToString('o')
+        path = $path.finalPath
+        pathIdentity = $path.identity
+        sessionId = $Process.SessionId
+        processHandleValue = [int64]$handleValue
+    }
+}
+
+function Assert-ExplorerTerminationIdentityPredicate {
+    param(
+        [Parameter(Mandatory)][object] $Expected,
+        [Parameter(Mandatory)][object] $RetainedProcess,
+        [Parameter(Mandatory)][object] $ImmediateTaskbarOwner,
+        [Parameter(Mandatory)][string] $Label
+    )
+
+    if ([uint32]$Expected.pid -ne [uint32]$RetainedProcess.pid -or
+        [string]$Expected.startTimeUtc -cne [string]$RetainedProcess.startTimeUtc -or
+        [int]$Expected.sessionId -ne [int]$RetainedProcess.sessionId -or
+        [string]$Expected.pathIdentity -cne [string]$RetainedProcess.pathIdentity -or
+        -not (Test-A4SPathEqual -First $Expected.path -Second $RetainedProcess.path) -or
+        [int64]$RetainedProcess.processHandleValue -eq 0 -or
+        [uint32]$ImmediateTaskbarOwner.pid -ne [uint32]$Expected.pid -or
+        [string]$ImmediateTaskbarOwner.startTimeUtc -cne
+            [string]$Expected.startTimeUtc -or
+        [int]$ImmediateTaskbarOwner.sessionId -ne [int]$Expected.sessionId -or
+        [string]$ImmediateTaskbarOwner.pathIdentity -cne
+            [string]$Expected.pathIdentity -or
+        -not (Test-A4SPathEqual -First $ImmediateTaskbarOwner.path `
+            -Second $Expected.path) -or
+        [uint32]$ImmediateTaskbarOwner.threadId -ne [uint32]$Expected.threadId -or
+        [int64]$ImmediateTaskbarOwner.taskbarWindowHandle -ne
+            [int64]$Expected.taskbarWindowHandle) {
+        throw "$Label refused an Explorer termination identity mismatch."
+    }
+    return $true
 }
 
 function Test-A4SPathEqual {
@@ -2386,18 +3365,60 @@ function Assert-BinaryBindingsMatchReleaseRecord {
     if ($Host.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
         $Dll.sha256 -cne ([string]$Release.record.dllSha256).ToUpperInvariant() -or
         $Host.fileVersion -cne [string]$Release.record.hostFileVersion -or
-        $Dll.fileVersion -cne [string]$Release.record.dllFileVersion -or
-        $Host.reportedVersion -cne [string]$Release.record.hostReportedVersion) {
-        throw 'The supplied host/DLL identities do not match the verified immutable release record.'
+        $Dll.fileVersion -cne [string]$Release.record.dllFileVersion) {
+        throw 'The supplied static host/DLL identities do not match the verified immutable release record.'
     }
     return $true
+}
+
+function Assert-HostBindingMatchesReleaseRecord {
+    param(
+        [Parameter(Mandatory)][object] $Release,
+        [Parameter(Mandatory)][object] $Host
+    )
+
+    [void](Assert-ValidA4SReleaseRecord -Record $Release.record)
+    if ($Host.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
+        $Host.fileVersion -cne [string]$Release.record.hostFileVersion) {
+        throw 'The supplied static host identity does not match the verified immutable release record.'
+    }
+    return $true
+}
+
+function Assert-StaticPeImageBytes {
+    param(
+        [Parameter(Mandatory)][byte[]] $Bytes,
+        [Parameter(Mandatory)][string] $Role
+    )
+
+    if ($Bytes.Length -lt 256 -or $Bytes[0] -ne 0x4D -or $Bytes[1] -ne 0x5A) {
+        throw "$Role is not a complete PE image with an MZ header."
+    }
+    $peOffset = [BitConverter]::ToInt32($Bytes, 0x3C)
+    if ($peOffset -lt 0x40 -or $peOffset -gt $Bytes.Length - 26 -or
+        $Bytes[$peOffset] -ne 0x50 -or $Bytes[$peOffset + 1] -ne 0x45 -or
+        $Bytes[$peOffset + 2] -ne 0 -or $Bytes[$peOffset + 3] -ne 0) {
+        throw "$Role has an invalid static PE signature offset."
+    }
+    $machine = [BitConverter]::ToUInt16($Bytes, $peOffset + 4)
+    $optionalSize = [BitConverter]::ToUInt16($Bytes, $peOffset + 20)
+    if ($machine -ne 0x8664 -or $optionalSize -lt 112 -or
+        $peOffset + 24 + $optionalSize -gt $Bytes.Length -or
+        [BitConverter]::ToUInt16($Bytes, $peOffset + 24) -ne 0x20B) {
+        throw "$Role is not a complete x64 PE32+ image."
+    }
+    return [pscustomobject][ordered]@{
+        machine = 'AMD64'
+        peOffset = $peOffset
+        optionalHeaderSize = $optionalSize
+        format = 'PE32+'
+    }
 }
 
 function Get-BinaryBinding {
     param(
         [Parameter(Mandatory)][string] $Path,
-        [Parameter(Mandatory)][string] $Role,
-        [switch] $QueryHostVersion
+        [Parameter(Mandatory)][string] $Role
     )
 
     $record = Get-CanonicalPathRecord -Path $Path -Description "$Role binary" -Kind File
@@ -2411,35 +3432,72 @@ function Get-BinaryBinding {
                 $locked.finalPath, $record.finalPath)) {
             throw "$Role binary path identity changed before it could be locked."
         }
+        if ($stream.Length -le 0 -or $stream.Length -gt 268435456) {
+            throw "$Role binary is empty or exceeds the 256-MiB static-authentication limit."
+        }
+        $bytes = [byte[]]::new([int]$stream.Length)
+        $offset = 0
+        while ($offset -lt $bytes.Length) {
+            $read = $stream.Read($bytes, $offset, $bytes.Length - $offset)
+            if ($read -le 0) { throw "$Role binary ended during its locked static read." }
+            $offset += $read
+        }
+        $pe = Assert-StaticPeImageBytes -Bytes $bytes -Role $Role
         $algorithm = [Security.Cryptography.SHA256]::Create()
         try {
             $sha256 = ([BitConverter]::ToString(
-                $algorithm.ComputeHash($stream))).Replace('-', '')
+                $algorithm.ComputeHash($bytes))).Replace('-', '')
         }
         finally { $algorithm.Dispose() }
+        # FileVersionInfo reads the fixed PE version resource without loading or
+        # executing the image. The no-write/no-delete stream remains held.
         $version = [Diagnostics.FileVersionInfo]::GetVersionInfo($record.finalPath)
-        $reported = $null
-        if ($QueryHostVersion) {
-            $versionResult = Invoke-A4SHostCommand -Executable $record.finalPath -Argument '--version'
-            if ($versionResult.exitCode -ne 0) {
-                throw "$Role --version failed with exit $($versionResult.exitCode)."
-            }
-            $reported = $versionResult.stdout
+        if ([string]::IsNullOrWhiteSpace([string]$version.FileVersion)) {
+            throw "$Role has no static fixed file-version resource."
         }
-        return [ordered]@{
+        return [pscustomobject][ordered]@{
             role = $Role
-            path = $record.finalPath
-            pathIdentity = $record.identity
+            path = $locked.finalPath
+            pathIdentity = $locked.identity
             sha256 = $sha256
-            length = [uint64]$stream.Length
-            fileVersion = $version.FileVersion
-            productVersion = $version.ProductVersion
-            reportedVersion = $reported
-            sourceBinding = $script:Evidence.sourceBinding
-            verifiedSourceCommit = $script:Evidence.verifiedSourceCommit
+            length = [uint64]$bytes.Length
+            fileVersion = [string]$version.FileVersion
+            productVersion = [string]$version.ProductVersion
+            fixedVersionReadMode = 'static-locked-pe-resource'
+            pe = $pe
+            reportedVersion = $null
+            sourceBinding = $null
+            verifiedSourceCommit = $null
         }
     }
     finally { $stream.Dispose() }
+}
+
+function Confirm-A4SAuthenticatedHostReportedVersion {
+    param(
+        [Parameter(Mandatory)][object] $Release,
+        [Parameter(Mandatory)][object] $AuthenticatedHostBinding
+    )
+
+    [void](Assert-HostBindingMatchesReleaseRecord -Release $Release `
+        -Host $AuthenticatedHostBinding)
+    $outerLock = [IO.File]::Open([string]$AuthenticatedHostBinding.path,
+        [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        $current = Get-BinaryBinding -Path $AuthenticatedHostBinding.path `
+            -Role 'authenticated source A4SMenuHost recheck'
+        Assert-BinaryCopyBinding -Source $AuthenticatedHostBinding -Copy $current
+        [void](Assert-HostBindingMatchesReleaseRecord -Release $Release -Host $current)
+        $versionResult = Invoke-A4SHostCommand `
+            -Executable $AuthenticatedHostBinding.path -Argument '--version'
+        if ($versionResult.exitCode -ne 0 -or
+            $versionResult.stdout -cne [string]$Release.record.hostReportedVersion) {
+            throw 'Authenticated A4SMenuHost --version does not match the verified release record.'
+        }
+        $AuthenticatedHostBinding.reportedVersion = $versionResult.stdout
+        return $versionResult
+    }
+    finally { $outerLock.Dispose() }
 }
 
 function Assert-BinaryCopyBinding {
@@ -2451,6 +3509,31 @@ function Assert-BinaryCopyBinding {
         $Source.fileVersion -cne $Copy.fileVersion -or
         $Source.productVersion -cne $Copy.productVersion) {
         throw "$($Copy.role) is not an exact version/hash copy of $($Source.role)."
+    }
+}
+
+function Get-StaticArtifactBinding {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $Role
+    )
+    $locked = Read-LockedFileBytesRecord -Path $Path `
+        -Description $Role -CaptureSha256 -MaximumBytes 16777216
+    return [pscustomobject][ordered]@{
+        role=$Role; path=$locked.path; pathIdentity=$locked.pathIdentity
+        sha256=$locked.sha256; length=$locked.length
+        bindingMode='static-locked-artifact-bytes'
+    }
+}
+
+function Assert-ArtifactCopyBinding {
+    param(
+        [Parameter(Mandatory)][object] $Source,
+        [Parameter(Mandatory)][object] $Copy
+    )
+    if ([string]$Source.sha256 -cne [string]$Copy.sha256 -or
+        [uint64]$Source.length -ne [uint64]$Copy.length) {
+        throw "$($Copy.role) is not an exact hash/length copy of $($Source.role)."
     }
 }
 
@@ -2612,12 +3695,8 @@ function Assert-ExactResidentHost {
 function Assert-NoResidentA4SHost {
     param([string] $ProbeHost)
 
-    if (-not [string]::IsNullOrWhiteSpace($ProbeHost)) {
-        $status = Get-A4SHostStatus -Executable $ProbeHost
-        if ($status.exitCode -ne $serviceNotActive) {
-            throw "An A4S host singleton is already active (status exit $($status.exitCode), '$($status.stdout)')."
-        }
-    }
+    # Never execute a caller path merely to probe singleton state. Cross-session
+    # process ownership plus the native singleton window are authoritative.
     $resident = @(Get-SameUserA4SHostProcesses)
     if ($resident.Count -ne 0) {
         throw "Found $($resident.Count) same-user A4SMenuHost process(es) across Windows sessions despite stopped status."
@@ -2877,10 +3956,18 @@ function Assert-RollingCrashGuardStage {
     if (-not $Snapshot.exists) {
         throw "Crash guard did not persist HostSafety after abnormal Explorer exit $ExpectedCount."
     }
+    $requiredNames = @('AbnormalExplorerExitCount', 'AbnormalExplorerExitTimes',
+        'AbnormalExplorerWindowStart', 'InjectionDisabled', 'LastExplorerExitCode')
+    $actualNames = @($Snapshot.values | ForEach-Object { [string]$_.name } | Sort-Object)
+    if ($actualNames.Count -ne 5 -or
+        ($actualNames -join "`0") -cne (($requiredNames | Sort-Object) -join "`0")) {
+        throw 'Crash guard HostSafety must contain five and only five exact values.'
+    }
     $lookup = @{}
     foreach ($record in $Snapshot.values) { $lookup[[string]$record.name] = $record }
     foreach ($name in @('InjectionDisabled', 'AbnormalExplorerExitCount',
-            'AbnormalExplorerExitTimes', 'LastExplorerExitCode')) {
+            'AbnormalExplorerWindowStart', 'AbnormalExplorerExitTimes',
+            'LastExplorerExitCode')) {
         if (-not $lookup.ContainsKey($name)) { throw "Crash guard omitted HostSafety value '$name'." }
     }
     foreach ($name in @('InjectionDisabled', 'AbnormalExplorerExitCount', 'LastExplorerExitCode')) {
@@ -2890,6 +3977,9 @@ function Assert-RollingCrashGuardStage {
     }
     if ([string]$lookup['AbnormalExplorerExitTimes'].kind -cne 'Binary') {
         throw 'Crash guard timestamps are not Registry Binary.'
+    }
+    if ([string]$lookup['AbnormalExplorerWindowStart'].kind -cne 'QWord') {
+        throw 'Crash guard window start is not Registry QWord.'
     }
     $disabled = [uint32]$lookup['InjectionDisabled'].value
     $expectedDisabledValue = if ($ExpectedDisabled) { 1 } else { 0 }
@@ -2905,6 +3995,10 @@ function Assert-RollingCrashGuardStage {
         throw "The rolling crash timestamp occupancy does not equal stage $ExpectedCount."
     }
     $nonzero = @($times | Select-Object -First $ExpectedCount)
+    $windowStart = [uint64]$lookup['AbnormalExplorerWindowStart'].value
+    if ($windowStart -eq 0 -or $windowStart -ne [uint64]$nonzero[0]) {
+        throw 'AbnormalExplorerWindowStart is not the exact first nonzero crash timestamp.'
+    }
     for ($index = 1; $index -lt $nonzero.Count; $index++) {
         if ($nonzero[$index] -lt $nonzero[$index - 1]) {
             throw 'The rolling crash timestamps are not ordered.'
@@ -2936,6 +4030,7 @@ function Assert-RollingCrashGuardStage {
     return [ordered]@{
         expectedCount = $ExpectedCount
         disabled = [bool]$ExpectedDisabled
+        windowStart100ns = $windowStart
         timestamps100ns = $nonzero
         span100ns = $nonzero[-1] - $nonzero[0]
         boundaries = @($Boundaries)
@@ -2945,11 +4040,19 @@ function Assert-RollingCrashGuardStage {
 function Invoke-IsolatedDllFailureQualification {
     param(
         [Parameter(Mandatory)][string] $SourceHost,
+        [Parameter(Mandatory)][string] $VerifiedReleaseRecordPath,
         [string] $RequestedEvidencePath
     )
 
     $script:TrackedHosts.Clear()
+    # The committed release record is authenticated before the caller-supplied
+    # HostPath is even considered for execution.
+    $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
     $sourceHost = Resolve-RegularFile -Path $SourceHost -Description 'A4SMenuHost test input'
+    $sourceBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost'
+    [void](Assert-HostBindingMatchesReleaseRecord -Release $release -Host $sourceBinding)
+    [void](Confirm-A4SAuthenticatedHostReportedVersion -Release $release `
+        -AuthenticatedHostBinding $sourceBinding)
     $bundle = New-EvidenceBundle -Mode 'isolated-dll-failures' -RequestedPath $RequestedEvidencePath
     $temporaryRoot = New-A4STemporaryRoot
     $initial = $null
@@ -2963,8 +4066,19 @@ function Invoke-IsolatedDllFailureQualification {
     $authorizedState = $null
     $operationError = $null
     try {
-        $sourceBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost' `
-            -QueryHostVersion
+        $script:Evidence.sourceBinding = 'verified-release-record'
+        $script:Evidence.verifiedSourceCommit =
+            ([string]$release.record.sourceCommit).ToLowerInvariant()
+        $script:Evidence.releaseRecord = [ordered]@{
+            path = $release.path
+            pathIdentity = $release.pathIdentity
+            gitRelativePath = $release.gitRelativePath
+            recordCommit = $release.recordCommit
+            recordBlob = $release.recordBlob
+            recordSha256 = $release.recordSha256
+        }
+        $sourceBinding.sourceBinding = $script:Evidence.sourceBinding
+        $sourceBinding.verifiedSourceCommit = $script:Evidence.verifiedSourceCommit
         $script:Evidence.binaries.sourceHost = $sourceBinding
         Save-Evidence
         $initial = Assert-CleanA4SSession -ProbeHost $sourceHost
@@ -3035,7 +4149,8 @@ function Invoke-IsolatedDllFailureQualification {
                 }
             }
             $caseDllBinding = if (Test-Path -LiteralPath $caseDll) {
-                Get-BinaryBinding -Path $caseDll -Role "isolated $caseName DLL input"
+                Get-StaticArtifactBinding -Path $caseDll `
+                    -Role "isolated $caseName DLL input"
             } else { $null }
 
             $resident = $null
@@ -3080,9 +4195,10 @@ function Invoke-IsolatedDllFailureQualification {
                 Assert-BinaryCopyBinding -Source $caseHostBinding -Copy $finalCaseHostBinding
                 $finalCaseDllBinding = $null
                 if ($caseDllBinding) {
-                    $finalCaseDllBinding = Get-BinaryBinding -Path $caseDll `
+                    $finalCaseDllBinding = Get-StaticArtifactBinding -Path $caseDll `
                         -Role "final isolated $caseName DLL input"
-                    Assert-BinaryCopyBinding -Source $caseDllBinding -Copy $finalCaseDllBinding
+                    Assert-ArtifactCopyBinding -Source $caseDllBinding `
+                        -Copy $finalCaseDllBinding
                 }
                 [void]$script:Evidence.cases.Add([ordered]@{
                     name = $caseName
@@ -3250,14 +4366,14 @@ function Request-ValidatedExplorerTermination {
     Assert-SameExplorerIdentity -Expected $ExpectedExplorer -Actual $current -Label "$Label validation"
     $process = [Diagnostics.Process]::GetProcessById([int]$current.pid)
     try {
-        $process.Refresh()
-        $actualPath = [IO.Path]::GetFullPath($process.MainModule.FileName)
-        if ($process.SessionId -ne [Diagnostics.Process]::GetCurrentProcess().SessionId -or
-            -not [StringComparer]::OrdinalIgnoreCase.Equals($actualPath,
-                [IO.Path]::GetFullPath((Join-Path $env:WINDIR 'explorer.exe')))) {
-            throw "$Label refused to terminate an unvalidated process."
-        }
+        # Force and retain this exact OS process handle, then revalidate every
+        # process identity field and Shell_TrayWnd ownership immediately before Kill.
+        $retainedIdentity = Get-RetainedExplorerProcessIdentity -Process $process
         $issuedFileTime = [uint64][DateTime]::UtcNow.ToFileTimeUtc()
+        $immediateTaskbar = Get-TaskbarExplorerIdentity
+        [void](Assert-ExplorerTerminationIdentityPredicate -Expected $current `
+            -RetainedProcess $retainedIdentity -ImmediateTaskbarOwner $immediateTaskbar `
+            -Label $Label)
         $process.Kill()
         $killReturnedFileTime = [uint64][DateTime]::UtcNow.ToFileTimeUtc()
         return [pscustomobject][ordered]@{
@@ -3266,6 +4382,8 @@ function Request-ValidatedExplorerTermination {
             issuedFileTimeUtc = $issuedFileTime
             killReturnedFileTimeUtc = $killReturnedFileTime
             oldExplorer = $current
+            retainedProcessIdentity = $retainedIdentity
+            immediateTaskbarOwner = $immediateTaskbar
             evidencePersisted = $false
             process = $process
         }
@@ -3402,8 +4520,17 @@ function Invoke-LiveFailureRecoveryQualification {
     )
 
     $script:TrackedHosts.Clear()
+    # Authenticate the immutable committed record first, then statically bind
+    # both caller-supplied images before HostPath is ever executed.
+    $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
     $sourceHost = Resolve-RegularFile -Path $SourceHost -Description 'A4SMenuHost live-test input'
     $sourceDll = Resolve-RegularFile -Path $SourceDll -Description 'A4SMenu.dll live-test input'
+    $sourceHostBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost'
+    $sourceDllBinding = Get-BinaryBinding -Path $sourceDll -Role 'source A4SMenu.dll'
+    [void](Assert-BinaryBindingsMatchReleaseRecord -Release $release `
+        -Host $sourceHostBinding -Dll $sourceDllBinding)
+    [void](Confirm-A4SAuthenticatedHostReportedVersion -Release $release `
+        -AuthenticatedHostBinding $sourceHostBinding)
     $bundle = New-EvidenceBundle -Mode 'live-explorer-crash-guard' -RequestedPath $RequestedEvidencePath
     $temporaryRoot = New-A4STemporaryRoot
     $backupPrepared = $false
@@ -3422,12 +4549,6 @@ function Invoke-LiveFailureRecoveryQualification {
     $authorizedState = $null
 
     try {
-        $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
-        $sourceHostBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost' `
-            -QueryHostVersion
-        $sourceDllBinding = Get-BinaryBinding -Path $sourceDll -Role 'source A4SMenu.dll'
-        [void](Assert-BinaryBindingsMatchReleaseRecord -Release $release `
-            -Host $sourceHostBinding -Dll $sourceDllBinding)
         $script:Evidence.sourceBinding = 'verified-release-record'
         $script:Evidence.verifiedSourceCommit = ([string]$release.record.sourceCommit).ToLowerInvariant()
         $script:Evidence.releaseRecord = [ordered]@{
@@ -3925,6 +5046,7 @@ else {
         switch ($PSCmdlet.ParameterSetName) {
             'Isolated' {
                 Invoke-IsolatedDllFailureQualification -SourceHost $HostPath `
+                    -VerifiedReleaseRecordPath $ReleaseRecordPath `
                     -RequestedEvidencePath $EvidencePath
             }
             'Live' {
