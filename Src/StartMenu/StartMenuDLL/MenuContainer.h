@@ -332,6 +332,12 @@ public:
 	static bool CloseStartMenu( void );
 #ifdef A4S_PRODUCT
 	static void ForceCloseA4STransients( void );
+	// Invalidates only the product's immutable normal-root snapshot unless
+	// bEnvironment is true, in which case cached policy, power and Start-folder
+	// discovery is discarded as well. Both operations are UI-thread only.
+	static void InvalidateA4SRootCache( bool bEnvironment=false );
+	// Releases every cloned PIDL before ItemManager is dismantled.
+	static void ClearA4SRootCache( void );
 #endif
 	static bool IsMenuOpened( void ) { return !s_Menus.empty(); }
 	static bool HasInputHandler( void ) { return s_pFrameworkInputPane!=NULL; }
@@ -580,6 +586,17 @@ private:
 			}
 		};
 	};
+
+#ifdef A4S_PRODUCT
+	struct A4SRootCache;
+	static A4SRootCache *s_pA4SRootCache;
+	static A4SRootCache &GetA4SRootCache( void );
+	static void PrepareA4SRootConfiguration( int dpi, unsigned int profileHash,
+		unsigned int modelHash, unsigned int rootSettings );
+	bool IsA4SRootCacheCandidate( void ) const;
+	bool RestoreA4SRootItems( ULONGLONG generation );
+	void PublishA4SRootItems( ULONGLONG generation );
+#endif
 
 	struct SortMenuItem
 	{

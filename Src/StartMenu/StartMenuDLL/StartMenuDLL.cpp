@@ -559,12 +559,30 @@ protected:
 	LRESULT OnColorChange( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 	{
 		CMenuContainer::s_Skin.Hash=0;
+#ifdef A4S_PRODUCT
+		// Color changes invalidate rendered/model state, but do not change the
+		// policy or known-folder environment cached by the warm root.
+		CMenuContainer::InvalidateA4SRootCache(false);
+#endif
 		return 0;
 	}
 
 
 	LRESULT OnSettingChange( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 	{
+#ifdef A4S_PRODUCT
+		// ToggleStartMenu temporarily disables active-window tracking and restores
+		// it when the menu closes. Those SystemParametersInfo calls broadcast this
+		// message themselves; treating it as an environment change would discard
+		// every newly published warm snapshot.
+		if (wParam!=SPI_SETACTIVEWINDOWTRACKING)
+		{
+			// Work-area changes only affect placement. Other setting broadcasts may
+			// represent policy, shell-folder redirection, remote-session or power
+			// changes and therefore require one cold environment rediscovery.
+			CMenuContainer::InvalidateA4SRootCache(wParam!=SPI_SETWORKAREA);
+		}
+#endif
 		if (wParam==SPI_SETWORKAREA)
 		{
 			if (!CMenuContainer::s_Menus.empty())
@@ -576,6 +594,11 @@ protected:
 
 	LRESULT OnDisplayChange( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& bHandled )
 	{
+#ifdef A4S_PRODUCT
+		// DPI/display changes are represented in the root-cache key and placement
+		// state. The policy and known-folder environment remains reusable.
+		CMenuContainer::InvalidateA4SRootCache(false);
+#endif
 		if (!CMenuContainer::s_Menus.empty())
 			CMenuContainer::s_Menus[0]->NotifyDisplayChange();
 		return 0;
@@ -4599,6 +4622,7 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 				else if (command==A4S_MENU_COMMAND_SUSPEND_INPUT)
 				{
 					InterlockedExchange(&g_A4SInputSuspended,1);
+					CMenuContainer::InvalidateA4SRootCache(true);
 					CMenuContainer::ForceCloseA4STransients();
 					if (!SuspendA4SKeyboardHook())
 					{
@@ -4609,6 +4633,7 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 				}
 				else if (command==A4S_MENU_COMMAND_REFRESH_INPUT)
 				{
+					CMenuContainer::InvalidateA4SRootCache(true);
 					CMenuContainer::ForceCloseA4STransients();
 					if (!RefreshA4SKeyboardHook())
 					{
@@ -5465,6 +5490,9 @@ STARTMENUAPI bool InitManagers( bool bNohook )
 STARTMENUAPI bool CloseManagers( bool bNohook )
 {
 #ifdef A4S_PRODUCT
+	// Cached MenuItems retain ItemManager pointers and cloned PIDLs. Destroy the
+	// snapshot before stopping or clearing any manager it can reference.
+	CMenuContainer::ClearA4SRootCache();
 	// The Programs snapshot worker consumes ItemManager metadata. Prove it has
 	// cancelled before dismantling that dependency; a timeout keeps the complete
 	// manager chain resident and inert, matching the other bounded-stop guards.

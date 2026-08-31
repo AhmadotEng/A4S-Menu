@@ -443,6 +443,148 @@ int CMenuContainer::s_ProgramsWidth, CMenuContainer::s_JumplistWidth;
 CComPtr<IFrameworkInputPane> CMenuContainer::s_pFrameworkInputPane;
 CString CMenuContainer::s_PinFolder;
 
+#ifdef A4S_PRODUCT
+struct CMenuContainer::A4SRootCache
+{
+	struct Key
+	{
+		ULONGLONG folderGeneration;
+		LONG policyGeneration;
+		LONG refreshGeneration;
+		int dpi;
+		unsigned int profileHash;
+		unsigned int modelHash;
+		unsigned int rootSettings;
+
+		bool operator==( const Key &other ) const
+		{
+			return folderGeneration==other.folderGeneration &&
+				policyGeneration==other.policyGeneration &&
+				refreshGeneration==other.refreshGeneration &&
+				dpi==other.dpi && profileHash==other.profileHash &&
+				modelHash==other.modelHash && rootSettings==other.rootSettings;
+		}
+	};
+
+	A4SRootCache( void )
+	{
+		policyGeneration=refreshGeneration=1;
+		bEnvironmentValid=bConfigurationValid=bSnapshotValid=false;
+		bNoCommonFolders=bNoRun=bNoClose=bHasTouch=bHasUpdates=bRemote=false;
+		memset(stdOptions,0,sizeof(stdOptions));
+		memset(&configuration,0,sizeof(configuration));
+		memset(&snapshotKey,0,sizeof(snapshotKey));
+		scrollCount=originalScrollCount=originalCount=0;
+		searchIndex=-1;
+		searchProvidersCount=searchItemCount=0;
+		programButtonIndex=programTreeIndex=-1;
+		folderHash[0]=folderHash[1]=0;
+		shutdownCommand=MENU_NO;
+	}
+
+	~A4SRootCache( void )
+	{
+		ClearSnapshot();
+	}
+
+	void ClearSnapshot( void )
+	{
+		for (std::vector<MenuItem>::iterator it=items.begin();it!=items.end();++it)
+		{
+			if (it->pItem1) ILFree(it->pItem1);
+			if (it->pItem2) ILFree(it->pItem2);
+			it->pItem1=it->pItem2=NULL;
+		}
+		items.clear();
+		bSnapshotValid=false;
+	}
+
+	void ClearEnvironment( void )
+	{
+		startMenu.Clear();
+		commonStartMenu.Clear();
+		pinFolder.Empty();
+		bEnvironmentValid=false;
+	}
+
+	LONG policyGeneration;
+	LONG refreshGeneration;
+	bool bEnvironmentValid;
+	bool bConfigurationValid;
+	bool bSnapshotValid;
+	bool bNoCommonFolders;
+	bool bNoRun;
+	bool bNoClose;
+	bool bHasTouch;
+	bool bHasUpdates;
+	bool bRemote;
+	int stdOptions[_countof(g_StdOptions)];
+	CAbsolutePidl startMenu;
+	CAbsolutePidl commonStartMenu;
+	CString pinFolder;
+	Key configuration;
+	Key snapshotKey;
+	std::vector<MenuItem> items;
+	int scrollCount;
+	int originalScrollCount;
+	int originalCount;
+	int searchIndex;
+	int searchProvidersCount;
+	int searchItemCount;
+	int programButtonIndex;
+	int programTreeIndex;
+	unsigned int folderHash[2];
+	TMenuID shutdownCommand;
+};
+
+CMenuContainer::A4SRootCache *CMenuContainer::s_pA4SRootCache=NULL;
+
+CMenuContainer::A4SRootCache &CMenuContainer::GetA4SRootCache( void )
+{
+	if (!s_pA4SRootCache)
+		s_pA4SRootCache=new A4SRootCache;
+	return *s_pA4SRootCache;
+}
+
+void CMenuContainer::InvalidateA4SRootCache( bool bEnvironment )
+{
+	if (!s_pA4SRootCache)
+		return;
+	A4SRootCache &cache=*s_pA4SRootCache;
+	cache.ClearSnapshot();
+	cache.refreshGeneration=cache.refreshGeneration==LONG_MAX?1:cache.refreshGeneration+1;
+	if (cache.bConfigurationValid)
+		cache.configuration.refreshGeneration=cache.refreshGeneration;
+	if (bEnvironment)
+	{
+		cache.ClearEnvironment();
+		cache.bConfigurationValid=false;
+		cache.policyGeneration=cache.policyGeneration==LONG_MAX?1:cache.policyGeneration+1;
+	}
+}
+
+void CMenuContainer::ClearA4SRootCache( void )
+{
+	delete s_pA4SRootCache;
+	s_pA4SRootCache=NULL;
+	s_PinFolder.Empty();
+}
+
+void CMenuContainer::PrepareA4SRootConfiguration( int dpi,
+	unsigned int profileHash, unsigned int modelHash, unsigned int rootSettings )
+{
+	A4SRootCache &cache=GetA4SRootCache();
+	cache.configuration.folderGeneration=0;
+	cache.configuration.policyGeneration=cache.policyGeneration;
+	cache.configuration.refreshGeneration=cache.refreshGeneration;
+	cache.configuration.dpi=dpi;
+	cache.configuration.profileHash=profileHash;
+	cache.configuration.modelHash=modelHash;
+	cache.configuration.rootSettings=rootSettings;
+	cache.bConfigurationValid=cache.bEnvironmentValid;
+}
+#endif
+
 LRESULT CALLBACK CMenuContainer::SubclassSearchBox( HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam, UINT_PTR uIdSubclass, DWORD_PTR dwRefData )
 {
 	CMenuContainer *pParent=(CMenuContainer*)uIdSubclass;
@@ -2439,12 +2581,96 @@ void CMenuContainer::AddJumpListItems( std::vector<MenuItem> &items )
 	}
 }
 
+// The product snapshot contains only process-stable value state. PIDLs are
+// cloned in both directions; ItemInfo and StdMenuItem pointers remain owned by
+// their process-wide managers/model and the snapshot is cleared before either
+// owner can be dismantled.
+#ifdef A4S_PRODUCT
+bool CMenuContainer::IsA4SRootCacheCandidate( void ) const
+{
+	return A4SMenuProfile::IsEnabled() && !m_bSubMenu && !m_pParent &&
+		(m_Options&CONTAINER_PROGRAMS)!=0 &&
+		(m_Options&(CONTAINER_ALLPROGRAMS|CONTAINER_DOCUMENTS|CONTAINER_SEARCH|
+			CONTAINER_JUMPLIST|CONTAINER_APPS|CONTAINER_A4S_CONTEXT))==0 &&
+		s_pA4SRootCache && s_pA4SRootCache->bEnvironmentValid &&
+		s_pA4SRootCache->bConfigurationValid;
+}
+
+bool CMenuContainer::RestoreA4SRootItems( ULONGLONG generation )
+{
+	if (!IsA4SRootCacheCandidate())
+		return false;
+	A4SRootCache &cache=*s_pA4SRootCache;
+	A4SRootCache::Key key=cache.configuration;
+	key.folderGeneration=generation;
+	if (!cache.bSnapshotValid || !(cache.snapshotKey==key))
+	{
+		cache.ClearSnapshot();
+		return false;
+	}
+
+	m_Items.reserve(cache.items.size());
+	for (std::vector<MenuItem>::const_iterator it=cache.items.begin();
+		it!=cache.items.end();++it)
+	{
+		MenuItem item;
+		item.Clone(*it);
+		m_Items.push_back(item);
+	}
+	m_ScrollCount=cache.scrollCount;
+	m_OriginalScrollCount=cache.originalScrollCount;
+	m_OriginalCount=cache.originalCount;
+	m_SearchIndex=cache.searchIndex;
+	m_SearchProvidersCount=cache.searchProvidersCount;
+	m_SearchItemCount=cache.searchItemCount;
+	m_ProgramButtonIndex=cache.programButtonIndex;
+	m_ProgramTreeIndex=cache.programTreeIndex;
+	m_FolderHash[0]=cache.folderHash[0];
+	m_FolderHash[1]=cache.folderHash[1];
+	s_ShutdownCommand=cache.shutdownCommand;
+	return true;
+}
+
+void CMenuContainer::PublishA4SRootItems( ULONGLONG generation )
+{
+	if (!IsA4SRootCacheCandidate() ||
+		g_ItemManager.GetFolderContentGeneration()!=generation)
+		return;
+	A4SRootCache &cache=*s_pA4SRootCache;
+	A4SRootCache::Key key=cache.configuration;
+	key.folderGeneration=generation;
+	cache.ClearSnapshot();
+	cache.items.reserve(m_Items.size());
+	for (std::vector<MenuItem>::const_iterator it=m_Items.begin();
+		it!=m_Items.end();++it)
+	{
+		MenuItem item;
+		item.Clone(*it);
+		cache.items.push_back(item);
+	}
+	cache.scrollCount=m_ScrollCount;
+	cache.originalScrollCount=m_OriginalScrollCount;
+	cache.originalCount=m_OriginalCount;
+	cache.searchIndex=m_SearchIndex;
+	cache.searchProvidersCount=m_SearchProvidersCount;
+	cache.searchItemCount=m_SearchItemCount;
+	cache.programButtonIndex=m_ProgramButtonIndex;
+	cache.programTreeIndex=m_ProgramTreeIndex;
+	cache.folderHash[0]=m_FolderHash[0];
+	cache.folderHash[1]=m_FolderHash[1];
+	cache.shutdownCommand=s_ShutdownCommand;
+	cache.snapshotKey=key;
+	cache.bSnapshotValid=true;
+}
+#endif
+
 // Initialize the m_Items list
 void CMenuContainer::InitItems( void )
 {
 #ifdef A4S_PRODUCT
 	const bool measurePinned=!m_bSubMenu && (m_Options&CONTAINER_PROGRAMS)!=0;
 	A4SPerformanceScope pinnedScope(A4S_PERF_PINNED_ENUMERATION,measurePinned);
+	ULONGLONG a4sRootGeneration=0;
 #endif
 	ClearItems(m_Items.begin(),m_Items.end());
 	m_pShellView=NULL;
@@ -2458,6 +2684,20 @@ void CMenuContainer::InitItems( void )
 	m_SearchScrollHeight=0;
 	m_SearchScrollPos=0;
 	m_SearchIndex=-1;
+#ifdef A4S_PRODUCT
+	// Product roots never expose drag/drop. Do not retain apartment-bound shell
+	// objects when a warm snapshot restores only immutable value state.
+	m_pDropFolder[0]=m_pDropFolder[1]=NULL;
+	if (IsA4SRootCacheCandidate())
+	{
+		a4sRootGeneration=g_ItemManager.GetFolderContentGeneration();
+		if (RestoreA4SRootItems(a4sRootGeneration))
+		{
+			pinnedScope.SetResult(static_cast<UINT32>(m_OriginalCount),TRUE);
+			return;
+		}
+	}
+#endif
 
 	if (m_Options&CONTAINER_JUMPLIST)
 	{
@@ -2805,6 +3045,8 @@ void CMenuContainer::InitItems( void )
 	m_OriginalScrollCount=m_ScrollCount;
 	UpdateAccelerators(0,m_OriginalCount);
 #ifdef A4S_PRODUCT
+	if (a4sRootGeneration)
+		PublishA4SRootItems(a4sRootGeneration);
 	pinnedScope.SetResult(measurePinned?static_cast<UINT32>(m_OriginalCount):0U);
 #endif
 }
@@ -7032,6 +7274,10 @@ LRESULT CMenuContainer::OnRefresh( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 			s_MenuScrolls.erase(m_FolderHash[0]);
 		if (!m_bSubMenu && !s_bWin7Style)
 			s_MenuMaxHeight[0]=-1;
+#ifdef A4S_PRODUCT
+		if (IsA4SRootCacheCandidate())
+			InvalidateA4SRootCache(false);
+#endif
 		InitItems();
 		InitWindow();
 		Invalidate();
@@ -8351,16 +8597,29 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	s_PreferredEffectFormat=RegisterClipboardFormat(CFSTR_PREFERREDDROPEFFECT);
 	s_DropDescriptionFormat=RegisterClipboardFormat(CFSTR_DROPDESCRIPTION);
 #endif
-	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
 #ifdef A4S_PRODUCT
-	// Root Programs enumeration is independent of first-frame construction.
-	// Warm it while the normal menu continues through its existing layout path;
-	// a later Programs view consumes only a complete cached snapshot.
-	CProgramsTree::PreloadA4SItems(s_bNoCommonFolders);
-#endif
+	A4SRootCache &a4sRootCache=GetA4SRootCache();
+	const bool bDiscoverA4SEnvironment=!a4sRootCache.bEnvironmentValid;
+	if (bDiscoverA4SEnvironment)
+	{
+		a4sRootCache.bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
+		a4sRootCache.bNoRun=(SHRestricted(REST_NORUN)!=0);
+		a4sRootCache.bNoClose=(SHRestricted(REST_NOCLOSE)!=0);
+		a4sRootCache.bHasTouch=GetWinVersion()>=WIN_VER_WIN8 &&
+			GetSettingBool(L"EnableTouch") &&
+			(GetSystemMetrics(SM_DIGITIZER)&NID_INTEGRATED_TOUCH)!=0;
+		a4sRootCache.bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
+	}
+	s_bNoCommonFolders=a4sRootCache.bNoCommonFolders;
+	s_bNoRun=a4sRootCache.bNoRun;
+	s_bNoClose=a4sRootCache.bNoClose;
+	s_bHasTouch=a4sRootCache.bHasTouch;
+#else
+	s_bNoCommonFolders=(SHRestricted(REST_NOCOMMONGROUPS)!=0);
 	s_bNoRun=(SHRestricted(REST_NORUN)!=0);
 	s_bNoClose=(SHRestricted(REST_NOCLOSE)!=0);
 	s_bHasTouch=GetWinVersion()>=WIN_VER_WIN8 && GetSettingBool(L"EnableTouch") && (GetSystemMetrics(SM_DIGITIZER)&NID_INTEGRATED_TOUCH)!=0;
+#endif
 	s_HasMoreResults=-1;
 	s_bDisableHover=false;
 	s_bDragClosed=false;
@@ -8369,14 +8628,15 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	InitTouchHelper();
 #endif
 
-	bool bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
 #ifdef A4S_PRODUCT
+	bool bRemote=a4sRootCache.bRemote;
 	// The product profile never exposes the legacy People or Active Directory
 	// search commands. Avoid probing Windows Mail or a domain controller on the
 	// latency-sensitive menu-opening path.
 	bool bPeople=false;
 	s_bActiveDirectory=0;
 #else
+	bool bRemote=GetSystemMetrics(SM_REMOTESESSION)!=0;
 	wchar_t wabPath[_MAX_PATH]=L"%ProgramFiles%\\Windows Mail\\wab.exe";
 	DoEnvironmentSubst(wabPath,_countof(wabPath));
 	HANDLE hWab=CreateFile(wabPath,0,FILE_SHARE_READ,NULL,OPEN_EXISTING,FILE_ATTRIBUTE_NORMAL,NULL);
@@ -8428,6 +8688,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	}
 #endif
 
+#ifdef A4S_PRODUCT
+	if (bDiscoverA4SEnvironment)
+	{
+#endif
 	s_bHasUpdates=(!bRemote || GetSettingBool(L"RemoteShutdown")) && GetSettingBool(L"CheckWinUpdates") && CheckForUpdates();
 
 	// Check control panel options for power buttons
@@ -8720,6 +8984,18 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		}
 		LOG_MENU(LOG_OPEN,L"ItemOptions[%d]=%d",i,g_StdOptions[i].options);
 	}	
+#ifdef A4S_PRODUCT
+		a4sRootCache.bHasUpdates=s_bHasUpdates;
+		for (int i=0;i<_countof(g_StdOptions);i++)
+			a4sRootCache.stdOptions[i]=g_StdOptions[i].options;
+	}
+	else
+	{
+		s_bHasUpdates=a4sRootCache.bHasUpdates;
+		for (int i=0;i<_countof(g_StdOptions);i++)
+			g_StdOptions[i].options=a4sRootCache.stdOptions[i];
+	}
+#endif
 
 #ifdef A4S_PRODUCT
 	s_bNoDragDrop=true;
@@ -8736,6 +9012,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	// create the top menu from the Start Menu folders
 	CAbsolutePidl path1;
 	CAbsolutePidl path2;
+#ifdef A4S_PRODUCT
+	if (bDiscoverA4SEnvironment)
+	{
+#endif
 	s_PinFolder.Empty();
 	if (bAllPrograms || GetSettingInt(L"PinnedPrograms")==PINNED_PROGRAMS_FAST)
 	{
@@ -8756,6 +9036,24 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		s_PinFolder=path;
 		SHParseDisplayName(path,NULL,&path1,0,NULL);
 	}
+#ifdef A4S_PRODUCT
+		a4sRootCache.startMenu.Clone(path1);
+		a4sRootCache.commonStartMenu.Clone(path2);
+		a4sRootCache.pinFolder=s_PinFolder;
+		// Publish only after policy, power, standard options and every path have
+		// been captured. A warm opener can therefore never observe a partial set.
+		a4sRootCache.bEnvironmentValid=true;
+	}
+	else
+	{
+		path1.Clone(a4sRootCache.startMenu);
+		path2.Clone(a4sRootCache.commonStartMenu);
+		s_PinFolder=a4sRootCache.pinFolder;
+	}
+	// Programs enumeration is independent of first-frame construction. The
+	// request is a cache/configuration check on a warm normal-root toggle.
+	CProgramsTree::PreloadA4SItems(s_bNoCommonFolders);
+#endif
 #ifndef A4S_PRODUCT
 #ifndef STARTSCREEN_WIN7
 	if (GetWinVersion()>=WIN_VER_WIN8)
@@ -8799,6 +9097,9 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 #endif
 	unsigned int rootSettings=0;
 	const StdMenuItem *pRoot=NULL;
+#ifdef A4S_PRODUCT
+	unsigned int a4sRootModelHash=0;
+#endif
 	if (bAllPrograms)
 	{
 		options|=CONTAINER_ALLPROGRAMS;
@@ -8806,6 +9107,18 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	else
 	{
 		pRoot=ParseCustomMenu(rootSettings);
+#ifdef A4S_PRODUCT
+		// Mirror the parsed-model identity without exposing CustomMenu internals.
+		// Product settings are memory-backed and locked, so this adds no registry
+		// or filesystem work to a warm activation.
+		a4sRootModelHash=FNV_HASH0;
+		if (GetSettingBool(L"ControlPanelCategories")) a4sRootModelHash+=1;
+		if (GetSettingInt(L"ProgramsStyle")==PROGRAMS_INLINE) a4sRootModelHash+=2;
+		if (GetSettingBool(L"AllProgramsMetro")) a4sRootModelHash+=4;
+		CString menuText=GetSettingString(L"MenuItems7");
+		a4sRootModelHash=CalcFNVHash(menuText,a4sRootModelHash);
+		a4sRootModelHash=CalcFNVHash(&rootSettings,sizeof(rootSettings),a4sRootModelHash);
+#endif
 	}
 
 	// A4S follows normal foreground-window z-order: opening or clicking it raises
@@ -9348,6 +9661,10 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 		animFlags|=AW_TOPMOST;
 	pStartMenu->SetWindowPos((animFlags&AW_TOPMOST)?HWND_TOPMOST:HWND_TOP,corner.x,corner.y,0,0,((initialMonitor!=s_MenuMonitor && !bAllPrograms)?SWP_NOMOVE|SWP_NOSIZE:0)|SWP_NOACTIVATE);
 
+#ifdef A4S_PRODUCT
+	if (!bAllPrograms)
+		PrepareA4SRootConfiguration(dpi,s_Skin.Hash,a4sRootModelHash,rootSettings);
+#endif
 	pStartMenu->InitItems();
 	pStartMenu->m_MaxWidth=s_MainMenuLimits.right-s_MainMenuLimits.left;
 	g_ItemManager.UpdateNewPrograms(CPoint((s_StartRect.left+s_StartRect.right)/2,(s_StartRect.top+s_StartRect.bottom)/2));

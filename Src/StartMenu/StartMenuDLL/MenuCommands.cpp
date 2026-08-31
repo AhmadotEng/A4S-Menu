@@ -2239,6 +2239,9 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 			if (SUCCEEDED(CreatePinLink(pItemPidl1,item.name,NULL,0)))
 			{
 				PlayMenuSound(SOUND_COMMAND);
+				// Directory notifications are asynchronous. Invalidate immediately so
+				// this explicit refresh cannot restore the pre-pin root snapshot.
+				InvalidateA4SRootCache(false);
 				m_bRefreshItems=true;
 				PostRefreshMessage();
 			}
@@ -2248,6 +2251,7 @@ void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *p
 			if (SUCCEEDED(RemoveA4SPinnedLink(pItemPidl1,s_PinFolder)))
 			{
 				PlayMenuSound(SOUND_COMMAND);
+				InvalidateA4SRootCache(false);
 				m_bRefreshItems=true;
 				PostRefreshMessage();
 			}
