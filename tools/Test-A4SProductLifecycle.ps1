@@ -61,7 +61,7 @@ public static class A4SProductLifecycleNative
         return processId;
     }
 
-    public static IntPtr[] GetVisibleTopLevelWindows(string expectedClassName)
+    public static IntPtr[] GetVisibleTopLevelWindows(string expectedClassName, uint expectedProcessId)
     {
         List<IntPtr> matches = new List<IntPtr>();
         bool enumerated = EnumWindows(delegate(IntPtr window, IntPtr parameter)
@@ -69,7 +69,10 @@ public static class A4SProductLifecycleNative
             if (!IsWindowVisible(window))
                 return true;
             StringBuilder className = new StringBuilder(256);
-            if (GetClassNameW(window, className, className.Capacity) > 0 &&
+            uint ownerProcessId;
+            if (GetWindowThreadProcessId(window, out ownerProcessId) != 0 &&
+                ownerProcessId == expectedProcessId &&
+                GetClassNameW(window, className, className.Capacity) > 0 &&
                 String.Equals(className.ToString(), expectedClassName, StringComparison.Ordinal))
                 matches.Add(window);
             return true;
@@ -164,8 +167,10 @@ function Test-A4SPathEqual {
 }
 
 function Get-VisibleA4SMenuWindows {
+    param([Parameter(Mandatory)][uint32] $ExplorerProcessId)
+
     return @([A4SProductLifecycleNative]::GetVisibleTopLevelWindows(
-        'A4SMenu.CMenuContainer'))
+        'A4SMenu.CMenuContainer', $ExplorerProcessId))
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -206,7 +211,7 @@ same-process --rehook.
 "@
 }
 
-if ((Get-VisibleA4SMenuWindows).Count -ne 0) {
+if ((Get-VisibleA4SMenuWindows -ExplorerProcessId $taskbarProcessId).Count -ne 0) {
     throw 'An A4S product menu window is already visible before the host starts.'
 }
 
@@ -266,7 +271,7 @@ try {
         throw "Opening --toggle failed with exit code $toggleOpenCode."
     }
     if (-not (Wait-A4SCondition -TimeoutSeconds $MenuTimeoutSeconds -Condition {
-        (Get-VisibleA4SMenuWindows).Count -ne 0
+        (Get-VisibleA4SMenuWindows -ExplorerProcessId $taskbarProcessId).Count -eq 1
     })) {
         throw "No visible A4SMenu.CMenuContainer window appeared within $MenuTimeoutSeconds seconds."
     }
@@ -277,7 +282,7 @@ try {
         throw "Closing --toggle failed with exit code $toggleCloseCode."
     }
     if (-not (Wait-A4SCondition -TimeoutSeconds $MenuTimeoutSeconds -Condition {
-        (Get-VisibleA4SMenuWindows).Count -eq 0
+        (Get-VisibleA4SMenuWindows -ExplorerProcessId $taskbarProcessId).Count -eq 0
     })) {
         throw "The visible A4S menu did not close within $MenuTimeoutSeconds seconds."
     }
@@ -291,7 +296,7 @@ try {
         throw "The resident host did not exit within $StopTimeoutSeconds seconds after logical disarm."
     }
     if (-not (Wait-A4SCondition -TimeoutSeconds $MenuTimeoutSeconds -Condition {
-        (Get-VisibleA4SMenuWindows).Count -eq 0
+        (Get-VisibleA4SMenuWindows -ExplorerProcessId $taskbarProcessId).Count -eq 0
     })) {
         throw 'An A4S menu window remained visible after host shutdown.'
     }
