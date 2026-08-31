@@ -162,6 +162,21 @@ void MarkA4SFirstPaint(HWND window)
 			0,FALSE,A4S_ACTIVATION_UNKNOWN,window);
 }
 
+void MarkA4SPaintRect(HWND window, const RECT &paintRect)
+{
+	const UINT64 operation=CurrentA4SOpenOperation();
+	const HWND associated=static_cast<HWND>(
+		InterlockedCompareExchangePointer(&g_openWindow,NULL,NULL));
+	if (!operation || !window || associated!=window)
+		return;
+	const LONG width=paintRect.right>paintRect.left?paintRect.right-paintRect.left:0;
+	const LONG height=paintRect.bottom>paintRect.top?paintRect.bottom-paintRect.top:0;
+	const ULONGLONG area=static_cast<ULONGLONG>(width)*static_cast<ULONGLONG>(height);
+	WriteEvent(A4S_PERF_PAINT_RECT,A4S_PERF_INSTANT,operation,
+		area>0xFFFFFFFFULL?0xFFFFFFFFU:static_cast<UINT32>(area),FALSE,
+		A4S_ACTIVATION_UNKNOWN,window);
+}
+
 void MarkA4SWindowVisible(HWND window)
 {
 	const UINT64 operation=CurrentA4SOpenOperation();

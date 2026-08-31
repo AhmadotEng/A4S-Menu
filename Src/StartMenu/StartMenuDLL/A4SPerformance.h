@@ -18,6 +18,7 @@ enum A4SPerformanceEvent : UINT32
 	A4S_PERF_CLOSE_PATH = 10,
 	A4S_PERF_WINDOW_HIDDEN = 11,
 	A4S_PERF_PRELOAD = 12,
+	A4S_PERF_PAINT_RECT = 13,
 };
 
 enum A4SPerformanceStage : UINT32
@@ -54,6 +55,7 @@ void AssociateA4SOpenWindow( HWND window );
 UINT64 BeginA4SClosePath( HWND window );
 UINT64 CurrentA4SOpenOperation( void );
 void MarkA4SFirstPaint( HWND window );
+void MarkA4SPaintRect( HWND window, const RECT &paintRect );
 void MarkA4SWindowVisible( HWND window );
 void MarkA4SWindowHidden( HWND window );
 
@@ -102,6 +104,7 @@ inline void AssociateA4SOpenWindow( HWND ) {}
 inline UINT64 BeginA4SClosePath( HWND ) { return 0; }
 inline UINT64 CurrentA4SOpenOperation( void ) { return 0; }
 inline void MarkA4SFirstPaint( HWND ) {}
+inline void MarkA4SPaintRect( HWND, const RECT & ) {}
 inline void MarkA4SWindowVisible( HWND ) {}
 inline void MarkA4SWindowHidden( HWND ) {}
 

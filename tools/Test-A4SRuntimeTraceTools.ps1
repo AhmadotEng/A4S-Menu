@@ -25,6 +25,7 @@ foreach ($name in $ownedFiles) {
 
 $performanceSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Src\StartMenu\StartMenuDLL\A4SPerformance.cpp') -Raw
 $containerSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Src\StartMenu\StartMenuDLL\MenuContainer.cpp') -Raw
+$paintSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\Src\StartMenu\StartMenuDLL\MenuPaint.cpp') -Raw
 Assert-A4S ($performanceSource -match 'InterlockedCompareExchange\(&g_registered,-1,0\)') 'provider registration is published before TraceLoggingRegister completes'
 Assert-A4S ($performanceSource -match 'BeginA4SPerformanceOperation[\s\S]+if \(!ProviderEnabled\(\)\)[\s\S]+return 0;') 'phase operations can begin outside an enabled ETW session'
 Assert-A4S ($performanceSource -match 'AssociateA4SOpenWindow' -and $containerSource -match 'AssociateA4SOpenWindow\(pStartMenu->m_hWnd\)') 'open operations are not associated with their exact root menu window'
@@ -32,6 +33,7 @@ Assert-A4S ($performanceSource -match 'BeginA4SClosePath\(HWND window\)' -and $c
 Assert-A4S ($performanceSource -match 'matchesOpen=!window \|\| associated==window') 'an old hidden window can clear a newer open operation'
 Assert-A4S ($performanceSource -match 'if \(!window \|\| closeWindow==window\)') 'an unrelated hidden window can complete a newer close operation'
 Assert-A4S ($containerSource -match 'CMenuContainer::OnDestroy[\s\S]+if \(!m_bSubMenu\)[\s\S]+MarkA4SWindowHidden\(m_hWnd\)') 'direct root-window destruction does not complete the correlated close operation'
+Assert-A4S ($performanceSource -match 'MarkA4SPaintRect\(HWND window, const RECT &paintRect\)' -and $paintSource -match 'MarkA4SPaintRect\(m_hWnd,ps\.rcPaint\)') 'root-menu repaint rectangles are not instrumented'
 
 $capturePath = Join-Path $PSScriptRoot 'Capture-A4SRuntimeTrace.ps1'
 $captureText = Get-Content -LiteralPath $capturePath -Raw
@@ -107,6 +109,7 @@ Add-SyntheticEvent 1 2 1 100 1
 Add-SyntheticEvent 2 3 1 101
 Add-SyntheticEvent 6 3 2 101 0 12 $true
 Add-SyntheticEvent 60 7 0 100
+Add-SyntheticEvent 61 13 0 100 0 100
 Add-SyntheticEvent 80 6 0 100
 Add-SyntheticEvent 80.2 2 2 100
 Add-SyntheticEvent 99 1 0 100 1
@@ -119,6 +122,7 @@ Add-SyntheticEvent 201 2 1 200 1
 Add-SyntheticEvent 202 5 1 201
 Add-SyntheticEvent 204 5 2 201
 Add-SyntheticEvent 217 7 0 200
+Add-SyntheticEvent 218 13 0 200 0 200
 Add-SyntheticEvent 221 6 0 200
 Add-SyntheticEvent 221.2 2 2 200
 Add-SyntheticEvent 249 1 0 200 1
@@ -155,6 +159,8 @@ try {
     Assert-A4S ($report.targetEvaluation.overallCustomTraceStatus -eq 'pass') 'passing synthetic trace failed targets'
     Assert-A4S ($report.cycles[1].activationSource -eq 'host') 'activation source was not decoded'
     Assert-A4S ($report.statistics.phases.backdropPrepare.count -eq 1) 'nested phase duration was not reported'
+    Assert-A4S ($report.statistics.paintRectangles.count -eq 2) 'paint rectangle events were not counted'
+    Assert-A4S ($report.statistics.paintRectangles.totalPixels -eq 300 -and $report.statistics.paintRectangles.maximumPixels -eq 200) 'paint rectangle pixel totals are wrong'
 
     $xmlPath = Join-Path $tempRoot 'tracerpt.xml'
     $settings = [Xml.XmlWriterSettings]::new()

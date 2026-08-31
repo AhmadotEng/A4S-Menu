@@ -14,6 +14,7 @@ $script:A4SEventNames = @{
     10 = 'closePath'
     11 = 'windowHidden'
     12 = 'preload'
+    13 = 'paintRect'
 }
 $script:A4SStageNames = @{
     0 = 'instant'
@@ -439,6 +440,14 @@ function ConvertTo-A4SRuntimeReport {
     $warmOpen = Get-A4SStatistics @($completeWarmCycles | ForEach-Object { $_.activationToVisibleMilliseconds })
     $warmPaint = Get-A4SStatistics @($completeWarmCycles | ForEach-Object { $_.activationToFirstPaintMilliseconds })
     $close = Get-A4SStatistics @($completeCycles | ForEach-Object { $_.closeActivationToHiddenMilliseconds })
+	$paintAreas = @($orderedEvents | Where-Object eventId -eq 13 | ForEach-Object { [double]$_.value } | Sort-Object)
+	$paintSummary = [pscustomobject][ordered]@{
+		count = $paintAreas.Count
+		totalPixels = if ($paintAreas.Count) { [long](($paintAreas | Measure-Object -Sum).Sum) } else { 0 }
+		p50Pixels = if ($paintAreas.Count) { [long]$paintAreas[[Math]::Max(0,[Math]::Ceiling($paintAreas.Count*0.50)-1)] } else { $null }
+		p95Pixels = if ($paintAreas.Count) { [long]$paintAreas[[Math]::Max(0,[Math]::Ceiling($paintAreas.Count*0.95)-1)] } else { $null }
+		maximumPixels = if ($paintAreas.Count) { [long]$paintAreas[-1] } else { $null }
+	}
     $frameBudget = [Math]::Round(1000.0 / $RefreshRateHz, 3)
     $warmStatus = if ($warmOpen.count -eq 0) { 'notMeasured' } elseif ($warmOpen.p95Milliseconds -le $WarmOpenTargetMilliseconds) { 'pass' } else { 'fail' }
     $closeStatus = if ($close.count -eq 0) { 'notMeasured' } elseif ($close.p95Milliseconds -le $frameBudget) { 'pass' } else { 'fail' }
@@ -493,6 +502,7 @@ function ConvertTo-A4SRuntimeReport {
             allCloseBeginToHidden = Get-A4SStatistics @($cycles | ForEach-Object { $_.closeBeginToHiddenMilliseconds })
             allOpenPath = Get-A4SStatistics @($cycles | ForEach-Object { $_.openPathMilliseconds })
             allClosePath = Get-A4SStatistics @($cycles | ForEach-Object { $_.closePathMilliseconds })
+			paintRectangles = $paintSummary
             phases = [pscustomobject]$allPhaseStats
         }
         targetEvaluation = [pscustomobject][ordered]@{

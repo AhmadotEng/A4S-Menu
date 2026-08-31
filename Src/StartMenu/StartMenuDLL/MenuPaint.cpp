@@ -3779,6 +3779,10 @@ LRESULT CMenuContainer::OnPaint( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL& 
 
 	if (uMsg!=WM_PRINTCLIENT)
 	{
+#ifdef A4S_PRODUCT
+		if (!m_bSubMenu)
+			MarkA4SPaintRect(m_hWnd,ps.rcPaint);
+#endif
 		EndPaint(&ps);
 #ifdef A4S_PRODUCT
 		if (!m_bSubMenu)
