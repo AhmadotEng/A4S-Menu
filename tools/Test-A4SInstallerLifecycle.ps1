@@ -74,7 +74,10 @@ $installRoot = [IO.Path]::GetFullPath((Join-Path $env:LOCALAPPDATA 'A4SMenu'))
 $versionsRoot = [IO.Path]::GetFullPath((Join-Path $installRoot 'versions'))
 $dataCachePath = [IO.Path]::GetFullPath((Join-Path $installRoot 'DataCache.db'))
 $cleanupHelperPath = [IO.Path]::GetFullPath((Join-Path ([IO.Path]::GetTempPath()) 'A4SMenuCleanup.exe'))
-$expectedCleanupRunOnce = '"' + $cleanupHelperPath + '" --cleanup --silent'
+$expectedCleanupRunOncePrefix = '"' + $cleanupHelperPath +
+    '" --cleanup --silent --cleanup-identity '
+$expectedCleanupRunOnce = $expectedCleanupRunOncePrefix +
+    '<20-digit-sequence>:<64-digit-token>'
 $expectedV1 = [Version]'1.0.0.0'
 $expectedV2 = [Version]'1.1.0.0'
 $frozenV1SetupSha256 = 'DF282F8DC18B382B7AC28599294E2A371EF97D01F85AE6F66E9DF6A02ACBC7C2'
@@ -439,7 +442,15 @@ function ConvertTo-EncodedRegistryValue {
             [Convert]::ToBase64String($bytes); break
         }
         ([Microsoft.Win32.RegistryValueKind]::DWord) { [string]([int]$value); break }
-        ([Microsoft.Win32.RegistryValueKind]::QWord) { [string]([long]$value); break }
+        ([Microsoft.Win32.RegistryValueKind]::QWord) {
+            # RegistryKey exposes REG_QWORD through signed Int64 even though the
+            # registry stores an unsigned 64-bit bit pattern.  Canonicalize the
+            # complete bit range as unsigned decimal so lifecycle sequences at
+            # or above 2^63 remain parseable and round-trip byte-exactly.
+            $bits = [BitConverter]::GetBytes([long]$value)
+            [BitConverter]::ToUInt64($bits, 0).ToString(
+                [Globalization.CultureInfo]::InvariantCulture); break
+        }
         default { throw "Unsupported registry value kind '$kind' at $($Key.Name)\$Name." }
     }
     return [ordered]@{
@@ -671,7 +682,16 @@ function ConvertFrom-EncodedRegistryData {
             Write-Output -NoEnumerate ([Convert]::FromBase64String([string]$Value.Data)); return
         }
         ([Microsoft.Win32.RegistryValueKind]::DWord) { return [int]::Parse([string]$Value.Data, [Globalization.CultureInfo]::InvariantCulture) }
-        ([Microsoft.Win32.RegistryValueKind]::QWord) { return [long]::Parse([string]$Value.Data, [Globalization.CultureInfo]::InvariantCulture) }
+        ([Microsoft.Win32.RegistryValueKind]::QWord) {
+            [uint64]$unsigned = 0
+            if (-not [uint64]::TryParse([string]$Value.Data,
+                    [Globalization.NumberStyles]::None,
+                    [Globalization.CultureInfo]::InvariantCulture,
+                    [ref]$unsigned)) {
+                throw "Encoded registry QWord '$($Value.Name)' is outside the UInt64 range."
+            }
+            return [BitConverter]::ToInt64([BitConverter]::GetBytes($unsigned), 0)
+        }
         default { throw "Unsupported registry value kind in recovery snapshot: $($Value.Kind)" }
     }
 }
@@ -934,9 +954,9 @@ function Restore-RegistryTreeSnapshot {
 
 function Invoke-RegistryRestoreBackendSelfTest {
     $registryRoot = [Microsoft.Win32.Registry]::CurrentUser
-    $sandboxSubKey = 'Software\A4SMenu\Tests\RegistryRestore\' +
+    $sandboxSubKey = 'Software\A4SMenuLifecycleRegistryRestoreTest.' +
         [Guid]::NewGuid().ToString('N').ToUpperInvariant()
-    if ($sandboxSubKey -notmatch '^Software\\A4SMenu\\Tests\\RegistryRestore\\[0-9A-F]{32}$') {
+    if ($sandboxSubKey -notmatch '^Software\\A4SMenuLifecycleRegistryRestoreTest\.[0-9A-F]{32}$') {
         throw 'The registry-backend self-test generated an unsafe sandbox path.'
     }
     $original = Get-RegistryTreeSnapshot -SubKey $sandboxSubKey -RegistryRoot $registryRoot
@@ -961,7 +981,7 @@ function Invoke-RegistryRestoreBackendSelfTest {
         Nodes = @(
             [ordered]@{ RelativePath = ''; Values = @(
                 [ordered]@{ Name = 'Expand'; Kind = 'ExpandString'; Data = '%TEMP%\A4S' },
-                [ordered]@{ Name = 'Qword'; Kind = 'QWord'; Data = '4294967297' }
+                [ordered]@{ Name = 'Qword'; Kind = 'QWord'; Data = '18446744073709551615' }
             ) },
             [ordered]@{ RelativePath = 'Child'; Values = @(
                 [ordered]@{ Name = 'Lines'; Kind = 'MultiString'; Data = @('one', 'two') }
@@ -1894,6 +1914,24 @@ function Assert-ExactQualificationOperation {
     return $actual
 }
 
+function Get-ExpectedCleanupRunOnceForSnapshot {
+    param([Parameter(Mandatory)] $Snapshot)
+    try {
+        $operation = Get-LifecycleOperationRecord `
+            -Aggregate ([ordered]@{ Snapshot = $Snapshot }) `
+            -Label 'pending cleanup identity'
+        if (-not $operation.LastPresent -or
+            $operation.LastSequence -ne $operation.HighWater) {
+            return $null
+        }
+        $encoded = $operation.LastSequence.ToString('D20',
+            [Globalization.CultureInfo]::InvariantCulture) + ':' +
+            $operation.LastToken
+        return $expectedCleanupRunOncePrefix + $encoded
+    }
+    catch { return $null }
+}
+
 function Test-InstallerOwnedCleanSnapshot {
     param([Parameter(Mandatory)] $Snapshot)
     $registration = $Snapshot.InstallerRegistration
@@ -1920,12 +1958,14 @@ function Test-ExactPendingCleanupSnapshot {
         [Parameter(Mandatory)][string] $ExpectedSha256
     )
     $registration = $Snapshot.InstallerRegistration
+    $expectedCleanup = Get-ExpectedCleanupRunOnceForSnapshot -Snapshot $Snapshot
     if ($registration.ActiveSlot.Present -or $registration.PreviousSlot.Present -or
         $registration.InstallVersion.Present -or $registration.Servicing.Exists -or
         $registration.Uninstall.Exists -or $registration.Run.Present -or
         $registration.RecoveryRunOnce.Present -or -not $registration.CleanupRunOnce.Present -or
         $registration.CleanupRunOnce.Kind -cne 'String' -or
-        $registration.CleanupRunOnce.Data -cne $expectedCleanupRunOnce) {
+        $null -eq $expectedCleanup -or
+        $registration.CleanupRunOnce.Data -cne $expectedCleanup) {
         return $false
     }
     $helper = $Snapshot.Cleanup.HelperFile
@@ -1949,12 +1989,12 @@ function Test-ExactPendingCleanupSnapshot {
 function Get-RecoveryDecision {
     param(
         [Parameter(Mandatory)][bool] $InstallerOwnedClean,
-        [Parameter(Mandatory)][bool] $ExactPendingCleanup,
+        [Parameter(Mandatory)][bool] $KnownOwnedPendingCleanup,
         [Parameter(Mandatory)][bool] $KnownOwnedRestorableClean,
         [Parameter(Mandatory)][bool] $KnownOwnedInstalled,
         [Parameter(Mandatory)][bool] $KnownOwnedUninstalled
     )
-    if ($ExactPendingCleanup) { return 'WaitPendingNoUninstall' }
+    if ($KnownOwnedPendingCleanup) { return 'WaitPendingNoUninstall' }
     if ($InstallerOwnedClean) {
         if ($KnownOwnedRestorableClean) { return 'RestoreCleanNoUninstall' }
         return 'RetainCleanUnknownNoMutation'
@@ -2548,8 +2588,11 @@ function Assert-NoTransientServicingState {
     }
 
     if ($Checkpoint.CleanupRunOnce.Present) {
+        $expectedCleanup = Get-ExpectedCleanupRunOnceForSnapshot `
+            -Snapshot $Checkpoint.Aggregate.Snapshot
         if ($Checkpoint.CleanupRunOnce.Kind -cne 'String' -or
-            $Checkpoint.CleanupRunOnce.Data -cne $expectedCleanupRunOnce) {
+            $null -eq $expectedCleanup -or
+            $Checkpoint.CleanupRunOnce.Data -cne $expectedCleanup) {
             throw "$($Checkpoint.Label) has a non-canonical pending cleanup command."
         }
         if (-not (Test-ExactPendingCleanupSnapshot -Snapshot $Checkpoint.Aggregate.Snapshot `
@@ -2956,12 +2999,22 @@ function Wait-ForInstalledCleanupCancellation {
 function Wait-ForPendingCleanupResolution {
     param(
         [Parameter(Mandatory)][string] $ExpectedSha256,
+        [Parameter(Mandatory)][uint64] $ExpectedSequence,
+        [Parameter(Mandatory)][string] $ExpectedToken,
         [ValidateRange(1, 30)][int] $TimeoutSeconds = 8
     )
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
     do {
         $aggregate = Get-StableLifecycleAggregate -Label 'recovery-pending-cleanup-observation' `
             -RequiredSamples 2 -TimeoutSeconds 2
+        try {
+            Assert-ExactQualificationOperation -Aggregate $aggregate `
+                -ExpectedSequence $ExpectedSequence -ExpectedToken $ExpectedToken `
+                -Label 'recovery-pending-cleanup-observation' | Out-Null
+        }
+        catch {
+            return [ordered]@{ State = 'Unknown'; Aggregate = $aggregate }
+        }
         if (Test-InstallerOwnedCleanSnapshot -Snapshot $aggregate.Snapshot) {
             return [ordered]@{ State = 'Clean'; Aggregate = $aggregate }
         }
@@ -3484,8 +3537,18 @@ finally {
                     $knownUninstalled = $null -ne $owned -and $owned.Kind -in @('UninstalledPending', 'UninstalledQuiescent')
                     $knownRestorableClean = $null -ne $owned -and
                         $owned.Kind -in @('Clean', 'UninstalledQuiescent')
+                    $knownOwnedPending = $exactPending -and $null -ne $owned -and
+                        $owned.Kind -ceq 'UninstalledPending' -and
+                        $null -ne $owned.Validation -and
+                        $null -ne $owned.QualificationOperation
+                    if ($knownOwnedPending) {
+                        Assert-ExactQualificationOperation -Aggregate $current `
+                            -ExpectedSequence ([uint64]$owned.QualificationOperation.ExpectedSequence) `
+                            -ExpectedToken ([string]$owned.QualificationOperation.Token) `
+                            -Label 'failure-recovery-owned-pending-cleanup' | Out-Null
+                    }
                     $recovery.Decision = Get-RecoveryDecision -InstallerOwnedClean $installerClean `
-                        -ExactPendingCleanup $exactPending `
+                        -KnownOwnedPendingCleanup $knownOwnedPending `
                         -KnownOwnedRestorableClean $knownRestorableClean `
                         -KnownOwnedInstalled $knownInstalled `
                         -KnownOwnedUninstalled $knownUninstalled
@@ -3510,7 +3573,9 @@ finally {
                     'WaitPendingNoUninstall' {
                         try {
                             $resolution = Wait-ForPendingCleanupResolution `
-                                -ExpectedSha256 $script:expectedCleanupHash
+                                -ExpectedSha256 $script:expectedCleanupHash `
+                                -ExpectedSequence ([uint64]$owned.QualificationOperation.ExpectedSequence) `
+                                -ExpectedToken ([string]$owned.QualificationOperation.Token)
                             $recovery.CleanupResolution = $resolution
                             if ($resolution.State -ceq 'Clean') {
                                 Restore-VerifiedCleanOriginalState -OriginalUserState $recoveryUserState `
@@ -3550,7 +3615,9 @@ finally {
                             $restoreAggregate = $recovery.UninstalledCheckpoint.Aggregate
                             if ($recovery.UninstalledCheckpoint.CleanupRunOnce.Present) {
                                 $resolution = Wait-ForPendingCleanupResolution `
-                                    -ExpectedSha256 $script:expectedCleanupHash
+                                    -ExpectedSha256 $script:expectedCleanupHash `
+                                    -ExpectedSequence ([uint64]$recovery.SetupUninstall.QualificationOperation.ExpectedSequence) `
+                                    -ExpectedToken ([string]$recovery.SetupUninstall.QualificationOperation.Token)
                                 $recovery.CleanupResolution = $resolution
                                 if ($resolution.State -cne 'Clean') {
                                     $recovery.Errors.Add('Recovery uninstall cleanup remains pending/unknown; the bundle was retained and original state was not raced.')

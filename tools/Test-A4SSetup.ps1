@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [switch] $SourceContractsOnly
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -225,6 +227,7 @@ $setupSource = [IO.File]::ReadAllText($setupSourcePath)
 foreach ($requiredMarker in @(
     'kSetupMutexPrefix',
     'kLifecycleMutexPrefix',
+    'A4S_HOST_SAFETY_MUTEX_PREFIX_W',
     'AcquireProductLocks()',
     'kLifecycleKey',
     'kServicingSequenceValue',
@@ -237,7 +240,9 @@ foreach ($requiredMarker in @(
     'Operation::Reconcile',
     'Hex(HashBytes(identity))',
     'SlotNameMatchesPayload(actualName, expectedName)',
-    'NewGuidName(L".repair-")',
+    'PlanDeployment(',
+    'MaterializeDeployment(',
+    'SchemaVersion',
     'DeleteJournalDurably()',
     'ClearSafetyStateChecked()',
     'GetWindowsDirectoryW',
@@ -254,12 +259,13 @@ if ($setupSource.IndexOf('RestoreRegistrationBestEffort', [StringComparison]::Or
 
 $installSource = Get-SourceSection -Source $setupSource -StartMarker 'int InstallOrRepair(' -EndMarker 'int Rollback('
 Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSource -Markers @(
-    'DeploySlot(payloads, oldState.activeSlot)',
+    'PlanDeployment(payloads,',
     'InspectExplorerA4SModules(ExplorerProcessId())',
     'mapped.complete && !mapped.unknownA4SModule',
     'mapped.validatedSlots.size() == 1U',
     'previous = mapped.validatedSlots.front()',
     'BeginJournal(',
+    'MaterializeDeployment(payloads, deployment, journal)',
     'QueueJournalRecovery(recoveryCommand)',
     'StopHost()',
     'PrepareSlotRegistration(newSlot, previous, identity)',
@@ -273,8 +279,9 @@ if ($installSource.IndexOf('resetSafety = options.resetSafety',
 
 $uninstallSource = Get-SourceSection -Source $setupSource -StartMarker 'int Uninstall(' -EndMarker 'int Cleanup('
 Assert-SourceOrder -Description 'Uninstall transaction' -Source $uninstallSource -Markers @(
+    'PlanCleanupHelper(payloads, identity)',
     'BeginJournal(',
-    'PrepareCleanup(payloads)',
+    'PrepareCleanup(payloads, cleanupPlan, journal, identity, cleanup)',
     'StopHost()',
     'PrepareUnregisterProduct(identity)',
     'MarkJournalReady()',
@@ -285,16 +292,19 @@ Assert-SourceOrder -Description 'Uninstall transaction' -Source $uninstallSource
 $cleanupSource = Get-SourceSection -Source $setupSource -StartMarker 'int Cleanup(' -EndMarker 'bool IsSwitch('
 Assert-SourceOrder -Description 'Deferred cleanup cancellation' -Source $cleanupSource -Markers @(
     'FullPath(CleanupHelperPath())',
+    'OpenCleanupImageForSelfDelete()',
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
     'AcquireProductLocks()',
     'ServicingRecoveryStateAllowsReconcile()',
-    'ReconcilePendingJournal()',
+    'ReconcilePendingJournal(&runningCleanupImage)',
     'ReadRawValue(recovery).present',
     'InstalledRegistrationPresent()',
     'RegistrationMatchesCommittedSlot(',
-    'RemoveCanonicalCleanupStateForHelper()',
-    'RequestNativeSelfDelete()')
+    'RemoveCanonicalCleanupStateForHelper(cleanupIdentity)',
+    'RequestNativeSelfDelete(runningCleanupImage)',
+    'CleanupContinuationMatches(cleanupIdentity)',
+    'CleanupKnownInstallTree()')
 if ($cleanupSource.IndexOf('WaitForProcessId(options.waitExplorerId)',
         [StringComparison]::Ordinal) -ge 0 -or
     $cleanupSource.IndexOf('DeleteValueChecked(kRunOnceKey, kCleanupRunOnceValue)',
@@ -352,7 +362,9 @@ Assert-SourceOrder -Description 'Explicit HostSafety reset parsing' -Source $par
     'IsSwitch(argument, L"--update")')
 foreach ($requiredMarker in @('IsSwitch(argument, L"--qualification-operation-token")',
         'options.qualificationToken.size() != 64U',
-        '!IsUpperHex(options.qualificationToken)')) {
+        '!IsUpperHex(options.qualificationToken)',
+        'IsSwitch(argument, L"--cleanup-identity")',
+        'TryParseOperationIdentity(options.cleanupIdentity, parsed)')) {
     if ($parseSource.IndexOf($requiredMarker, [StringComparison]::Ordinal) -lt 0) {
         throw "Hidden qualification-token parsing contract is missing '$requiredMarker'."
     }
@@ -372,15 +384,82 @@ if ($failureSource.IndexOf('DeleteTreeChecked(kStateKey)', [StringComparison]::O
     throw 'Failed-operation recovery can delete the product state instead of restoring its exact snapshot.'
 }
 
-$completeSource = Get-SourceSection -Source $setupSource -StartMarker 'void CompleteJournal(' -EndMarker 'void ReconcilePendingJournal('
+$completeSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void CompleteJournal(const ServicingJournal &journal) {' `
+    -EndMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {'
 Assert-SourceOrder -Description 'Post-commit completion' -Source $completeSource -Markers @(
+    'SetDword(key.get(), L"CompletionStarted", 1)',
+    'RegFlushKey(key.get())',
     'ClearSafetyStateChecked()',
-    'DeleteJournalDurably()',
-    'DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue)')
+    'DeleteValueChecked(kRunOnceKey, kRecoveryRunOnceValue)',
+    'DeleteJournalDurably()')
+
+$beginJournalSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'ServicingJournal BeginJournal(' -EndMarker 'void PersistOwnedPathState('
+Assert-SourceOrder -Description 'Durable filesystem intent before materialization' `
+    -Source $beginJournalSource -Markers @(
+        'journal.previous = CaptureRegistration()',
+        'journal.deployment = *deployment',
+        'journal.cleanupHelper = *cleanupHelper',
+        'SetDword(key.get(), L"CompletionStarted", 0)',
+        'SetDword(key.get(), L"SchemaVersion", 2)',
+        'WriteJournalOwnedPath(key.get(), L"DeploymentStaging"',
+        'WriteJournalOwnedPath(key.get(), L"DeploymentFinal"',
+        'WriteJournalOwnedPath(key.get(), L"CleanupHelper"',
+        'SetDword(key.get(), L"SnapshotComplete", 1)',
+        'RegFlushKey(key.get())')
+
+$rollbackSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void RollBackJournal(ServicingJournal &journal, UniqueHandle *runningCleanupImage)' `
+    -EndMarker 'void CompleteJournal('
+Assert-SourceOrder -Description 'Registration-first owned-only rollback' -Source $rollbackSource -Markers @(
+    'RestoreRegistration(journal.previous)',
+    'RegistrationSnapshotMatches(journal.previous)',
+    'ReleaseOwnedCleanupHelper(journal, runningCleanupImage)',
+    'ReleaseOwnedDeployment(journal, runningCleanupImage)',
+    'DeleteJournalDurably()')
+
+$safetySource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void ClearSafetyStateChecked()' -EndMarker 'void DeleteJournalDurably()'
+Assert-SourceOrder -Description 'Lifecycle-Setup-HostSafety nesting' -Source $safetySource -Markers @(
+    'AcquireHostSafetyMutex()',
+    'DeleteTreeChecked(A4S_HOST_SAFETY_REGISTRY_W)')
+if ([regex]::Matches($setupSource,
+        'DeleteTreeChecked\(A4S_HOST_SAFETY_REGISTRY_W\)').Count -ne 1) {
+    throw 'HostSafety state has an uncoordinated deletion path.'
+}
+
+foreach ($pureMarker in @(
+        'static_assert(CanDeleteOwnedPath(true, true, false, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, false, false, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, true, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, false, true, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, false, false, true, true, false))')) {
+    if ($setupSource.IndexOf($pureMarker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Filesystem rollback decision coverage is missing '$pureMarker'."
+    }
+}
+
+$reconcileSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {' `
+    -EndMarker 'bool StartPreparedCleanup('
+Assert-SourceOrder -Description 'Running recovery image rollback' -Source $reconcileSource -Markers @(
+    'journal.completionStarted && ready && completingTargetMatches',
+    'CompleteJournal(journal)',
+    'journal.deployment.required',
+    'FullPath(ModulePath())',
+    'OpenCleanupImageForSelfDelete()',
+    'rollbackImage = &runningDeploymentImage',
+    'RollBackJournal(journal, rollbackImage)')
 
 $prepareSource = Get-SourceSection -Source $setupSource -StartMarker 'void PrepareSlotRegistration(' -EndMarker 'void CommitSlotStartup('
 if ($prepareSource.IndexOf('kRecoveryRunOnceValue', [StringComparison]::Ordinal) -ge 0) {
     throw 'Install preparation removes its own durable recovery command before the commit marker.'
+}
+
+if ($SourceContractsOnly) {
+    Write-Host 'Validated offline A4SMenuSetup source contracts: durable intent/materialization, exact owned rollback, Explorer gates, and Lifecycle -> Setup -> HostSafety locking.'
+    return
 }
 
 $setupItems = @(Get-ChildItem -LiteralPath $setupStage -Force)

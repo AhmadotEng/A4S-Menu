@@ -206,9 +206,10 @@ $decisionCommands = @($decisionFunction.FindAll({
 Assert-Contract ($decisionCommands.Count -eq 0) 'recovery decision model is no longer side-effect free'
 . ([scriptblock]::Create($decisionFunction.Extent.Text))
 function Invoke-RecoveryModel {
-    param([bool] $Clean, [bool] $Pending, [bool] $KnownClean,
+    param([bool] $Clean, [bool] $KnownOwnedPending, [bool] $KnownClean,
         [bool] $KnownInstalled, [bool] $KnownUninstalled)
-    Get-RecoveryDecision -InstallerOwnedClean $Clean -ExactPendingCleanup $Pending `
+    Get-RecoveryDecision -InstallerOwnedClean $Clean `
+        -KnownOwnedPendingCleanup $KnownOwnedPending `
         -KnownOwnedRestorableClean $KnownClean -KnownOwnedInstalled $KnownInstalled `
         -KnownOwnedUninstalled $KnownUninstalled
 }
@@ -216,8 +217,10 @@ Assert-Contract ((Invoke-RecoveryModel $true $false $true $true $false) -ceq
     'RestoreCleanNoUninstall') 'known clean state can select uninstall'
 Assert-Contract ((Invoke-RecoveryModel $true $false $false $true $false) -ceq
     'RetainCleanUnknownNoMutation') 'unknown/concurrent clean state is mutated'
-Assert-Contract ((Invoke-RecoveryModel $false $true $false $true $false) -ceq
-    'WaitPendingNoUninstall') 'exact pending cleanup can select uninstall'
+Assert-Contract ((Invoke-RecoveryModel $false $false $false $false $false) -ceq
+    'RetainUnknownNoMutation') 'external exact-looking pending cleanup is treated as owned'
+Assert-Contract ((Invoke-RecoveryModel $false $true $false $false $true) -ceq
+    'WaitPendingNoUninstall') 'known-owned pending cleanup is not observed safely'
 Assert-Contract ((Invoke-RecoveryModel $false $false $false $true $false) -ceq
     'UninstallKnownOwned') 'coherent owned installed state does not select uninstall'
 Assert-Contract ((Invoke-RecoveryModel $false $false $false $false $false) -ceq
@@ -282,6 +285,8 @@ Assert-ContainsOrdinal $setupSource 'kSetupMutexPrefix[] = L"Global\\A4SMenu.Set
     'native setup mutex prefix does not match the harness product-coordination name'
 Assert-ContainsOrdinal $setupSource 'kLifecycleMutexPrefix[] = L"Global\\A4SMenu.Lifecycle.v1."' `
     'native lifecycle mutex prefix does not match the harness product-coordination name'
+Assert-ContainsOrdinal $setupSource 'A4S_HOST_SAFETY_MUTEX_PREFIX_W' `
+    'native setup does not share the raw-SID HostSafety mutex namespace'
 $acquireSource = (Get-FunctionAst -Ast $ast -Name 'Acquire-LifecycleMutex').Extent.Text
 $productAcquireSource = (Get-FunctionAst -Ast $ast -Name 'Acquire-ProductMutationLocks').Extent.Text
 foreach ($leaseSource in @($acquireSource, $productAcquireSource)) {
@@ -312,8 +317,15 @@ Assert-OrderedMarkers $journalSource @(
     'journal.previous = CaptureRegistration()',
     'journal.operationSequence = identity.sequence',
     'journal.operationToken = identity.token',
+    'journal.deployment = *deployment',
+    'journal.cleanupHelper = *cleanupHelper',
+    'SetDword(key.get(), L"CompletionStarted", 0)',
+    'SetDword(key.get(), L"SchemaVersion", 2)',
     'SetQword(key.get(), L"OperationSequence", identity.sequence)',
     'SetString(key.get(), L"OperationToken", identity.token)',
+    'WriteJournalOwnedPath(key.get(), L"DeploymentStaging"',
+    'WriteJournalOwnedPath(key.get(), L"DeploymentFinal"',
+    'WriteJournalOwnedPath(key.get(), L"CleanupHelper"',
     'SetDword(key.get(), L"SnapshotComplete", 1)',
     'RegFlushKey(key.get())') 'journaled sequence/token transaction'
 $nativeMainSource = $setupSource.Substring($setupSource.IndexOf('int WINAPI wWinMain('))
@@ -434,6 +446,30 @@ foreach ($marker in @(
         'The DataCache recovery backup no longer matches the immutable manifest',
         'ExpectedAggregate.Fingerprint')) {
     Assert-ContainsOrdinal $source $marker "immutable recovery contract is missing '$marker'"
+}
+foreach ($marker in @('$knownOwnedPending = $exactPending',
+        '$owned.Kind -ceq ''UninstalledPending''',
+        '$null -ne $owned.QualificationOperation',
+        "-Label 'failure-recovery-owned-pending-cleanup'",
+        '-KnownOwnedPendingCleanup $knownOwnedPending')) {
+    Assert-ContainsOrdinal $recoverySource $marker `
+        "pending-cleanup ownership proof is missing '$marker'"
+}
+$pendingWaitSource = (Get-FunctionAst -Ast $ast `
+    -Name 'Wait-ForPendingCleanupResolution').Extent.Text
+foreach ($marker in @('[uint64] $ExpectedSequence', '[string] $ExpectedToken',
+        'Assert-ExactQualificationOperation -Aggregate $aggregate',
+        "State = 'Unknown'")) {
+    Assert-ContainsOrdinal $pendingWaitSource $marker `
+        "pending-cleanup continuity check is missing '$marker'"
+}
+foreach ($marker in @(
+        '-ExpectedSequence ([uint64]$owned.QualificationOperation.ExpectedSequence)',
+        '-ExpectedToken ([string]$owned.QualificationOperation.Token)',
+        '-ExpectedSequence ([uint64]$recovery.SetupUninstall.QualificationOperation.ExpectedSequence)',
+        '-ExpectedToken ([string]$recovery.SetupUninstall.QualificationOperation.Token)')) {
+    Assert-ContainsOrdinal $recoverySource $marker `
+        "pending-cleanup recovery call is missing '$marker'"
 }
 
 # Registration and cleanup are one repeated stable aggregate, and every
@@ -571,7 +607,7 @@ $registryBackendTest = Invoke-RegistryRestoreBackendSelfTest
 Assert-Contract ([bool]$registryBackendTest.Passed -and
     [int]$registryBackendTest.MutationStepsTested -gt 0 -and
     [string]$registryBackendTest.Sandbox -match
-        '^Software\\A4SMenu\\Tests\\RegistryRestore\\[0-9A-F]{32}$') `
+        '^Software\\A4SMenuLifecycleRegistryRestoreTest\.[0-9A-F]{32}$') `
     'production registry restoration backend no-op/success/failure rollback test failed'
 
 # Execute the installed-process ownership model. Exact active-host records may
@@ -661,17 +697,18 @@ $cleanupSource = Get-SourceSection -Text $setupSource -StartMarker 'int Cleanup(
     -EndMarker 'bool IsSwitch('
 Assert-OrderedMarkers $cleanupSource @(
     'FullPath(CleanupHelperPath())',
+    'OpenCleanupImageForSelfDelete()',
     'WaitForProcessId(options.waitProcessId)',
     'WaitForProcessOrInstalledState(options.waitExplorerId)',
     'AcquireProductLocks()',
     'ServicingRecoveryStateAllowsReconcile()',
-    'ReconcilePendingJournal()',
+    'ReconcilePendingJournal(&runningCleanupImage)',
     'ReadRawValue(recovery).present',
     'InstalledRegistrationPresent()',
     'RegistrationMatchesCommittedSlot(',
-    'RemoveCanonicalCleanupStateForHelper()',
-    'RequestNativeSelfDelete()',
-    'StringValueEquals(kRunOnceKey, kCleanupRunOnceValue, expectedCleanup)',
+    'RemoveCanonicalCleanupStateForHelper(cleanupIdentity)',
+    'RequestNativeSelfDelete(runningCleanupImage)',
+    'CleanupContinuationMatches(cleanupIdentity)',
     'CleanupKnownInstallTree()') 'stale cleanup cancellation and canonical ownership'
 Assert-Contract ($cleanupSource.IndexOf('WaitForProcessId(options.waitExplorerId)',
         [StringComparison]::Ordinal) -lt 0) 'cleanup can still wait forever without observing reinstall'
@@ -680,15 +717,59 @@ Assert-Contract ($cleanupSource.IndexOf('DeleteValueChecked(kRunOnceKey, kCleanu
 $installSource = Get-SourceSection -Text $setupSource -StartMarker 'int InstallOrRepair(' `
     -EndMarker 'int Rollback('
 Assert-OrderedMarkers $installSource @(
-    'DeploySlot(payloads, oldState.activeSlot)',
+    'PlanDeployment(payloads,',
     'InspectExplorerA4SModules(ExplorerProcessId())',
     'mapped.complete && !mapped.unknownA4SModule',
     'mapped.validatedSlots.size() == 1U',
     'previous = mapped.validatedSlots.front()',
     'BeginJournal(',
+    'MaterializeDeployment(payloads, deployment, journal)',
     'PrepareSlotRegistration(newSlot, previous, identity)',
     'CompleteJournal(journal)',
     'PruneObsoleteSlotsBestEffort') 'mapped rollback-slot retention'
+
+$rollbackSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void RollBackJournal(ServicingJournal &journal, UniqueHandle *runningCleanupImage)' `
+    -EndMarker 'void CompleteJournal(const ServicingJournal &journal) {'
+Assert-OrderedMarkers $rollbackSource @(
+    'RestoreRegistration(journal.previous)',
+    'RegistrationSnapshotMatches(journal.previous)',
+    'ReleaseOwnedCleanupHelper(journal, runningCleanupImage)',
+    'ReleaseOwnedDeployment(journal, runningCleanupImage)',
+    'DeleteJournalDurably()') 'registration-first exact-owned filesystem rollback'
+
+$hostSafetySource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void ClearSafetyStateChecked()' `
+    -EndMarker 'void DeleteJournalDurably()'
+Assert-OrderedMarkers $hostSafetySource @(
+    'AcquireHostSafetyMutex()',
+    'DeleteTreeChecked(A4S_HOST_SAFETY_REGISTRY_W)') `
+    'Lifecycle-Setup-HostSafety lock nesting'
+Assert-Contract ([regex]::Matches($setupSource,
+        'DeleteTreeChecked\(A4S_HOST_SAFETY_REGISTRY_W\)').Count -eq 1) `
+    'HostSafety has an uncoordinated setup deletion path'
+
+foreach ($marker in @(
+        'static_assert(CanDeleteOwnedPath(true, true, false, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, false, false, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, true, false, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, false, true, true, false, false))',
+        'static_assert(!CanDeleteOwnedPath(true, true, false, false, true, true, false))')) {
+    Assert-ContainsOrdinal $setupSource $marker `
+        "native owned-path failure decision matrix omits '$marker'"
+}
+$nativeReconcileSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'void ReconcilePendingJournal(UniqueHandle *runningCleanupImage) {' `
+    -EndMarker 'bool StartPreparedCleanup('
+Assert-OrderedMarkers $nativeReconcileSource @(
+    'journal.completionStarted && ready && completingTargetMatches',
+    'CompleteJournal(journal)',
+    'journal.deployment.required',
+    'FullPath(ModulePath())',
+    'OpenCleanupImageForSelfDelete()',
+    'rollbackImage = &runningDeploymentImage',
+    'RollBackJournal(journal, rollbackImage)') `
+    'running recovery image exact self-delete before owned slot release'
 $moduleInspectionSource = Get-SourceSection -Text $setupSource `
     -StartMarker 'struct ExplorerModuleInspection' `
     -EndMarker 'bool StartHost('
