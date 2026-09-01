@@ -318,7 +318,7 @@ function Get-StableFileEvidence {
     $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $sha = [Security.Cryptography.SHA256]::Create()
-        try { $hash = [Convert]::ToHexString($sha.ComputeHash($stream)) }
+        try { $hash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
         finally { $sha.Dispose() }
         [ordered]@{ path = $resolved; length = $stream.Length; sha256 = $hash }
     }

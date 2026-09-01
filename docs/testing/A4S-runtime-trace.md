@@ -148,7 +148,8 @@ The custom-trace target evaluation covers:
 - zero incomplete-operation/cycle diagnostics.
 
 Use `-EnforceTargets` when a non-passing custom trace should make the command
-fail after preserving its ETL and writing the report.
+fail after preserving its raw ETL. A failed enforced evaluation does not replace
+an existing decoded-XML/report pair with a non-passing pair.
 
 Programs enumeration and first-input search initialization require a separate
 manual phase trace; they are not exercised by repeated open/close cycles:
@@ -178,11 +179,18 @@ An existing ETL can be decoded again without running or touching the product:
     -RefreshRateHz 239
 ```
 
-`-Force` permits atomically replacing only derived XML/JSON files. The raw ETL
-is never modified. Raw ETL/event input, decoded XML, and JSON report paths must
-all be distinct; `-Force` cannot waive that rule. An existing target must also
-parse as the corresponding A4S schema-2 report or A4S tracerpt XML, so `-Force`
-cannot be used as a general arbitrary-file replacement switch.
+`-Force` permits replacing only recognizable derived XML/JSON files. ETL
+conversion stages both new artifacts before publishing either one, retains both
+prior artifacts until post-publication hash validation passes, and restores the
+prior pair if a later publication or validation step fails. Raw ETL/event input,
+decoded XML, and JSON report paths must be lexically and physically distinct;
+hard-link aliases, alternate data streams, reparse-point path components, and
+an incomplete prior ETL-derived pair are refused. The converter holds stable
+read leases and revalidates file identity, length, and SHA-256 before commit.
+These safeguards prevent accidental/concurrent converter collisions; they are
+not presented as a security boundary against a privileged process racing the
+filesystem. An existing target must parse as the corresponding A4S schema-2
+report or A4S tracerpt XML, so `-Force` is not a general replacement switch.
 `-EventJsonPath` exists for deterministic synthetic/offline tests.
 Offline `-EnforceTargets` cannot pass without an explicit
 `-ExpectedCycleCount`; this prevents a truncated ETL from validating itself.

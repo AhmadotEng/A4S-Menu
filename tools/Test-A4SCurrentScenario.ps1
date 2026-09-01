@@ -272,7 +272,7 @@ function Get-StableFileEvidence {
     $stream = [IO.File]::Open($resolved, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $sha = [Security.Cryptography.SHA256]::Create()
-        try { $hash = [Convert]::ToHexString($sha.ComputeHash($stream)) }
+        try { $hash = [BitConverter]::ToString($sha.ComputeHash($stream)).Replace('-', '') }
         finally { $sha.Dispose() }
         [pscustomobject][ordered]@{ path = $resolved; length = $stream.Length; sha256 = $hash }
     }
@@ -308,7 +308,7 @@ function Write-A4SMatrixAtomically {
 function Get-A4SMatrixMutexName {
     param([Parameter(Mandatory)][string] $Path)
     $sha = [Security.Cryptography.SHA256]::Create()
-    try { $hash = [Convert]::ToHexString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Path.ToUpperInvariant()))) }
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($Path.ToUpperInvariant()))).Replace('-', '') }
     finally { $sha.Dispose() }
     "Local\A4SMenu.ScenarioMatrix.v1.$hash"
 }
@@ -496,10 +496,10 @@ if ($AllowMenuAutomation) {
         [A4SScenarioNative]::Toggle($hostWindow)
         $visibleWindows = @(Wait-MenuState -Visible $true -OwnerProcessId $explorerProcessId)
         if ($visibleWindows.Count -ne 1) { throw "Open/close automation found $($visibleWindows.Count) visible A4S menu windows; expected one." }
-        [A4SScenarioNative]::FlushDwmChecked()
         $menuWindow = [IntPtr]$visibleWindows[0]
         $automationMenuWindow = $menuWindow
         $automationMenuExpectedVisible = $true
+        [A4SScenarioNative]::FlushDwmChecked()
         if ([A4SScenarioNative]::GetForegroundWindow() -ne $menuWindow) { throw 'The opened A4S menu was not the foreground top-level window.' }
         $menu = [A4SScenarioNative]::Describe($menuWindow)
         if ($menu.Dpi -eq 0) { throw 'GetDpiForWindow returned zero for the A4S menu; DPI evidence is unavailable.' }

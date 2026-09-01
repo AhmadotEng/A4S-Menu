@@ -437,6 +437,9 @@ function Invoke-A4SToggleCycle {
     $ExpectedVisible.Value = $true
     [A4SRuntimeTraceNative]::FlushDwm()
     $cycleRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate([IntPtr]$windows[0])
+    if ($cycleRefreshRateHz -eq 0) {
+        throw 'The actual visible menu monitor did not report a valid nonzero nominal refresh rate for this cycle.'
+    }
     if ($VisibleSettleMilliseconds -gt 0) { [Threading.Thread]::Sleep($VisibleSettleMilliseconds) }
     [A4SRuntimeTraceNative]::Toggle($HostWindow, 2500)
     [void](Wait-A4SMenuVisibility -Visible $false -ExplorerProcessId $ExplorerProcessId -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
@@ -586,6 +589,11 @@ $requestedRefreshRateHz = $RefreshRateHz
 $observedNominalRefreshRateHz = 0
 $refreshRateSource = $null
 $automatedMenuRefreshRates = [Collections.Generic.List[uint32]]::new()
+$warmupMenuRefreshRates = [Collections.Generic.List[uint32]]::new()
+$capturedMenuRefreshRates = [Collections.Generic.List[uint32]]::new()
+$attemptedAutomatedCycles = 0
+$attemptedWarmupCycles = 0
+$attemptedCapturedCycles = 0
 if (-not $OutputDirectory) {
     $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff')
     $OutputDirectory = Join-Path $repoRoot "build\test-results\A4S-runtime-trace-$stamp-$PID"
@@ -615,9 +623,12 @@ try {
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
             -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
             -ExpectedLogonId $observerLogonId)
+        $attemptedWarmupCycles++
+        $attemptedAutomatedCycles++
         $cycleResult = Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId `
             -ExpectedVisible ([ref]$automationMenuExpectedVisible) -OpenedWindow ([ref]$automationMenuWindow)
-        if ($cycleResult.refreshRateHz -gt 0) { [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz) }
+        [void]$warmupMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz)
+        [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz)
     }
     if ([A4SRuntimeTraceNative]::HostStatus($hostWindow, 2500) -ne 3) { throw 'A4SMenuHost left READY during warm-up.' }
     $startArguments = @(
@@ -642,9 +653,12 @@ try {
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
             -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
             -ExpectedLogonId $observerLogonId)
+        $attemptedCapturedCycles++
+        $attemptedAutomatedCycles++
         $cycleResult = Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId `
             -ExpectedVisible ([ref]$automationMenuExpectedVisible) -OpenedWindow ([ref]$automationMenuWindow)
-        if ($cycleResult.refreshRateHz -gt 0) { [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz) }
+        [void]$capturedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz)
+        [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz)
         $completedCycles++
     }
     if ($ManualInteractionSeconds -gt 0) {
@@ -696,6 +710,14 @@ try {
 }
 
 try {
+    if ($automatedMenuRefreshRates.Count -ne $attemptedAutomatedCycles -or
+        $warmupMenuRefreshRates.Count -ne $attemptedWarmupCycles -or
+        $capturedMenuRefreshRates.Count -ne $attemptedCapturedCycles) {
+        throw "Actual menu-monitor refresh evidence is incomplete: recorded $($automatedMenuRefreshRates.Count) values for $attemptedAutomatedCycles attempted automated cycles."
+    }
+    if (@($automatedMenuRefreshRates | Where-Object { $_ -eq 0 }).Count -ne 0) {
+        throw 'Actual menu-monitor refresh evidence contains an invalid zero value.'
+    }
     $uniqueMenuRefreshRates = @($automatedMenuRefreshRates | Sort-Object -Unique)
     if ($uniqueMenuRefreshRates.Count -gt 1) {
         throw "Automated trace cycles used menu monitors with different nominal refresh rates: $($uniqueMenuRefreshRates -join ', ') Hz. Run each monitor/rate as a separate trace."
@@ -703,30 +725,35 @@ try {
     if ($uniqueMenuRefreshRates.Count -eq 1) {
         $observedNominalRefreshRateHz = [double]$uniqueMenuRefreshRates[0]
     }
-    if ($requestedRefreshRateHz -gt 0) {
-        $RefreshRateHz = $requestedRefreshRateHz
-        $refreshRateSource = if ($observedNominalRefreshRateHz -gt 0) {
-            'operator-supplied-and-checked-against-the-actual-menu-monitor-current-mode-integer'
+    if ($attemptedAutomatedCycles -gt 0) {
+        if ($uniqueMenuRefreshRates.Count -ne 1 -or $observedNominalRefreshRateHz -le 0) {
+            throw 'Every automated cycle must provide one valid actual menu-monitor refresh rate; operator input cannot replace missing cycle evidence.'
+        }
+        if ($requestedRefreshRateHz -gt 0 -and
+            [Math]::Abs($requestedRefreshRateHz - $observedNominalRefreshRateHz) -gt 1.0) {
+            throw "The supplied refresh rate $requestedRefreshRateHz Hz differs materially from the actual menu monitor's current-mode integer value $observedNominalRefreshRateHz Hz. Recheck the active display before using a one-frame target."
+        }
+        $RefreshRateHz = $observedNominalRefreshRateHz
+        $refreshRateSource = if ($requestedRefreshRateHz -gt 0) {
+            'actual-menu-monitor EnumDisplaySettings current-mode integer; operator value cross-checked only'
         } else {
-            'operator-supplied; actual-menu-monitor rate unavailable for comparison'
+            'actual-menu-monitor EnumDisplaySettings current-mode integer'
         }
-        if ($observedNominalRefreshRateHz -gt 0 -and
-            [Math]::Abs($RefreshRateHz - $observedNominalRefreshRateHz) -gt 1.0) {
-            throw "The supplied refresh rate $RefreshRateHz Hz differs materially from the actual menu monitor's current-mode integer value $observedNominalRefreshRateHz Hz. Recheck the active display before using a one-frame target."
-        }
-    } elseif ($observedNominalRefreshRateHz -gt 0) {
-        $RefreshRateHz = $observedNominalRefreshRateHz
-        $refreshRateSource = 'actual-menu-monitor EnumDisplaySettings current-mode integer'
     } elseif ($ManualInteractionSeconds -gt 0) {
-        # Manual phase capture does not own the user's menu HWND. Retain an
-        # explicitly labeled taskbar-monitor fallback; pass -RefreshRateHz when
-        # the manual interaction will occur on another monitor.
-        $observedNominalRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
-        $RefreshRateHz = $observedNominalRefreshRateHz
-        $refreshRateSource = 'manual-phase taskbar-monitor fallback; no automated menu window was observed'
-        if ($RefreshRateHz -eq 0) { throw 'Could not determine a fallback refresh rate for the manual phase; pass -RefreshRateHz explicitly.' }
+        if ($requestedRefreshRateHz -gt 0) {
+            $RefreshRateHz = $requestedRefreshRateHz
+            $refreshRateSource = 'manual-phase operator-supplied; no tool-owned menu window was observed'
+        } else {
+            # Manual phase capture does not own the user's menu HWND. Retain an
+            # explicitly labeled taskbar-monitor fallback; pass -RefreshRateHz
+            # when the manual interaction will occur on another monitor.
+            $observedNominalRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
+            $RefreshRateHz = $observedNominalRefreshRateHz
+            $refreshRateSource = 'manual-phase taskbar-monitor fallback; no automated menu window was observed'
+            if ($RefreshRateHz -eq 0) { throw 'Could not determine a fallback refresh rate for the manual phase; pass -RefreshRateHz explicitly.' }
+        }
     } else {
-        throw 'Could not determine the actual automated menu monitor refresh rate; pass -RefreshRateHz explicitly and investigate EnumDisplaySettings.'
+        throw 'No automated or manual refresh-rate evidence path was selected.'
     }
     [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
         -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
@@ -828,6 +855,11 @@ if (Test-Path -LiteralPath $reportPath -PathType Leaf) {
             requestedCycles = $CapturedCycles
             completedCycles = $completedCycles
             warmupCycles = $WarmupCycles
+            attemptedAutomatedCycles = $attemptedAutomatedCycles
+            attemptedWarmupCycles = $attemptedWarmupCycles
+            attemptedCapturedCycles = $attemptedCapturedCycles
+            warmupMenuMonitorRefreshRatesHz = @($warmupMenuRefreshRates)
+            capturedMenuMonitorRefreshRatesHz = @($capturedMenuRefreshRates)
             manualInteractionSeconds = $ManualInteractionSeconds
             tracePurpose = if ($ManualInteractionSeconds -gt 0) { 'manual Programs/search/interaction phase capture; target enforcement disabled' } else { 'automated open/close target capture' }
             refreshRateHz = $RefreshRateHz

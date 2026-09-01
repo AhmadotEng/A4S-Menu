@@ -245,10 +245,12 @@ paint, search initialization, preload, hiding, and repaint rectangles. Capture
 ```
 
 `239` is the qualification machine's current configured rate; recheck it if
-the display mode changes. The supplied value is compared with the current-mode
-integer reported by `EnumDisplaySettings` for the actual menu monitor. Every
-automated cycle must report the same nominal rate; mixed-rate monitor cycles
-are rejected and must be captured separately. The report uses the unrounded
+the display mode changes. For automated traces the supplied value is only a
+cross-check: every warm-up and captured cycle must record a valid nonzero
+current-mode integer from `EnumDisplaySettings` for that cycle's actual visible
+menu monitor. The recorded count must equal the attempted-cycle count, and the
+actual observed rate drives target math. Missing or mixed-rate evidence is
+rejected; operator input cannot replace it. The report uses the unrounded
 `1000 / refresh-rate` budget (4.184100... ms at 239 Hz), while displaying
 rounded values for readability.
 
@@ -256,7 +258,8 @@ The capture validates the staged paths and SHA-256 hashes, the resident and
 file PE/RSDS identities, Explorer/host PIDs and start times, numeric session,
 token logon identity, disabled StartAllBack state, exact requested cycle count,
 and end-of-run identity. It preserves the raw ETL, decoded-XML hash, report,
-session logs, and capture metadata in a new directory. The parser rejects
+per-cycle monitor-rate evidence, session logs, and capture metadata in a new
+directory. The parser rejects
 mixed-process, duplicated, incomplete, and under-sampled traces.
 
 Custom markers authoritatively measure application activation-to-visible,

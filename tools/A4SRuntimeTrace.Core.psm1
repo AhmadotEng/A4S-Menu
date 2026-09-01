@@ -524,4 +524,143 @@ function ConvertTo-A4SRuntimeReport {
     }
 }
 
-Export-ModuleMember -Function ConvertFrom-A4STracerptXml, Import-A4SEventJson, ConvertTo-A4SRuntimeReport
+function Restore-A4SPublishedArtifact {
+    param(
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [Parameter(Mandatory)][bool]$ExistedBefore,
+        [Parameter(Mandatory)][bool]$WasPublished,
+        [string]$BackupPath
+    )
+
+    if (-not $WasPublished) { return }
+    if ($ExistedBefore) {
+        if (-not $BackupPath -or -not [IO.File]::Exists($BackupPath)) {
+            throw "The prior artifact backup is unavailable for '$DestinationPath'."
+        }
+        if ([IO.File]::Exists($DestinationPath)) {
+            $discard = "$DestinationPath.rollback-discard-$PID-$([Guid]::NewGuid().ToString('N'))"
+            try {
+                [IO.File]::Replace($BackupPath, $DestinationPath, $discard, $true)
+            } finally {
+                if ([IO.File]::Exists($discard)) { [IO.File]::Delete($discard) }
+            }
+        } else {
+            [IO.File]::Move($BackupPath, $DestinationPath)
+        }
+    } elseif ([IO.File]::Exists($DestinationPath)) {
+        [IO.File]::Delete($DestinationPath)
+    }
+}
+
+function Publish-A4SArtifactPairTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$XmlStagedPath,
+        [Parameter(Mandatory)][string]$XmlDestinationPath,
+        [Parameter(Mandatory)][string]$JsonStagedPath,
+        [Parameter(Mandatory)][string]$JsonDestinationPath,
+        [scriptblock]$PostPublishValidation
+    )
+
+    foreach ($stage in @($XmlStagedPath, $JsonStagedPath)) {
+        if (-not [IO.File]::Exists($stage)) { throw "A staged artifact is missing: '$stage'." }
+    }
+    if ([StringComparer]::OrdinalIgnoreCase.Equals(
+        [IO.Path]::GetFullPath($XmlDestinationPath),
+        [IO.Path]::GetFullPath($JsonDestinationPath))) {
+        throw 'The XML and JSON transaction destinations must be distinct.'
+    }
+
+    $xmlExisted = [IO.File]::Exists($XmlDestinationPath)
+    $jsonExisted = [IO.File]::Exists($JsonDestinationPath)
+    $xmlBackup = if ($xmlExisted) { "$XmlDestinationPath.backup-$PID-$([Guid]::NewGuid().ToString('N'))" } else { $null }
+    $jsonBackup = if ($jsonExisted) { "$JsonDestinationPath.backup-$PID-$([Guid]::NewGuid().ToString('N'))" } else { $null }
+    $xmlPublished = $false
+    $jsonPublished = $false
+    $committed = $false
+    try {
+        if ($xmlExisted) {
+            [IO.File]::Replace($XmlStagedPath, $XmlDestinationPath, $xmlBackup, $true)
+        } else {
+            [IO.File]::Move($XmlStagedPath, $XmlDestinationPath)
+        }
+        $xmlPublished = $true
+
+        if ($jsonExisted) {
+            [IO.File]::Replace($JsonStagedPath, $JsonDestinationPath, $jsonBackup, $true)
+        } else {
+            [IO.File]::Move($JsonStagedPath, $JsonDestinationPath)
+        }
+        $jsonPublished = $true
+
+        if ($PostPublishValidation) { & $PostPublishValidation }
+        $committed = $true
+    } catch {
+        $publishFailure = $_
+        $rollbackFailures = [Collections.Generic.List[string]]::new()
+        try {
+            Restore-A4SPublishedArtifact -DestinationPath $JsonDestinationPath `
+                -ExistedBefore $jsonExisted -WasPublished $jsonPublished -BackupPath $jsonBackup
+        } catch { [void]$rollbackFailures.Add("JSON rollback failed: $($_.Exception.Message)") }
+        try {
+            Restore-A4SPublishedArtifact -DestinationPath $XmlDestinationPath `
+                -ExistedBefore $xmlExisted -WasPublished $xmlPublished -BackupPath $xmlBackup
+        } catch { [void]$rollbackFailures.Add("XML rollback failed: $($_.Exception.Message)") }
+        if ($rollbackFailures.Count) {
+            throw "Artifact-pair publication failed: $($publishFailure.Exception.Message) Rollback was incomplete: $($rollbackFailures -join ' ')"
+        }
+        throw $publishFailure
+    } finally {
+        foreach ($stage in @($XmlStagedPath, $JsonStagedPath)) {
+            if ([IO.File]::Exists($stage)) { [IO.File]::Delete($stage) }
+        }
+        if ($committed) {
+            foreach ($backup in @($xmlBackup, $jsonBackup)) {
+                if ($backup -and [IO.File]::Exists($backup)) {
+                    try { [IO.File]::Delete($backup) }
+                    catch { Write-Warning "The artifact pair committed, but backup cleanup failed for '$backup': $($_.Exception.Message)" }
+                }
+            }
+        }
+    }
+}
+
+function Publish-A4SSingleArtifactTransaction {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$StagedPath,
+        [Parameter(Mandatory)][string]$DestinationPath,
+        [scriptblock]$PostPublishValidation
+    )
+
+    if (-not [IO.File]::Exists($StagedPath)) { throw "A staged artifact is missing: '$StagedPath'." }
+    $existed = [IO.File]::Exists($DestinationPath)
+    $backup = if ($existed) { "$DestinationPath.backup-$PID-$([Guid]::NewGuid().ToString('N'))" } else { $null }
+    $published = $false
+    $committed = $false
+    try {
+        if ($existed) { [IO.File]::Replace($StagedPath, $DestinationPath, $backup, $true) }
+        else { [IO.File]::Move($StagedPath, $DestinationPath) }
+        $published = $true
+        if ($PostPublishValidation) { & $PostPublishValidation }
+        $committed = $true
+    } catch {
+        $publishFailure = $_
+        try {
+            Restore-A4SPublishedArtifact -DestinationPath $DestinationPath `
+                -ExistedBefore $existed -WasPublished $published -BackupPath $backup
+        } catch {
+            throw "Artifact publication failed: $($publishFailure.Exception.Message) Rollback failed: $($_.Exception.Message)"
+        }
+        throw $publishFailure
+    } finally {
+        if ([IO.File]::Exists($StagedPath)) { [IO.File]::Delete($StagedPath) }
+        if ($committed -and $backup -and [IO.File]::Exists($backup)) {
+            try { [IO.File]::Delete($backup) }
+            catch { Write-Warning "The artifact committed, but backup cleanup failed for '$backup': $($_.Exception.Message)" }
+        }
+    }
+}
+
+Export-ModuleMember -Function ConvertFrom-A4STracerptXml, Import-A4SEventJson, ConvertTo-A4SRuntimeReport, `
+    Publish-A4SArtifactPairTransaction, Publish-A4SSingleArtifactTransaction

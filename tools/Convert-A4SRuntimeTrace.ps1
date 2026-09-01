@@ -28,9 +28,83 @@ Set-StrictMode -Version 2.0
 
 Import-Module (Join-Path $PSScriptRoot 'A4SRuntimeTrace.Core.psm1') -Force
 
+if (-not ('A4STraceFileLeaseNative' -as [type])) {
+    Add-Type -TypeDefinition @'
+using System;
+using System.ComponentModel;
+using System.Globalization;
+using System.Runtime.InteropServices;
+using Microsoft.Win32.SafeHandles;
+
+public static class A4STraceFileLeaseNative
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct FILETIME { public uint LowDateTime, HighDateTime; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct BY_HANDLE_FILE_INFORMATION
+    {
+        public uint FileAttributes;
+        public FILETIME CreationTime, LastAccessTime, LastWriteTime;
+        public uint VolumeSerialNumber, FileSizeHigh, FileSizeLow, NumberOfLinks;
+        public uint FileIndexHigh, FileIndexLow;
+    }
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool GetFileInformationByHandle(
+        SafeFileHandle file, out BY_HANDLE_FILE_INFORMATION information);
+
+    public static string Identity(SafeFileHandle file)
+    {
+        BY_HANDLE_FILE_INFORMATION information;
+        if (!GetFileInformationByHandle(file, out information))
+            throw new Win32Exception(Marshal.GetLastWin32Error());
+        return string.Format(CultureInfo.InvariantCulture, "{0:X8}:{1:X8}{2:X8}",
+            information.VolumeSerialNumber, information.FileIndexHigh, information.FileIndexLow);
+    }
+}
+'@
+}
+
 function Resolve-A4SOutputPath {
     param([Parameter(Mandatory)][string]$Path)
     return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
+}
+
+function Assert-A4SReparseFreePath {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $root = [IO.Path]::GetPathRoot($fullPath)
+    if (-not $root) { throw "Artifact path is not rooted: '$Path'." }
+    if ($fullPath.Substring($root.Length).Contains(':')) {
+        throw "Artifact paths may not use alternate data streams: '$fullPath'."
+    }
+
+    $current = $fullPath
+    while ($current) {
+        if (Test-Path -LiteralPath $current) {
+            $item = Get-Item -LiteralPath $current -Force -ErrorAction Stop
+            if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+                throw "Trace conversion refuses a reparse-point path component: '$($item.FullName)'."
+            }
+        }
+        $parent = Split-Path -Parent $current
+        if (-not $parent -or [StringComparer]::OrdinalIgnoreCase.Equals($parent, $current)) { break }
+        $current = $parent
+    }
+}
+
+function Ensure-A4SSafeParentDirectory {
+    param([Parameter(Mandatory)][string]$Path)
+
+    $directory = Split-Path -Parent $Path
+    if (-not $directory) { throw "Artifact path has no parent directory: '$Path'." }
+    Assert-A4SReparseFreePath -Path $directory
+    if (-not (Test-Path -LiteralPath $directory -PathType Container)) {
+        New-Item -ItemType Directory -Path $directory -Force | Out-Null
+    }
+    Assert-A4SReparseFreePath -Path $directory
 }
 
 function Assert-A4SDistinctArtifactPaths {
@@ -45,6 +119,76 @@ function Assert-A4SDistinctArtifactPaths {
                 [IO.Path]::GetFullPath([string]$Paths[$leftName]),
                 [IO.Path]::GetFullPath([string]$Paths[$rightName]))) {
                 throw "Trace conversion requires distinct $leftName and $rightName paths. -Force never authorizes replacing the raw input or aliasing two derived artifacts."
+            }
+        }
+    }
+}
+
+function Get-A4SStreamSha256 {
+    param([Parameter(Mandatory)][IO.FileStream]$Stream)
+
+    $position = $Stream.Position
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try {
+        $Stream.Position = 0
+        return [BitConverter]::ToString($sha.ComputeHash($Stream)).Replace('-', '')
+    } finally {
+        $Stream.Position = $position
+        $sha.Dispose()
+    }
+}
+
+function New-A4SReadLease {
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][string]$Path)
+
+    Assert-A4SReparseFreePath -Path $Path
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { throw "$Name is not a regular file: '$Path'." }
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::Read, 4096, [IO.FileOptions]::SequentialScan)
+    try {
+        return [pscustomobject]@{
+            name = $Name
+            path = [IO.Path]::GetFullPath($Path)
+            stream = $stream
+            identity = [A4STraceFileLeaseNative]::Identity($stream.SafeFileHandle)
+            length = $stream.Length
+            sha256 = Get-A4SStreamSha256 -Stream $stream
+        }
+    } catch {
+        $stream.Dispose()
+        throw
+    }
+}
+
+function Close-A4SReadLease {
+    param($Lease)
+    if ($Lease -and $Lease.stream) {
+        $Lease.stream.Dispose()
+        $Lease.stream = $null
+    }
+}
+
+function Assert-A4SLeaseStillMatchesPath {
+    param([Parameter(Mandatory)]$Lease)
+
+    Assert-A4SReparseFreePath -Path $Lease.path
+    $verification = New-A4SReadLease -Name "$($Lease.name) verification" -Path $Lease.path
+    try {
+        if ($verification.identity -ne $Lease.identity -or
+            $verification.length -ne $Lease.length -or
+            -not [StringComparer]::OrdinalIgnoreCase.Equals($verification.sha256, $Lease.sha256)) {
+            throw "$($Lease.name) changed identity or bytes while trace conversion was running: '$($Lease.path)'."
+        }
+    } finally { Close-A4SReadLease -Lease $verification }
+}
+
+function Assert-A4SNoPhysicalAliases {
+    param([Parameter(Mandatory)][object[]]$Leases)
+
+    for ($left = 0; $left -lt $Leases.Count; $left++) {
+        for ($right = $left + 1; $right -lt $Leases.Count; $right++) {
+            if ([StringComparer]::Ordinal.Equals($Leases[$left].identity, $Leases[$right].identity)) {
+                throw "Trace conversion refuses physical aliases: $($Leases[$left].name) and $($Leases[$right].name) identify the same file."
             }
         }
     }
@@ -77,16 +221,23 @@ function Assert-A4SExistingDerivedXml {
     }
 }
 
-function Write-A4SJsonCreateNew {
+function Write-A4SJsonStage {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
-    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
+
     $json = ($Value | ConvertTo-Json -Depth 12) + [Environment]::NewLine
     $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
-    $stream = [IO.FileStream]::new($temporary, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
         [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
     try { $stream.Write($bytes, 0, $bytes.Length); $stream.Flush($true) }
     finally { $stream.Dispose() }
-    [IO.File]::Move($temporary, $Path)
+}
+
+function Get-A4SFileSha256 {
+    param([Parameter(Mandatory)][string]$Path)
+    $stream = [IO.FileStream]::new($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read,
+        [IO.FileShare]::Read, 4096, [IO.FileOptions]::SequentialScan)
+    try { return Get-A4SStreamSha256 -Stream $stream }
+    finally { $stream.Dispose() }
 }
 
 $events = @()
@@ -96,135 +247,178 @@ $sourceHash = ''
 $rawEtlPreserved = $false
 $decodedXml = $null
 $decodedXmlHash = $null
+$resolvedOutput = $null
+$sourceLease = $null
+$xmlTargetLease = $null
+$jsonTargetLease = $null
+$decodedXmlStage = $null
+$jsonStage = $null
+$conversionMutex = [Threading.Mutex]::new($false, 'Local\A4SMenu.TraceArtifactPublication.v1')
+$ownsConversionMutex = $false
+try { $ownsConversionMutex = $conversionMutex.WaitOne(0) }
+catch [Threading.AbandonedMutexException] { $ownsConversionMutex = $true }
+if (-not $ownsConversionMutex) {
+    $conversionMutex.Dispose()
+    throw 'Another A4S trace conversion is publishing artifacts in this Windows session. Retry after it completes.'
+}
 
-if ($PSCmdlet.ParameterSetName -eq 'Etl') {
-    $sourcePath = (Resolve-Path -LiteralPath $EtlPath -ErrorAction Stop).ProviderPath
-    if ([IO.Path]::GetExtension($sourcePath) -ine '.etl') { throw "Expected an .etl input; received '$sourcePath'." }
-    $sourceType = 'etl'
-    if (-not $OutputPath) { $OutputPath = "$([IO.Path]::ChangeExtension($sourcePath, $null)).a4s-runtime.json" }
-    $resolvedOutput = Resolve-A4SOutputPath $OutputPath
-    if (-not $TracerptXmlPath) { $TracerptXmlPath = [IO.Path]::ChangeExtension($sourcePath, '.tracerpt.xml') }
-    $decodedXml = Resolve-A4SOutputPath $TracerptXmlPath
-    Assert-A4SDistinctArtifactPaths ([ordered]@{
-        rawEtlInput = $sourcePath
-        decodedXml = $decodedXml
-        jsonReport = $resolvedOutput
-    })
-    if ((Test-Path -LiteralPath $resolvedOutput) -and -not $Force) {
-        throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
-    }
-    if ((Test-Path -LiteralPath $resolvedOutput -PathType Leaf) -and $Force) {
-        Assert-A4SExistingDerivedReport -Path $resolvedOutput
-    }
-    $outputDirectory = Split-Path -Parent $resolvedOutput
-    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    }
-    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-    $rawEtlPreserved = $true
-    if ((Test-Path -LiteralPath $decodedXml) -and -not $Force) {
-        throw "Decoded tracerpt XML already exists at '$decodedXml'. Use -Force to replace only that derived file; the ETL is never changed."
-    }
-    if ((Test-Path -LiteralPath $decodedXml -PathType Leaf) -and $Force) {
-        Assert-A4SExistingDerivedXml -Path $decodedXml
-    }
-    $xmlDirectory = Split-Path -Parent $decodedXml
-    if (-not (Test-Path -LiteralPath $xmlDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $xmlDirectory -Force | Out-Null
-    }
-    $tracerpt = Join-Path $env:SystemRoot 'System32\tracerpt.exe'
-    if (-not (Test-Path -LiteralPath $tracerpt -PathType Leaf)) { throw "Windows tracerpt.exe was not found at '$tracerpt'." }
-    $decodedXmlTemporary = "$decodedXml.partial-$PID-$([Guid]::NewGuid().ToString('N')).xml"
-    $decodeOutput = @(& $tracerpt $sourcePath -o $decodedXmlTemporary -of XML -lr -y 2>&1)
-    $decodeExitCode = $LASTEXITCODE
-    if ($decodeExitCode -ne 0) {
-        throw "tracerpt failed with exit code $decodeExitCode. Raw ETL remains at '$sourcePath'; partial derived output, if any, remains at '$decodedXmlTemporary'. Output: $($decodeOutput -join ' ')"
-    }
-    $decodedXmlHash = (Get-FileHash -LiteralPath $decodedXmlTemporary -Algorithm SHA256).Hash
-    $events = @(ConvertFrom-A4STracerptXml -Path $decodedXmlTemporary -ExpectedProcessId $ExpectedProcessId)
-    $postParseXmlHash = (Get-FileHash -LiteralPath $decodedXmlTemporary -Algorithm SHA256).Hash
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($decodedXmlHash, $postParseXmlHash)) {
-        throw "The decoded tracerpt XML changed while it was parsed; refusing non-immutable evidence from '$decodedXmlTemporary'."
-    }
-    $postDecodeSourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $postDecodeSourceHash)) {
-        throw "The raw ETL changed while it was decoded; refusing non-immutable evidence from '$sourcePath'."
-    }
-    if ($events.Count -eq 0) {
-        throw "No decodable A4SMenu.Runtime events were found. Raw ETL remains at '$sourcePath'; inspect '$decodedXmlTemporary' and verify the selected DLL contains provider 74a9f986-c7ab-429a-9571-df0fb7f4a33c."
-    }
-    if (Test-Path -LiteralPath $decodedXml -PathType Leaf) {
-        $xmlBackup = "$decodedXml.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
-        $xmlReplaced = $false
-        try {
-            [IO.File]::Replace($decodedXmlTemporary, $decodedXml, $xmlBackup, $true)
-            $xmlReplaced = $true
-        } finally {
-            if ($xmlReplaced -and [IO.File]::Exists($xmlBackup)) { [IO.File]::Delete($xmlBackup) }
+try {
+    if ($PSCmdlet.ParameterSetName -eq 'Etl') {
+        $sourcePath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $EtlPath -ErrorAction Stop).ProviderPath)
+        if ([IO.Path]::GetExtension($sourcePath) -ine '.etl') { throw "Expected an .etl input; received '$sourcePath'." }
+        $sourceType = 'etl'
+        $rawEtlPreserved = $true
+        if (-not $OutputPath) { $OutputPath = "$([IO.Path]::ChangeExtension($sourcePath, $null)).a4s-runtime.json" }
+        $resolvedOutput = Resolve-A4SOutputPath $OutputPath
+        if (-not $TracerptXmlPath) { $TracerptXmlPath = [IO.Path]::ChangeExtension($sourcePath, '.tracerpt.xml') }
+        $decodedXml = Resolve-A4SOutputPath $TracerptXmlPath
+        Assert-A4SDistinctArtifactPaths ([ordered]@{
+            rawEtlInput = $sourcePath
+            decodedXml = $decodedXml
+            jsonReport = $resolvedOutput
+        })
+        foreach ($path in @($sourcePath, $decodedXml, $resolvedOutput)) { Assert-A4SReparseFreePath -Path $path }
+        Ensure-A4SSafeParentDirectory -Path $decodedXml
+        Ensure-A4SSafeParentDirectory -Path $resolvedOutput
+
+        $xmlExists = [IO.File]::Exists($decodedXml)
+        $jsonExists = [IO.File]::Exists($resolvedOutput)
+        foreach ($target in @($decodedXml, $resolvedOutput)) {
+            if ((Test-Path -LiteralPath $target) -and -not [IO.File]::Exists($target)) {
+                throw "Derived artifact target is not a regular file: '$target'."
+            }
+        }
+        if (-not $Force -and ($xmlExists -or $jsonExists)) {
+            throw "A derived XML or JSON artifact already exists. Use -Force only to transactionally replace a complete, recognizable derived pair."
+        }
+        $sourceLease = New-A4SReadLease -Name 'raw ETL input' -Path $sourcePath
+        if ($xmlExists) { $xmlTargetLease = New-A4SReadLease -Name 'decoded XML target' -Path $decodedXml }
+        if ($jsonExists) { $jsonTargetLease = New-A4SReadLease -Name 'JSON report target' -Path $resolvedOutput }
+        $artifactLeases = @(@($sourceLease, $xmlTargetLease, $jsonTargetLease) | Where-Object { $_ })
+        Assert-A4SNoPhysicalAliases -Leases $artifactLeases
+        if ($xmlTargetLease) { Assert-A4SExistingDerivedXml -Path $decodedXml }
+        if ($jsonTargetLease) { Assert-A4SExistingDerivedReport -Path $resolvedOutput }
+        if ($Force -and ($xmlExists -xor $jsonExists)) {
+            throw '-Force requires both prior ETL-derived XML and JSON artifacts to exist, or neither; an incomplete pair is refused.'
+        }
+        $sourceHash = $sourceLease.sha256
+
+        $tracerpt = Join-Path $env:SystemRoot 'System32\tracerpt.exe'
+        if (-not (Test-Path -LiteralPath $tracerpt -PathType Leaf)) { throw "Windows tracerpt.exe was not found at '$tracerpt'." }
+        $decodedXmlStage = "$decodedXml.partial-$PID-$([Guid]::NewGuid().ToString('N')).xml"
+        $decodeOutput = @(& $tracerpt $sourcePath -o $decodedXmlStage -of XML -lr -y 2>&1)
+        $decodeExitCode = $LASTEXITCODE
+        if ($decodeExitCode -ne 0) {
+            throw "tracerpt failed with exit code $decodeExitCode. Raw ETL remains unchanged at '$sourcePath'. Output: $($decodeOutput -join ' ')"
+        }
+        $decodedXmlHash = Get-A4SFileSha256 -Path $decodedXmlStage
+        $events = @(ConvertFrom-A4STracerptXml -Path $decodedXmlStage -ExpectedProcessId $ExpectedProcessId)
+        if (-not [StringComparer]::OrdinalIgnoreCase.Equals(
+            $decodedXmlHash, (Get-A4SFileSha256 -Path $decodedXmlStage))) {
+            throw "The staged tracerpt XML changed while it was parsed: '$decodedXmlStage'."
+        }
+        Assert-A4SLeaseStillMatchesPath -Lease $sourceLease
+        if ($events.Count -eq 0) {
+            throw "No decodable A4SMenu.Runtime events were found. Raw ETL remains at '$sourcePath'."
         }
     } else {
-        [IO.File]::Move($decodedXmlTemporary, $decodedXml)
+        $sourcePath = [IO.Path]::GetFullPath((Resolve-Path -LiteralPath $EventJsonPath -ErrorAction Stop).ProviderPath)
+        $sourceType = 'syntheticJson'
+        if (-not $OutputPath) { $OutputPath = "$sourcePath.a4s-runtime.json" }
+        $resolvedOutput = Resolve-A4SOutputPath $OutputPath
+        Assert-A4SDistinctArtifactPaths ([ordered]@{
+            eventJsonInput = $sourcePath
+            jsonReport = $resolvedOutput
+        })
+        foreach ($path in @($sourcePath, $resolvedOutput)) { Assert-A4SReparseFreePath -Path $path }
+        Ensure-A4SSafeParentDirectory -Path $resolvedOutput
+        if ((Test-Path -LiteralPath $resolvedOutput) -and -not [IO.File]::Exists($resolvedOutput)) {
+            throw "Derived report target is not a regular file: '$resolvedOutput'."
+        }
+        $jsonExists = [IO.File]::Exists($resolvedOutput)
+        if ($jsonExists -and -not $Force) {
+            throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
+        }
+        $sourceLease = New-A4SReadLease -Name 'synthetic event input' -Path $sourcePath
+        if ($jsonExists) { $jsonTargetLease = New-A4SReadLease -Name 'JSON report target' -Path $resolvedOutput }
+        $artifactLeases = @(@($sourceLease, $jsonTargetLease) | Where-Object { $_ })
+        Assert-A4SNoPhysicalAliases -Leases $artifactLeases
+        if ($jsonTargetLease) { Assert-A4SExistingDerivedReport -Path $resolvedOutput }
+        $sourceHash = $sourceLease.sha256
+        $events = @(Import-A4SEventJson -Path $sourcePath -ExpectedProcessId $ExpectedProcessId)
+        Assert-A4SLeaseStillMatchesPath -Lease $sourceLease
+        if ($events.Count -eq 0) { throw "No A4S runtime events were found in '$sourcePath'." }
     }
-    $publishedXmlHash = (Get-FileHash -LiteralPath $decodedXml -Algorithm SHA256).Hash
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($decodedXmlHash, $publishedXmlHash)) {
-        throw "The atomically published tracerpt XML does not match the parsed bytes at '$decodedXml'."
-    }
-} else {
-    $sourcePath = (Resolve-Path -LiteralPath $EventJsonPath -ErrorAction Stop).ProviderPath
-    $sourceType = 'syntheticJson'
-    if (-not $OutputPath) { $OutputPath = "$sourcePath.a4s-runtime.json" }
-    $resolvedOutput = Resolve-A4SOutputPath $OutputPath
-    Assert-A4SDistinctArtifactPaths ([ordered]@{
-        eventJsonInput = $sourcePath
-        jsonReport = $resolvedOutput
-    })
-    if ((Test-Path -LiteralPath $resolvedOutput) -and -not $Force) {
-        throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
-    }
-    if ((Test-Path -LiteralPath $resolvedOutput -PathType Leaf) -and $Force) {
-        Assert-A4SExistingDerivedReport -Path $resolvedOutput
-    }
-    $outputDirectory = Split-Path -Parent $resolvedOutput
-    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
-        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
-    }
-    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-    $events = @(Import-A4SEventJson -Path $sourcePath -ExpectedProcessId $ExpectedProcessId)
-    $postImportSourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-    if (-not [StringComparer]::OrdinalIgnoreCase.Equals($sourceHash, $postImportSourceHash)) {
-        throw "The synthetic event source changed while it was parsed; refusing non-immutable evidence from '$sourcePath'."
-    }
-    if ($events.Count -eq 0) { throw "No A4S runtime events were found in '$sourcePath'." }
-}
 
-$report = ConvertTo-A4SRuntimeReport -Events $events -ColdSampleCount $ColdSampleCount `
-    -ExpectedCycleCount $ExpectedCycleCount -MinimumWarmSampleCount $MinimumWarmSampleCount `
-    -MinimumCloseSampleCount $MinimumCloseSampleCount `
-    -WarmOpenTargetMilliseconds $WarmOpenTargetMilliseconds -RefreshRateHz $RefreshRateHz `
-    -SourceType $sourceType -SourcePath $sourcePath
-$report.source | Add-Member -NotePropertyName sha256 -NotePropertyValue $sourceHash
-$report.source | Add-Member -NotePropertyName rawEtlPreserved -NotePropertyValue $rawEtlPreserved
-if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlPath -NotePropertyValue $decodedXml }
-if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlSha256 -NotePropertyValue $decodedXmlHash }
+    $report = ConvertTo-A4SRuntimeReport -Events $events -ColdSampleCount $ColdSampleCount `
+        -ExpectedCycleCount $ExpectedCycleCount -MinimumWarmSampleCount $MinimumWarmSampleCount `
+        -MinimumCloseSampleCount $MinimumCloseSampleCount `
+        -WarmOpenTargetMilliseconds $WarmOpenTargetMilliseconds -RefreshRateHz $RefreshRateHz `
+        -SourceType $sourceType -SourcePath $sourcePath
+    $report.source | Add-Member -NotePropertyName sha256 -NotePropertyValue $sourceHash
+    $report.source | Add-Member -NotePropertyName rawEtlPreserved -NotePropertyValue $rawEtlPreserved
+    if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlPath -NotePropertyValue $decodedXml }
+    if ($decodedXml) { $report.source | Add-Member -NotePropertyName tracerptXmlSha256 -NotePropertyValue $decodedXmlHash }
 
-if ((Test-Path -LiteralPath $resolvedOutput) -and $Force) {
-    # Force applies only to derived files in an explicit conversion. Preserve
-    # the old report until the replacement bytes are durable.
-    $temporaryOutput = "$resolvedOutput.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
-    Write-A4SJsonCreateNew -Path $temporaryOutput -Value $report
-    $outputBackup = "$resolvedOutput.backup-$PID-$([Guid]::NewGuid().ToString('N'))"
-    $outputReplaced = $false
+    if ($EnforceTargets -and $report.targetEvaluation.overallCustomTraceStatus -ne 'pass') {
+        throw 'A4S custom runtime trace targets did not pass; no derived artifact replacement was published.'
+    }
+
+    $jsonStage = "$resolvedOutput.partial-$PID-$([Guid]::NewGuid().ToString('N')).json"
+    Write-A4SJsonStage -Path $jsonStage -Value $report
+    $jsonStageHash = Get-A4SFileSha256 -Path $jsonStage
+
+    Assert-A4SLeaseStillMatchesPath -Lease $sourceLease
+    if ($xmlTargetLease) { Assert-A4SLeaseStillMatchesPath -Lease $xmlTargetLease }
+    if ($jsonTargetLease) { Assert-A4SLeaseStillMatchesPath -Lease $jsonTargetLease }
+    Close-A4SReadLease -Lease $xmlTargetLease
+    Close-A4SReadLease -Lease $jsonTargetLease
+    Assert-A4SReparseFreePath -Path $resolvedOutput
+
+    if ($decodedXml) {
+        Assert-A4SReparseFreePath -Path $decodedXml
+        $expectedXmlHash = $decodedXmlHash
+        $expectedJsonHash = $jsonStageHash
+        $xmlValidationPath = $decodedXml
+        $jsonValidationPath = $resolvedOutput
+        $postPublishValidation = {
+            $actualXmlHash = (Get-FileHash -LiteralPath $xmlValidationPath -Algorithm SHA256).Hash
+            $actualJsonHash = (Get-FileHash -LiteralPath $jsonValidationPath -Algorithm SHA256).Hash
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expectedXmlHash, $actualXmlHash) -or
+                -not [StringComparer]::OrdinalIgnoreCase.Equals($expectedJsonHash, $actualJsonHash)) {
+                throw 'Published XML/JSON bytes do not match the transaction stages.'
+            }
+        }.GetNewClosure()
+        Publish-A4SArtifactPairTransaction -XmlStagedPath $decodedXmlStage `
+            -XmlDestinationPath $decodedXml -JsonStagedPath $jsonStage `
+            -JsonDestinationPath $resolvedOutput -PostPublishValidation $postPublishValidation
+        $decodedXmlStage = $null
+        $jsonStage = $null
+    } else {
+        $expectedJsonHash = $jsonStageHash
+        $jsonValidationPath = $resolvedOutput
+        $postPublishValidation = {
+            $actualJsonHash = (Get-FileHash -LiteralPath $jsonValidationPath -Algorithm SHA256).Hash
+            if (-not [StringComparer]::OrdinalIgnoreCase.Equals($expectedJsonHash, $actualJsonHash)) {
+                throw 'Published JSON bytes do not match the transaction stage.'
+            }
+        }.GetNewClosure()
+        Publish-A4SSingleArtifactTransaction -StagedPath $jsonStage `
+            -DestinationPath $resolvedOutput -PostPublishValidation $postPublishValidation
+        $jsonStage = $null
+    }
+
+    Write-Output $resolvedOutput
+} finally {
     try {
-        [IO.File]::Replace($temporaryOutput, $resolvedOutput, $outputBackup, $true)
-        $outputReplaced = $true
+        Close-A4SReadLease -Lease $xmlTargetLease
+        Close-A4SReadLease -Lease $jsonTargetLease
+        Close-A4SReadLease -Lease $sourceLease
+        foreach ($stage in @($decodedXmlStage, $jsonStage)) {
+            if ($stage -and [IO.File]::Exists($stage)) { [IO.File]::Delete($stage) }
+        }
     } finally {
-        if ($outputReplaced -and [IO.File]::Exists($outputBackup)) { [IO.File]::Delete($outputBackup) }
+        if ($ownsConversionMutex) { $conversionMutex.ReleaseMutex() }
+        $conversionMutex.Dispose()
     }
-} else {
-    Write-A4SJsonCreateNew -Path $resolvedOutput -Value $report
-}
-Write-Output $resolvedOutput
-
-if ($EnforceTargets -and $report.targetEvaluation.overallCustomTraceStatus -ne 'pass') {
-    throw "A4S custom runtime trace targets did not pass. Review '$resolvedOutput'."
 }

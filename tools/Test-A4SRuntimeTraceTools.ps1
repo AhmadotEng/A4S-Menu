@@ -54,9 +54,22 @@ Assert-A4S ($captureText -match 'ManualInteractionSeconds' -and
     $captureText -match '\$ManualInteractionSeconds -gt 0 -and \$EnforceTargets' -and
     $captureText -match 'Open All Programs') 'manual Programs/search phase capture is missing or can be mislabeled as an enforced target trace'
 Assert-A4S ($captureText -match 'actual-menu-monitor EnumDisplaySettings' -and
-    $captureText -match 'different nominal refresh rates') 'trace frame budget is not bound to one consistent actual menu-monitor refresh rate'
+    $captureText -match 'different nominal refresh rates' -and
+    $captureText -match '\$cycleRefreshRateHz -eq 0' -and
+    $captureText -match '\$automatedMenuRefreshRates\.Count -ne \$attemptedAutomatedCycles' -and
+    $captureText -match 'capturedMenuMonitorRefreshRatesHz' -and
+    $captureText -notmatch 'operator-supplied; actual-menu-monitor rate unavailable') 'trace frame budget is not bound to complete per-cycle actual menu-monitor refresh evidence'
+$convertText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -Raw
+Assert-A4S ($convertText -match 'Publish-A4SArtifactPairTransaction' -and
+    $convertText -match 'FileShare\]::Read' -and
+    $convertText -match 'Assert-A4SLeaseStillMatchesPath' -and
+    $convertText -match 'Assert-A4SNoPhysicalAliases' -and
+    $convertText -match 'Assert-A4SReparseFreePath' -and
+    $convertText -match 'A4SMenu\.TraceArtifactPublication\.v1') 'trace conversion lacks transactional pair publication, session exclusivity, stable read leases, or physical/reparse alias rejection'
 $coreText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'A4SRuntimeTrace.Core.psm1') -Raw
 Assert-A4S ($coreText -match 'p95UnroundedMilliseconds' -and $coreText -match '1000\.0 / \$RefreshRateHz') 'one-frame target math rounds away sub-millisecond precision'
+Assert-A4S ($coreText -match 'Restore-A4SPublishedArtifact' -and
+    $coreText -match 'Publish-A4SArtifactPairTransaction') 'the XML/JSON artifact transaction has no rollback implementation'
 
 $captureTokens = $null
 $captureParseErrors = $null
@@ -161,6 +174,60 @@ try {
     $jsonPath = Join-Path $tempRoot 'events.json'
     $outputPath = Join-Path $tempRoot 'report.json'
     @($synthetic) | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+
+    $transactionRoot = Join-Path $tempRoot 'pair-transaction'
+    New-Item -ItemType Directory -Path $transactionRoot | Out-Null
+    $transactionXml = Join-Path $transactionRoot 'derived.xml'
+    $transactionJson = Join-Path $transactionRoot 'derived.json'
+    $transactionXmlStage = Join-Path $transactionRoot 'derived.xml.stage'
+    $transactionJsonStage = Join-Path $transactionRoot 'derived.json.stage'
+    [IO.File]::WriteAllText($transactionXml, 'old-xml', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($transactionJson, 'old-json', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($transactionXmlStage, 'new-xml', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($transactionJsonStage, 'new-json', [Text.UTF8Encoding]::new($false))
+    $lockedSecondPublishFailed = $false
+    $jsonPublicationLock = [IO.FileStream]::new($transactionJson, [IO.FileMode]::Open,
+        [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        try {
+            Publish-A4SArtifactPairTransaction -XmlStagedPath $transactionXmlStage `
+                -XmlDestinationPath $transactionXml -JsonStagedPath $transactionJsonStage `
+                -JsonDestinationPath $transactionJson
+        } catch { $lockedSecondPublishFailed = $true }
+    } finally { $jsonPublicationLock.Dispose() }
+    Assert-A4S $lockedSecondPublishFailed 'a forced failure during second-artifact publication was not surfaced'
+    Assert-A4S (([IO.File]::ReadAllText($transactionXml)) -eq 'old-xml' -and
+        ([IO.File]::ReadAllText($transactionJson)) -eq 'old-json') 'a second-artifact publication failure did not restore the prior pair'
+
+    [IO.File]::WriteAllText($transactionXmlStage, 'new-xml', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($transactionJsonStage, 'new-json', [Text.UTF8Encoding]::new($false))
+    $transactionRollbackObserved = $false
+    try {
+        Publish-A4SArtifactPairTransaction -XmlStagedPath $transactionXmlStage `
+            -XmlDestinationPath $transactionXml -JsonStagedPath $transactionJsonStage `
+            -JsonDestinationPath $transactionJson -PostPublishValidation { throw 'synthetic later failure' }
+    } catch { if ($_.Exception.Message -match 'synthetic later failure') { $transactionRollbackObserved = $true } }
+    Assert-A4S $transactionRollbackObserved 'a failure after pair publication was not surfaced'
+    Assert-A4S (([IO.File]::ReadAllText($transactionXml)) -eq 'old-xml' -and
+        ([IO.File]::ReadAllText($transactionJson)) -eq 'old-json') 'a later failure did not restore the complete prior XML/JSON pair'
+    Assert-A4S (@(Get-ChildItem -LiteralPath $transactionRoot | Where-Object {
+        $_.Name -match '\.(?:stage|backup-|rollback-discard-)'
+    }).Count -eq 0) 'pair rollback leaked stage, backup, or discard artifacts'
+
+    [IO.File]::WriteAllText($transactionXmlStage, 'committed-xml', [Text.UTF8Encoding]::new($false))
+    [IO.File]::WriteAllText($transactionJsonStage, 'committed-json', [Text.UTF8Encoding]::new($false))
+    Publish-A4SArtifactPairTransaction -XmlStagedPath $transactionXmlStage `
+        -XmlDestinationPath $transactionXml -JsonStagedPath $transactionJsonStage `
+        -JsonDestinationPath $transactionJson -PostPublishValidation {
+            if (([IO.File]::ReadAllText($transactionXml)) -ne 'committed-xml' -or
+                ([IO.File]::ReadAllText($transactionJson)) -ne 'committed-json') { throw 'pair validation mismatch' }
+        }
+    Assert-A4S (([IO.File]::ReadAllText($transactionXml)) -eq 'committed-xml' -and
+        ([IO.File]::ReadAllText($transactionJson)) -eq 'committed-json') 'the successful pair transaction did not publish both artifacts'
+    Assert-A4S (@(Get-ChildItem -LiteralPath $transactionRoot | Where-Object {
+        $_.Name -match '\.(?:stage|backup-|rollback-discard-)'
+    }).Count -eq 0) 'successful pair publication leaked transaction artifacts'
+
     [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
         -ExpectedProcessId 4242 -ColdSampleCount 1 -ExpectedCycleCount 3 `
         -MinimumWarmSampleCount 2 -MinimumCloseSampleCount 3 -RefreshRateHz 60 -OutputPath $outputPath)
@@ -202,6 +269,35 @@ try {
     Assert-A4S $sourceReplacementRejected '-Force could replace the synthetic source with its derived report'
     Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($sourceHashBeforeCollisionTest,
         (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash)) 'rejected source/report alias changed the source bytes'
+
+    $hardLinkOutput = Join-Path $tempRoot 'source-hardlink.json'
+    New-Item -ItemType HardLink -Path $hardLinkOutput -Target $jsonPath | Out-Null
+    $hardLinkAliasRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+            -ExpectedProcessId 4242 -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 `
+            -MinimumCloseSampleCount 3 -OutputPath $hardLinkOutput -Force)
+    } catch { if ($_.Exception.Message -match 'physical aliases') { $hardLinkAliasRejected = $true } }
+    Assert-A4S $hardLinkAliasRejected '-Force accepted a physical hard-link alias of its synthetic source'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($sourceHashBeforeCollisionTest,
+        (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash)) 'hard-link alias rejection changed the source bytes'
+
+    $realReparseTarget = Join-Path $tempRoot 'real-reparse-target'
+    $junctionOutput = Join-Path $tempRoot 'junction-output'
+    New-Item -ItemType Directory -Path $realReparseTarget | Out-Null
+    New-Item -ItemType Junction -Path $junctionOutput -Target $realReparseTarget | Out-Null
+    try {
+        $reparseRejected = $false
+        try {
+            [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+                -ExpectedProcessId 4242 -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 `
+                -MinimumCloseSampleCount 3 -OutputPath (Join-Path $junctionOutput 'report.json'))
+        } catch { if ($_.Exception.Message -match 'reparse-point path component') { $reparseRejected = $true } }
+        Assert-A4S $reparseRejected 'trace conversion accepted a destination through a directory junction'
+        Assert-A4S (-not [IO.File]::Exists((Join-Path $realReparseTarget 'report.json'))) 'reparse-path rejection still wrote a derived report'
+    } finally {
+        if (Test-Path -LiteralPath $junctionOutput) { [IO.Directory]::Delete($junctionOutput) }
+    }
 
     $nonDerivedJson = Join-Path $tempRoot 'unrelated.json'
     [IO.File]::WriteAllText($nonDerivedJson, '{"unrelated":true}', [Text.UTF8Encoding]::new($false))

@@ -21,6 +21,21 @@ $forbiddenNativeApis = @(
     'InitiateSystemShutdown', 'SetSuspendState'
 )
 
+$windowsPowerShellContractFiles = @(
+    'Get-A4SPerformanceSnapshot.ps1',
+    'Measure-A4SProductPerformance.ps1',
+    'Test-A4SCurrentScenario.ps1',
+    'Convert-A4SRuntimeTrace.ps1',
+    'Capture-A4SRuntimeTrace.ps1',
+    'A4SRuntimeTrace.Core.psm1'
+)
+foreach ($contractName in $windowsPowerShellContractFiles) {
+    $contractSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot $contractName) -Raw
+    if ($contractSource -match '\[Convert\]::ToHexString') {
+        throw "$contractName uses Convert.ToHexString, which is unavailable in Windows PowerShell 5.1/.NET Framework."
+    }
+}
+
 foreach ($name in $toolNames) {
     $path = Join-Path $PSScriptRoot $name
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -141,6 +156,14 @@ if ($scenarioSource -notmatch 'Get-A4SLoadedImageIdentity' -or
     $scenarioSource -match 'File\]::Replace\([^\r\n]*\$null') {
     throw 'The scenario tool lacks exact resident-image binding, atomic matrix persistence, or ambiguous-cleanup protection.'
 }
+$scenarioVisibleWait = $scenarioSource.IndexOf('$visibleWindows = @(Wait-MenuState -Visible $true', [StringComparison]::Ordinal)
+if ($scenarioVisibleWait -lt 0) { throw 'Scenario automation has no authoritative visible-window wait.' }
+$scenarioOwnershipRecord = $scenarioSource.IndexOf('$automationMenuWindow = $menuWindow', $scenarioVisibleWait, [StringComparison]::Ordinal)
+$scenarioDwmFlush = $scenarioSource.IndexOf('[A4SScenarioNative]::FlushDwmChecked()', $scenarioVisibleWait, [StringComparison]::Ordinal)
+if ($scenarioOwnershipRecord -lt 0 -or $scenarioDwmFlush -lt 0 -or
+    $scenarioOwnershipRecord -gt $scenarioDwmFlush) {
+    throw 'Scenario automation does not record exact HWND cleanup ownership immediately after the visibility wait and before DwmFlush.'
+}
 if ($snapshotSource -notmatch 'MaximumCleanExplorerAgeSeconds' -or
     $snapshotSource -notmatch 'cleanProductStateVerified' -or
     $performanceSource -notmatch 'baseline\.qualification\.cleanProductStateVerified' -or
@@ -193,4 +216,4 @@ if (-not $SkipObservationSmokeTest) {
     }
 }
 
-Write-Host "PASS: performance/stability tools parse, fresh native-helper copies compile with verified interop layouts, exact resident/payload binding and durable evidence contracts are present, and the curated mutation denylist is clear$(if($SkipObservationSmokeTest){' (observation smoke test intentionally skipped)'}else{'; the read-only observation smoke test is valid'})."
+Write-Host "PASS: performance/stability tools parse under PowerShell $($PSVersionTable.PSVersion), avoid the Windows PowerShell 5.1-incompatible hex API, fresh native-helper copies compile with verified interop layouts, exact resident/payload binding and durable evidence contracts are present, and the curated mutation denylist is clear$(if($SkipObservationSmokeTest){' (observation smoke test intentionally skipped)'}else{'; the read-only observation smoke test is valid'})."
