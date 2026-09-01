@@ -180,30 +180,196 @@ foreach ($forbiddenProbeMarker in @('CreateToolhelp32Snapshot',
 }
 Assert-Contract (-not [regex]::IsMatch($explorerProbeText, '\bwhile\s*\(')) `
     'guest native Explorer module snapshot contains a data-dependent while loop'
+$directModuleInventoryDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Get-ExplorerModuleInventoryDirect'
+}, $true))
+Assert-Contract ($directModuleInventoryDefinitions.Count -eq 1) `
+    'guest must define exactly one direct Explorer module inventory function'
+$directModuleInventoryText = $directModuleInventoryDefinitions[0].Extent.Text
+Assert-ContainsOrdinal $directModuleInventoryText `
+    '[A4SSandboxWindowProbe]::ModuleSnapshotForProcess($ExplorerPid)' `
+    'guest direct native Explorer module inventory call'
+foreach ($marker in @('$snapshot.TotalModuleCount', '$snapshot.MainModulePath',
+        'SchemaVersion = 1', 'ExplorerPid = $ExplorerPid',
+        'Join-Path $env:SystemRoot ''explorer.exe''',
+        '$mainModulePath.Equals($canonicalExplorerPath',
+        '(Get-TaskbarExplorerPid) -ne $ExplorerPid')) {
+    Assert-ContainsOrdinal $directModuleInventoryText $marker `
+        'guest direct native Explorer module inventory completeness proof'
+}
+Assert-Contract (-not [regex]::IsMatch($directModuleInventoryText,
+        '(?i)\.Modules\b')) `
+    'guest direct Explorer inventory regressed to an unbounded Process.Modules enumeration'
+
 $moduleInventoryDefinitions = @($guestAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
         $node.Name -ieq 'Get-ExplorerModuleInventory'
 }, $true))
 Assert-Contract ($moduleInventoryDefinitions.Count -eq 1) `
-    'guest must define exactly one executable Explorer module inventory function'
+    'guest must define exactly one isolated Explorer module inventory function'
 $moduleInventoryText = $moduleInventoryDefinitions[0].Extent.Text
-Assert-ContainsOrdinal $moduleInventoryText `
-    '[A4SSandboxWindowProbe]::ModuleSnapshotForProcess($ExplorerPid)' `
-    'guest native Explorer module inventory call'
-foreach ($marker in @('$snapshot.TotalModuleCount', '$snapshot.MainModulePath',
-        'Join-Path $env:SystemRoot ''explorer.exe''',
-        '$mainModulePath.Equals($canonicalExplorerPath',
+foreach ($marker in @(
+        "'System32\WindowsPowerShell\v1.0\powershell.exe'",
+        "'explorer-module-probe-{0}-{1}' -f `$ExplorerPid",
+        "[Guid]::NewGuid().ToString('N')",
+        'Invoke-ExactProcess -Path $windowsPowerShell',
+        "'-File', `$script:guestScriptPath, '-ExplorerProbeChild'",
+        "'-ExplorerProbeProcessId', [string]`$ExplorerPid",
+        '-Label $label',
+        '-TimeoutSeconds 8 -KillWaitMilliseconds 5000',
+        '[string]::IsNullOrEmpty([string]$execution.Stderr)',
+        'ConvertFrom-ExplorerModuleInventoryJson',
+        '-ExpectedExplorerPid $ExplorerPid',
+        '$actual = Get-FileIdentity ([string]$reported.Path)',
+        '$actual.Sha256 -cne [string]$reported.Sha256',
         '(Get-TaskbarExplorerPid) -ne $ExplorerPid')) {
     Assert-ContainsOrdinal $moduleInventoryText $marker `
-        'guest native Explorer module inventory completeness proof'
+        'guest isolated bounded Explorer module inventory'
 }
-Assert-Contract (-not [regex]::IsMatch($moduleInventoryText,
-        '(?i)\.Modules\b')) `
-    'guest Explorer inventory regressed to an unbounded Process.Modules enumeration'
+Assert-Contract ($moduleInventoryText.IndexOf(
+        '[A4SSandboxWindowProbe]::ModuleSnapshotForProcess',
+        [StringComparison]::Ordinal) -lt 0) `
+    'normal Explorer inventory invokes PSAPI in the long-lived guest process'
+Assert-Contract ([regex]::Matches($moduleInventoryText,
+        'Invoke-ExactProcess').Count -eq 1) `
+    'normal Explorer inventory must own exactly one killable child boundary'
+Assert-OrderedMarkers $moduleInventoryText @(
+    '$label = ''explorer-module-probe-{0}-{1}''',
+    '[Guid]::NewGuid().ToString(''N'')',
+    '$execution = Invoke-ExactProcess',
+    '-Label $label',
+    '[string]::IsNullOrEmpty([string]$execution.Stderr)',
+    '$inventory = ConvertFrom-ExplorerModuleInventoryJson',
+    '-ExpectedExplorerPid $ExplorerPid',
+    '$actual = Get-FileIdentity ([string]$reported.Path)',
+    '$actual.Sha256 -cne [string]$reported.Sha256',
+    '(Get-TaskbarExplorerPid) -ne $ExplorerPid') `
+    'guest isolated probe execution, parsing, replay, and PID-rebind order'
+
+$jsonIntegralDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Test-IsJsonIntegralNumber'
+}, $true))
+Assert-Contract ($jsonIntegralDefinitions.Count -eq 1) `
+    'guest must define exactly one strict JSON integral-number predicate'
+$jsonIntegralText = $jsonIntegralDefinitions[0].Extent.Text
+Assert-ContainsOrdinal $jsonIntegralText `
+    '$Value -is [int] -or $Value -is [long]' `
+    'guest strict JSON integral-number predicate'
+
+$moduleJsonDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'ConvertFrom-ExplorerModuleInventoryJson'
+}, $true))
+Assert-Contract ($moduleJsonDefinitions.Count -eq 1) `
+    'guest must define exactly one strict Explorer child JSON reader'
+$moduleJsonText = $moduleJsonDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[Text.Encoding]::UTF8.GetByteCount($Text)',
+        '[ValidateRange(1, 2147483647)][int] $ExpectedExplorerPid',
+        '$byteCount -gt 131072',
+        '$Text.IndexOf("`r"', '$Text.IndexOf("`n"',
+        '$Text | ConvertFrom-Json -ErrorAction Stop',
+        "@('Complete', 'Error', 'ExplorerPid', 'MainModulePath'",
+        "'Modules', 'SchemaVersion', 'TotalModuleCount'",
+        '$value.Complete -isnot [bool]', '$null -ne $value.Error',
+        'Test-IsJsonIntegralNumber $value.SchemaVersion',
+        '[long]$value.SchemaVersion -ne 1',
+        'Test-IsJsonIntegralNumber $value.ExplorerPid',
+        '[long]$value.ExplorerPid -ne [long]$ExpectedExplorerPid',
+        'Test-IsJsonIntegralNumber $value.TotalModuleCount',
+        '$totalModuleCount -gt 4096',
+        '$value.Modules -isnot [Array]',
+        '$moduleValues.Count -gt 8',
+        '$moduleValues.Count -gt $totalModuleCount',
+        'Test-IsJsonIntegralNumber $module.Length',
+        '[long]$module.Length -le 0',
+        '$uniquePaths.Add($path)', 'Normalize-Sha256')) {
+    Assert-ContainsOrdinal $moduleJsonText $marker `
+        'guest strict bounded Explorer child JSON reader'
+}
+foreach ($marker in @('schema-string', 'schema-boolean', 'schema-fractional',
+        'schema-wrong', 'pid-string', 'pid-boolean', 'pid-fractional',
+        'pid-wrong', 'count-string', 'count-boolean', 'count-fractional',
+        'missing-schemaversion', 'missing-explorerpid', 'modules-null',
+        'modules-singleton-object', 'modules-exceed-total-count',
+        'length-string', 'length-boolean', 'length-fractional')) {
+    Assert-ContainsOrdinal $guestSource $marker `
+        'guest strict Explorer child JSON negative self-test matrix'
+}
+
+$probeChildBlocks = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.IfStatementAst] -and
+        $node.Clauses.Count -gt 0 -and
+        $node.Clauses[0].Item1.Extent.Text -match '\$ExplorerProbeChild'
+}, $true))
+Assert-Contract ($probeChildBlocks.Count -eq 1) `
+    'guest must define exactly one hidden Explorer probe child entry block'
+$probeChildText = $probeChildBlocks[0].Extent.Text
+foreach ($marker in @(
+        '[Environment]::Is64BitProcess',
+        '$probeIdentity = Get-WindowsSandboxIdentity',
+        '(Get-TaskbarExplorerPid) -ne $ExplorerProbeProcessId',
+        '$directInventory = Get-ExplorerModuleInventoryDirect',
+        '[Console]::Out.Write(($directInventory | ConvertTo-Json -Depth 20 -Compress))',
+        'return')) {
+    Assert-ContainsOrdinal $probeChildText $marker `
+        'guest hidden read-only Explorer probe child mode'
+}
+Assert-OrderedMarkers $probeChildText @(
+    '[Environment]::Is64BitProcess',
+    '$probeIdentity = Get-WindowsSandboxIdentity',
+    '(Get-TaskbarExplorerPid) -ne $ExplorerProbeProcessId',
+    '$directInventory = Get-ExplorerModuleInventoryDirect',
+    '[Console]::Out.Write(($directInventory | ConvertTo-Json -Depth 20 -Compress))',
+    'return') 'guest hidden child x64, identity, PID, direct-probe, and output order'
+foreach ($forbiddenChildMarker in @('Write-GuestStage', 'Write-ProgressEvidence',
+        'Invoke-ExactProcess', 'Get-ExplorerModuleInventory -')) {
+    Assert-Contract ($probeChildText.IndexOf($forbiddenChildMarker,
+            [StringComparison]::OrdinalIgnoreCase) -lt 0) `
+        "guest hidden Explorer probe child contains forbidden '$forbiddenChildMarker'"
+}
+foreach ($marker in @(
+        '[Parameter(DontShow = $true)][switch] $ExplorerProbeChild',
+        '[Parameter(DontShow = $true)][int] $ExplorerProbeProcessId',
+        'if ($ExplorerProbeProcessId -ne 0)',
+        "throw '-ExplorerProbeProcessId is private to the hidden Explorer probe child mode.'")) {
+    Assert-ContainsOrdinal $guestSource $marker 'guest hidden Explorer probe parameter boundary'
+}
 Assert-Contract (-not [regex]::IsMatch($guestSource,
         '(?i)\$process\.Modules\b')) `
     'guest contains a forbidden Process.Modules enumeration'
+
+$checkpointDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Get-Checkpoint'
+}, $true))
+Assert-Contract ($checkpointDefinitions.Count -eq 1) `
+    'guest must define exactly one staged checkpoint collector'
+$checkpointText = $checkpointDefinitions[0].Extent.Text
+Assert-OrderedMarkers $checkpointText @(
+    '$explorerPid = Get-TaskbarExplorerPid',
+    "Write-GuestStage -Ordinal 45 -Stage 'v1-checkpoint-taskbar-pid-resolved'",
+    '$explorerModules = Get-ExplorerModuleInventory $explorerPid',
+    "Write-GuestStage -Ordinal 46 -Stage 'v1-checkpoint-explorer-modules-captured'",
+    '$product = Get-RegistryTreeSnapshot',
+    "Write-GuestStage -Ordinal 47 -Stage 'v1-checkpoint-registry-captured'",
+    '$userState = Get-UserStateProjection',
+    "Write-GuestStage -Ordinal 48 -Stage 'v1-checkpoint-user-state-captured'",
+    '$dataCache = Get-DataCacheRecord',
+    "Write-GuestStage -Ordinal 49 -Stage 'v1-checkpoint-cache-captured'",
+    '$installInventory = Get-InstallInventory',
+    "Write-GuestStage -Ordinal 50 -Stage 'v1-checkpoint-install-inventory-captured'",
+    '$processes = Get-A4SProcessInventory',
+    "Write-GuestStage -Ordinal 51 -Stage 'v1-checkpoint-process-inventory-captured'") `
+    'guest post-exit checkpoint component stages'
 
 $mappingWaitDefinitions = @($guestAst.FindAll({
     param($node)
@@ -525,7 +691,25 @@ Assert-OrderedMarkers $guestSource @(
     "Write-GuestStage -Ordinal 36 -Stage 'v1-host-exit-starting'",
     '$v1Exit = Invoke-ExactProcess',
     "Write-GuestStage -Ordinal 37 -Stage 'v1-host-exit-completed'",
+    "Write-GuestStage -Ordinal 38 -Stage 'v1-post-exit-settle-starting'",
+    'Start-Sleep -Milliseconds 3100',
+    "Write-GuestStage -Ordinal 39 -Stage 'v1-post-exit-settle-completed'",
+    "Write-GuestStage -Ordinal 40 -Stage 'v1-cache-seed-starting'",
+    '[IO.File]::WriteAllBytes($cachePath, $cacheBytes)',
+    "Write-GuestStage -Ordinal 41 -Stage 'v1-cache-seed-completed'",
+    "Write-GuestStage -Ordinal 42 -Stage 'v1-cache-stability-wait-starting'",
+    "Write-GuestStage -Ordinal 43 -Stage 'v1-cache-stability-verified'",
+    "Write-GuestStage -Ordinal 44 -Stage 'v1-quiescent-checkpoint-starting'",
+    '$installV1Checkpoint = Get-Checkpoint',
+    "'install-v1-host-quiescent-cache-baseline' -PublishPostExitStages",
+    "Write-GuestStage -Ordinal 52 -Stage 'v1-quiescent-checkpoint-captured'",
+    "Write-GuestStage -Ordinal 53 -Stage 'v1-quiescent-checkpoint-assertion-starting'",
+    'Assert-InstalledCheckpoint -Checkpoint $installV1Checkpoint',
+    "Write-GuestStage -Ordinal 54 -Stage 'v1-quiescent-checkpoint-asserted'",
     "Name = 'install-v1'",
+    "Write-GuestStage -Ordinal 55 -Stage 'v1-install-evidence-publication-starting'",
+    'Write-ProgressEvidence',
+    "Write-GuestStage -Ordinal 56 -Stage 'v1-install-evidence-published'",
     "Name = 'update-v1-to-v2'",
     "Name = 'rollback-v2-to-v1'",
     "Name = 'update-v1-to-v2-again'",
@@ -540,9 +724,9 @@ Assert-Contract ([regex]::Matches($guestSource,
 
 Assert-OrderedMarkers $guestSource @(
     '$failure = $_',
-    "Write-GuestStage -Ordinal 38 -Stage 'failure-checkpoint-starting'",
+    "Write-GuestStage -Ordinal 88 -Stage 'failure-checkpoint-starting'",
     "`$script:evidence.FailureCheckpoint = Get-Checkpoint 'failure'",
-    "Write-GuestStage -Ordinal 39 -Stage 'failure-checkpoint-captured'") `
+    "Write-GuestStage -Ordinal 89 -Stage 'failure-checkpoint-captured'") `
     'guest authenticated failure-checkpoint boundary'
 
 foreach ($hash in @(
@@ -636,6 +820,12 @@ Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 x64 bounded native PSAPI module snapshot contract passed') `
     'guest bounded PSAPI module enumeration and main-module proof were not dynamically exercised by x64 Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 strict compact Explorer child JSON contract passed') `
+    'guest strict compact Explorer child JSON reader was not dynamically exercised by Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 strict typed Explorer child JSON rejection contract passed') `
+    'guest strict typed Explorer child JSON rejection matrix was not dynamically exercised by Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 bounded V1 host readiness model contract passed') `
     'guest strict bounded V1 host readiness model was not dynamically exercised by Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
@@ -644,6 +834,9 @@ Assert-Contract (($guestContractOutput -join ' ') -match
 Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 started-stage failure cleanup contract passed') `
     'guest started-stage publication failure cleanup was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 hidden Explorer child rejection contract passed') `
+    'guest hidden Explorer child fail-closed boundary was not dynamically exercised by Windows PowerShell 5.1'
 $bootstrapContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
     -ExecutionPolicy Bypass -File $bootstrapPath -ContractSelfTest 2>&1)
 $bootstrapContractExitCode = $LASTEXITCODE

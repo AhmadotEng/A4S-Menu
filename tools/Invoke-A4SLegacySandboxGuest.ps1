@@ -16,11 +16,14 @@ param(
     [string] $ExpectedNonce,
     [string] $ExpectedRequestSha256,
     [string] $ExpectedGuestScriptSha256,
-    [switch] $ContractSelfTest
+    [switch] $ContractSelfTest,
+    [Parameter(DontShow = $true)][switch] $ExplorerProbeChild,
+    [Parameter(DontShow = $true)][int] $ExplorerProbeProcessId
 )
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+$script:guestScriptPath = [IO.Path]::GetFullPath([string]$MyInvocation.MyCommand.Path)
 
 $frozenV1SetupSha256 = 'DF282F8DC18B382B7AC28599294E2A371EF97D01F85AE6F66E9DF6A02ACBC7C2'
 $frozenV1HostSha256 = '9995676D0B74DE2E68E0C4EACB7E4111BE1AF13AA34C3505499C3925708A0573'
@@ -623,7 +626,7 @@ function Get-TaskbarExplorerPid {
     return [A4SSandboxWindowProbe]::TaskbarExplorerPid()
 }
 
-function Get-ExplorerModuleInventory {
+function Get-ExplorerModuleInventoryDirect {
     param([Parameter(Mandatory)][int] $ExplorerPid)
     $modules = [Collections.Generic.List[object]]::new()
     try {
@@ -648,6 +651,8 @@ function Get-ExplorerModuleInventory {
             throw 'The taskbar Explorer changed while its module snapshot was captured.'
         }
         return [ordered]@{
+            SchemaVersion = 1
+            ExplorerPid = $ExplorerPid
             Complete = $true
             Error = $null
             TotalModuleCount = [int]$snapshot.TotalModuleCount
@@ -657,12 +662,160 @@ function Get-ExplorerModuleInventory {
     }
     catch {
         return [ordered]@{
+            SchemaVersion = 1
+            ExplorerPid = $ExplorerPid
             Complete = $false
             Error = $_.Exception.Message
             TotalModuleCount = 0
             MainModulePath = $null
             Modules = @($modules)
         }
+    }
+}
+
+function Test-IsJsonIntegralNumber {
+    param([Parameter(Mandatory)][AllowNull()] $Value)
+    return $Value -is [int] -or $Value -is [long]
+}
+
+function ConvertFrom-ExplorerModuleInventoryJson {
+    param(
+        [Parameter(Mandatory)][string] $Text,
+        [Parameter(Mandatory)][string] $ExpectedMainModulePath,
+        [Parameter(Mandatory)][ValidateRange(1, 2147483647)][int] $ExpectedExplorerPid
+    )
+    $byteCount = [Text.Encoding]::UTF8.GetByteCount($Text)
+    if ($byteCount -lt 2 -or $byteCount -gt 131072 -or
+        $Text.IndexOf("`r", [StringComparison]::Ordinal) -ge 0 -or
+        $Text.IndexOf("`n", [StringComparison]::Ordinal) -ge 0) {
+        throw 'The Explorer probe child did not return one bounded compact JSON document.'
+    }
+    $value = $Text | ConvertFrom-Json -ErrorAction Stop
+    $properties = @($value.PSObject.Properties.Name | Sort-Object)
+    $expectedProperties = @('Complete', 'Error', 'ExplorerPid', 'MainModulePath',
+        'Modules', 'SchemaVersion', 'TotalModuleCount') | Sort-Object
+    if (($properties -join '|') -cne ($expectedProperties -join '|') -or
+        $value.Complete -isnot [bool] -or -not [bool]$value.Complete -or
+        $null -ne $value.Error) {
+        throw 'The Explorer probe child returned an invalid top-level inventory schema.'
+    }
+    if (-not (Test-IsJsonIntegralNumber $value.SchemaVersion) -or
+        [long]$value.SchemaVersion -ne 1) {
+        throw 'The Explorer probe child returned an invalid schema version.'
+    }
+    if (-not (Test-IsJsonIntegralNumber $value.ExplorerPid) -or
+        [long]$value.ExplorerPid -ne [long]$ExpectedExplorerPid) {
+        throw 'The Explorer probe child returned an invalid or mismatched Explorer PID.'
+    }
+    if (-not (Test-IsJsonIntegralNumber $value.TotalModuleCount)) {
+        throw 'The Explorer probe child returned a non-integral total module count.'
+    }
+    $totalModuleCount = [long]$value.TotalModuleCount
+    if ($totalModuleCount -le 0 -or $totalModuleCount -gt 4096) {
+        throw 'The Explorer probe child returned an invalid total module count.'
+    }
+    if ($value.MainModulePath -isnot [string]) {
+        throw 'The Explorer probe child returned a non-string main module path.'
+    }
+    $mainModulePath = [IO.Path]::GetFullPath([string]$value.MainModulePath)
+    $expectedMain = [IO.Path]::GetFullPath($ExpectedMainModulePath)
+    if (-not $mainModulePath.Equals($expectedMain,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'The Explorer probe child did not prove the expected canonical main image.'
+    }
+    $modules = [Collections.Generic.List[object]]::new()
+    $uniquePaths = [Collections.Generic.HashSet[string]]::new(
+        [StringComparer]::OrdinalIgnoreCase)
+    if ($value.Modules -isnot [Array]) {
+        throw 'The Explorer probe child Modules value is not a JSON array.'
+    }
+    $moduleValues = [Array]$value.Modules
+    if ($moduleValues.Count -gt 8 -or $moduleValues.Count -gt $totalModuleCount) {
+        throw 'The Explorer probe child returned an impossible A4S module count.'
+    }
+    foreach ($module in $moduleValues) {
+        $moduleProperties = @($module.PSObject.Properties.Name | Sort-Object)
+        $expectedModuleProperties = @('Length', 'OriginalFilename', 'Path',
+            'ProductVersion', 'Sha256') | Sort-Object
+        if (($moduleProperties -join '|') -cne ($expectedModuleProperties -join '|') -or
+            $module.Path -isnot [string] -or $module.Sha256 -isnot [string] -or
+            $module.ProductVersion -isnot [string] -or
+            $module.OriginalFilename -isnot [string] -or
+            -not (Test-IsJsonIntegralNumber $module.Length) -or
+            [long]$module.Length -le 0) {
+            throw 'The Explorer probe child returned an invalid A4S module schema.'
+        }
+        $path = [IO.Path]::GetFullPath([string]$module.Path)
+        $sha256 = Normalize-Sha256 ([string]$module.Sha256)
+        if (-not $uniquePaths.Add($path) -or
+            [IO.Path]::GetFileName($path) -ine 'A4SMenu.dll' -or
+            [string]$module.ProductVersion -notmatch '^[0-9]+(?:\.[0-9]+){3}$' -or
+            [string]$module.OriginalFilename -ine 'A4SMenu.dll') {
+            throw 'The Explorer probe child returned an invalid A4S module identity.'
+        }
+        $modules.Add([ordered]@{
+            Path = $path
+            Length = [long]$module.Length
+            Sha256 = $sha256
+            ProductVersion = [string]$module.ProductVersion
+            OriginalFilename = [string]$module.OriginalFilename
+        })
+    }
+    return [ordered]@{
+        SchemaVersion = 1
+        ExplorerPid = [int]$ExpectedExplorerPid
+        Complete = $true
+        Error = $null
+        TotalModuleCount = [int]$totalModuleCount
+        MainModulePath = $mainModulePath
+        Modules = @($modules)
+    }
+}
+
+function Get-ExplorerModuleInventory {
+    param([Parameter(Mandatory)][int] $ExplorerPid)
+    if ($ExplorerPid -le 0) { throw 'The Explorer probe PID must be positive.' }
+    $windowsPowerShell = [IO.Path]::GetFullPath((Join-Path $env:SystemRoot `
+        'System32\WindowsPowerShell\v1.0\powershell.exe'))
+    if (-not (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf)) {
+        throw 'Canonical x64 Windows PowerShell 5.1 is missing.'
+    }
+    $label = 'explorer-module-probe-{0}-{1}' -f $ExplorerPid,
+        [Guid]::NewGuid().ToString('N')
+    $execution = Invoke-ExactProcess -Path $windowsPowerShell -Arguments @(
+        '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
+        '-File', $script:guestScriptPath, '-ExplorerProbeChild',
+        '-ExplorerProbeProcessId', [string]$ExplorerPid) -Label $label `
+        -TimeoutSeconds 8 -KillWaitMilliseconds 5000
+    if (-not [string]::IsNullOrEmpty([string]$execution.Stderr)) {
+        throw 'The Explorer probe child wrote unexpected stderr.'
+    }
+    $inventory = ConvertFrom-ExplorerModuleInventoryJson `
+        -Text ([string]$execution.Stdout) `
+        -ExpectedMainModulePath (Join-Path $env:SystemRoot 'explorer.exe') `
+        -ExpectedExplorerPid $ExplorerPid
+    $verifiedModules = [Collections.Generic.List[object]]::new()
+    foreach ($reported in @($inventory.Modules)) {
+        $actual = Get-FileIdentity ([string]$reported.Path)
+        if ([long]$actual.Length -ne [long]$reported.Length -or
+            [string]$actual.Sha256 -cne [string]$reported.Sha256 -or
+            [string]$actual.ProductVersion -cne [string]$reported.ProductVersion -or
+            [string]$actual.OriginalFilename -ine [string]$reported.OriginalFilename) {
+            throw 'The parent could not reproduce an Explorer probe child module identity.'
+        }
+        $verifiedModules.Add($actual)
+    }
+    if ((Get-TaskbarExplorerPid) -ne $ExplorerPid) {
+        throw 'The taskbar Explorer changed after the bounded child module snapshot.'
+    }
+    return [ordered]@{
+        SchemaVersion = 1
+        ExplorerPid = $ExplorerPid
+        Complete = $true
+        Error = $null
+        TotalModuleCount = [int]$inventory.TotalModuleCount
+        MainModulePath = [string]$inventory.MainModulePath
+        Modules = @($verifiedModules)
     }
 }
 
@@ -683,23 +836,67 @@ function Get-A4SProcessInventory {
 }
 
 function Get-Checkpoint {
-    param([Parameter(Mandatory)][string] $Label)
+    param(
+        [Parameter(Mandatory)][string] $Label,
+        [switch] $PublishPostExitStages
+    )
     $explorerPid = Get-TaskbarExplorerPid
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 45 -Stage 'v1-checkpoint-taskbar-pid-resolved' `
+            -Details @{ ExplorerPid = $explorerPid }
+    }
+    $explorerModules = Get-ExplorerModuleInventory $explorerPid
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 46 -Stage 'v1-checkpoint-explorer-modules-captured' `
+            -Details @{
+                ExplorerPid = $explorerPid
+                TotalModuleCount = [int]$explorerModules.TotalModuleCount
+                A4SMenuModuleCount = @($explorerModules.Modules).Count
+            }
+    }
+    $product = Get-RegistryTreeSnapshot 'Software\A4SMenu'
+    $lifecycle = Get-RegistryTreeSnapshot 'Software\A4SMenuLifecycle'
+    $run = Get-RegistryValueRecord 'Software\Microsoft\Windows\CurrentVersion\Run' 'A4SMenu'
+    $cleanupRunOnce = Get-RegistryValueRecord `
+        'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuCleanup'
+    $recoveryRunOnce = Get-RegistryValueRecord `
+        'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuServicingRecovery'
+    $uninstall = Get-RegistryTreeSnapshot `
+        'Software\Microsoft\Windows\CurrentVersion\Uninstall\A4SMenu'
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 47 -Stage 'v1-checkpoint-registry-captured'
+    }
+    $userState = Get-UserStateProjection
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 48 -Stage 'v1-checkpoint-user-state-captured'
+    }
+    $dataCache = Get-DataCacheRecord
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 49 -Stage 'v1-checkpoint-cache-captured'
+    }
+    $installInventory = Get-InstallInventory
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 50 -Stage 'v1-checkpoint-install-inventory-captured'
+    }
+    $processes = Get-A4SProcessInventory
+    if ($PublishPostExitStages) {
+        Write-GuestStage -Ordinal 51 -Stage 'v1-checkpoint-process-inventory-captured'
+    }
     return [ordered]@{
         Label = $Label
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
         ExplorerPid = $explorerPid
-        ExplorerModules = Get-ExplorerModuleInventory $explorerPid
-        Product = Get-RegistryTreeSnapshot 'Software\A4SMenu'
-        Lifecycle = Get-RegistryTreeSnapshot 'Software\A4SMenuLifecycle'
-        Run = Get-RegistryValueRecord 'Software\Microsoft\Windows\CurrentVersion\Run' 'A4SMenu'
-        CleanupRunOnce = Get-RegistryValueRecord 'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuCleanup'
-        RecoveryRunOnce = Get-RegistryValueRecord 'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuServicingRecovery'
-        Uninstall = Get-RegistryTreeSnapshot 'Software\Microsoft\Windows\CurrentVersion\Uninstall\A4SMenu'
-        UserState = Get-UserStateProjection
-        DataCache = Get-DataCacheRecord
-        InstallInventory = Get-InstallInventory
-        Processes = Get-A4SProcessInventory
+        ExplorerModules = $explorerModules
+        Product = $product
+        Lifecycle = $lifecycle
+        Run = $run
+        CleanupRunOnce = $cleanupRunOnce
+        RecoveryRunOnce = $recoveryRunOnce
+        Uninstall = $uninstall
+        UserState = $userState
+        DataCache = $dataCache
+        InstallInventory = $installInventory
+        Processes = $processes
     }
 }
 
@@ -1399,6 +1596,125 @@ function Assert-ContractModel {
         throw 'Bounded native PSAPI contract did not prove this x64 Windows PowerShell module snapshot.'
     }
     Write-Host 'A4S legacy Sandbox guest PS5 x64 bounded native PSAPI module snapshot contract passed.'
+    $newProbeInventoryModel = {
+        [ordered]@{
+            SchemaVersion = [int]1
+            ExplorerPid = [int]$PID
+            Complete = $true
+            Error = $null
+            TotalModuleCount = [int]$nativeSnapshot.TotalModuleCount
+            MainModulePath = [string]$nativeSnapshot.MainModulePath
+            Modules = [object[]]@()
+        }
+    }
+    $compactInventoryJson = ((& $newProbeInventoryModel) |
+        ConvertTo-Json -Depth 20 -Compress)
+    $roundTripInventory = ConvertFrom-ExplorerModuleInventoryJson `
+        -Text $compactInventoryJson -ExpectedMainModulePath $windowsPowerShell `
+        -ExpectedExplorerPid $PID
+    if (-not $roundTripInventory.Complete -or
+        [int]$roundTripInventory.SchemaVersion -ne 1 -or
+        [int]$roundTripInventory.ExplorerPid -ne $PID -or
+        [int]$roundTripInventory.TotalModuleCount -ne
+            [int]$nativeSnapshot.TotalModuleCount -or
+        @($roundTripInventory.Modules).Count -ne 0) {
+        throw 'Strict compact Explorer child JSON contract did not round-trip.'
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 strict compact Explorer child JSON contract passed.'
+
+    $newProbeModuleModel = {
+        param(
+            [Parameter(Mandatory)][string] $Directory,
+            [Parameter(Mandatory)] $Length
+        )
+        [ordered]@{
+            Path = Join-Path $Directory 'A4SMenu.dll'
+            Length = $Length
+            Sha256 = '0' * 64
+            ProductVersion = '1.0.0.0'
+            OriginalFilename = 'A4SMenu.dll'
+        }
+    }
+    $invalidProbeCases = [Collections.Generic.List[object]]::new()
+    $typedMutations = @(
+        [ordered]@{ Name = 'schema-string'; Property = 'SchemaVersion'; Value = '1' },
+        [ordered]@{ Name = 'schema-boolean'; Property = 'SchemaVersion'; Value = $true },
+        [ordered]@{ Name = 'schema-fractional'; Property = 'SchemaVersion'; Value = [double]1.5 },
+        [ordered]@{ Name = 'schema-wrong'; Property = 'SchemaVersion'; Value = [int]2 },
+        [ordered]@{ Name = 'pid-string'; Property = 'ExplorerPid'; Value = [string]$PID },
+        [ordered]@{ Name = 'pid-boolean'; Property = 'ExplorerPid'; Value = $true },
+        [ordered]@{ Name = 'pid-fractional'; Property = 'ExplorerPid'; Value = [double]($PID + 0.5) },
+        [ordered]@{ Name = 'pid-wrong'; Property = 'ExplorerPid'; Value = [int]($PID + 1) },
+        [ordered]@{ Name = 'count-string'; Property = 'TotalModuleCount'; Value = '1' },
+        [ordered]@{ Name = 'count-boolean'; Property = 'TotalModuleCount'; Value = $true },
+        [ordered]@{ Name = 'count-fractional'; Property = 'TotalModuleCount'; Value = [double]1.5 }
+    )
+    foreach ($mutation in $typedMutations) {
+        $model = & $newProbeInventoryModel
+        $model[[string]$mutation.Property] = $mutation.Value
+        $invalidProbeCases.Add([ordered]@{
+            Name = [string]$mutation.Name
+            Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+        })
+    }
+    foreach ($missingCase in @(
+            [ordered]@{ Name = 'missing-schemaversion'; Property = 'SchemaVersion' },
+            [ordered]@{ Name = 'missing-explorerpid'; Property = 'ExplorerPid' })) {
+        $model = & $newProbeInventoryModel
+        $model.Remove([string]$missingCase.Property)
+        $invalidProbeCases.Add([ordered]@{
+            Name = [string]$missingCase.Name
+            Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+        })
+    }
+    $model = & $newProbeInventoryModel
+    $model['Modules'] = $null
+    $invalidProbeCases.Add([ordered]@{
+        Name = 'modules-null'
+        Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+    })
+    $moduleOne = & $newProbeModuleModel -Directory 'C:\probe-one' -Length ([long]1)
+    $moduleTwo = & $newProbeModuleModel -Directory 'C:\probe-two' -Length ([long]2)
+    $model = & $newProbeInventoryModel
+    $model['Modules'] = $moduleOne
+    $invalidProbeCases.Add([ordered]@{
+        Name = 'modules-singleton-object'
+        Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+    })
+    $model = & $newProbeInventoryModel
+    $model['TotalModuleCount'] = [int]1
+    $model['Modules'] = [object[]]@($moduleOne, $moduleTwo)
+    $invalidProbeCases.Add([ordered]@{
+        Name = 'modules-exceed-total-count'
+        Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+    })
+    foreach ($lengthMutation in @(
+            [ordered]@{ Name = 'length-string'; Value = '1' },
+            [ordered]@{ Name = 'length-boolean'; Value = $true },
+            [ordered]@{ Name = 'length-fractional'; Value = [double]1.5 })) {
+        $model = & $newProbeInventoryModel
+        $module = & $newProbeModuleModel -Directory 'C:\probe-length' `
+            -Length $lengthMutation.Value
+        $model['Modules'] = [object[]]@($module)
+        $invalidProbeCases.Add([ordered]@{
+            Name = [string]$lengthMutation.Name
+            Json = ($model | ConvertTo-Json -Depth 20 -Compress)
+        })
+    }
+    foreach ($invalidProbeCase in $invalidProbeCases) {
+        $rejected = $false
+        try {
+            ConvertFrom-ExplorerModuleInventoryJson `
+                -Text ([string]$invalidProbeCase.Json) `
+                -ExpectedMainModulePath $windowsPowerShell `
+                -ExpectedExplorerPid $PID | Out-Null
+        }
+        catch { $rejected = $true }
+        if (-not $rejected) {
+            throw "Strict Explorer child JSON accepted invalid case '$($invalidProbeCase.Name)'."
+        }
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 strict typed Explorer child JSON rejection contract passed.'
 
     $statusModels = @(
         [ordered]@{ ExitCode = 0; Stdout = "A4SMenuHost: ready`r`n"; State = 'ready'; Disposition = 'ready' },
@@ -1529,6 +1845,20 @@ Start-Sleep -Seconds 30
         if ($null -ne (Get-Process -Id $stageFailurePid -ErrorAction SilentlyContinue)) {
             throw 'Started-stage publication failure contract left its direct child alive.'
         }
+
+        $hiddenProbeStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $hiddenProbeRejection = Invoke-ExactProcess -Path $windowsPowerShell `
+            -Arguments @('-NoLogo', '-NoProfile', '-NonInteractive',
+                '-ExecutionPolicy', 'Bypass', '-File', $script:guestScriptPath,
+                '-ExplorerProbeChild', '-ExplorerProbeProcessId', [string]$PID) `
+            -Label 'hidden-explorer-probe-rejection-contract' -TimeoutSeconds 8 `
+            -KillWaitMilliseconds 5000 -AcceptedExitCodes @(0, 1)
+        $hiddenProbeStopwatch.Stop()
+        if (-not [string]::IsNullOrEmpty([string]$hiddenProbeRejection.Stdout) -or
+            [string]::IsNullOrWhiteSpace([string]$hiddenProbeRejection.Stderr) -or
+            $hiddenProbeStopwatch.Elapsed.TotalSeconds -gt 13) {
+            throw "Hidden Explorer child mode did not reject a non-taskbar/non-Sandbox probe fail-closed and in time (exit=$($hiddenProbeRejection.ExitCode), stdout='$($hiddenProbeRejection.Stdout)', stderr='$($hiddenProbeRejection.Stderr)')."
+        }
     }
     finally {
         if ([IO.Directory]::Exists($processContractRoot)) {
@@ -1537,7 +1867,36 @@ Start-Sleep -Seconds 30
     }
     Write-Host 'A4S legacy Sandbox guest PS5 bounded process timeout contract passed.'
     Write-Host 'A4S legacy Sandbox guest PS5 started-stage failure cleanup contract passed.'
+    Write-Host 'A4S legacy Sandbox guest PS5 hidden Explorer child rejection contract passed.'
     Write-Host 'A4S legacy Sandbox guest in-memory contract passed.'
+}
+
+if ($ExplorerProbeChild) {
+    if ($ContractSelfTest -or $ExplorerProbeProcessId -le 0 -or
+        -not [string]::IsNullOrWhiteSpace($RequestPath) -or
+        -not [string]::IsNullOrWhiteSpace($ExpectedSessionId) -or
+        -not [string]::IsNullOrWhiteSpace($ExpectedNonce) -or
+        -not [string]::IsNullOrWhiteSpace($ExpectedRequestSha256) -or
+        -not [string]::IsNullOrWhiteSpace($ExpectedGuestScriptSha256)) {
+        throw 'The hidden Explorer probe child accepts only one positive process ID.'
+    }
+    if (-not [Environment]::Is64BitProcess) {
+        throw 'The hidden Explorer probe child requires x64 Windows PowerShell.'
+    }
+    $probeIdentity = Get-WindowsSandboxIdentity
+    if ((Get-TaskbarExplorerPid) -ne $ExplorerProbeProcessId) {
+        throw 'The hidden Explorer probe PID is not the active Sandbox taskbar Explorer.'
+    }
+    $directInventory = Get-ExplorerModuleInventoryDirect `
+        -ExplorerPid $ExplorerProbeProcessId
+    if (-not $directInventory.Complete) {
+        throw "The direct Explorer module probe failed: $($directInventory.Error)"
+    }
+    [Console]::Out.Write(($directInventory | ConvertTo-Json -Depth 20 -Compress))
+    return
+}
+if ($ExplorerProbeProcessId -ne 0) {
+    throw '-ExplorerProbeProcessId is private to the hidden Explorer probe child mode.'
 }
 
 if ($ContractSelfTest) {
@@ -1767,22 +2126,36 @@ try {
     # The legacy injected DLL cannot be unloaded without replacing Explorer.
     # Give its one-shot preload worker time to settle before establishing the
     # cache bytes whose installer preservation is measured below.
+    Write-GuestStage -Ordinal 38 -Stage 'v1-post-exit-settle-starting'
     Start-Sleep -Milliseconds 3100
+    Write-GuestStage -Ordinal 39 -Stage 'v1-post-exit-settle-completed'
 
     $cacheBytes = [Text.Encoding]::UTF8.GetBytes(
         ('A4S-SANDBOX-CACHE-V1-BASELINE:' + [string]$request.Nonce + ':' + ('x' * 512)))
     $cachePath = Join-Path $env:LOCALAPPDATA 'A4SMenu\DataCache.db'
+    Write-GuestStage -Ordinal 40 -Stage 'v1-cache-seed-starting'
     [IO.File]::WriteAllBytes($cachePath, $cacheBytes)
     $cacheBaseline = Get-DataCacheRecord
     $cacheSha256 = [string]$cacheBaseline.Sha256
+    Write-GuestStage -Ordinal 41 -Stage 'v1-cache-seed-completed' -Details @{
+        Length = [long]$cacheBaseline.Length
+        Sha256 = $cacheSha256
+    }
+    Write-GuestStage -Ordinal 42 -Stage 'v1-cache-stability-wait-starting'
     Start-Sleep -Milliseconds 1000
     if ([string](Get-DataCacheRecord).Sha256 -cne $cacheSha256) {
         throw 'DataCache.db did not remain quiescent after the V1 host exited.'
     }
-    $installV1Checkpoint = Get-Checkpoint 'install-v1-host-quiescent-cache-baseline'
+    Write-GuestStage -Ordinal 43 -Stage 'v1-cache-stability-verified'
+    Write-GuestStage -Ordinal 44 -Stage 'v1-quiescent-checkpoint-starting'
+    $installV1Checkpoint = Get-Checkpoint `
+        'install-v1-host-quiescent-cache-baseline' -PublishPostExitStages
+    Write-GuestStage -Ordinal 52 -Stage 'v1-quiescent-checkpoint-captured'
+    Write-GuestStage -Ordinal 53 -Stage 'v1-quiescent-checkpoint-assertion-starting'
     Assert-InstalledCheckpoint -Checkpoint $installV1Checkpoint -ExpectedActive $request.V1 `
         -ExpectedPrevious $null -ExpectedSlotCount 1 -InitialExplorerPid $initialExplorerPid `
         -ExpectedUserStateSha256 $seedUserStateSha256 -ExpectedCacheSha256 $cacheSha256 | Out-Null
+    Write-GuestStage -Ordinal 54 -Stage 'v1-quiescent-checkpoint-asserted'
     $script:evidence.Steps.Add([ordered]@{
         Name = 'install-v1'
         Execution = $installV1Execution
@@ -1793,7 +2166,9 @@ try {
         ExplorerMappingAfterReadiness = $v1ReadyMapping
         Checkpoint = $installV1Checkpoint
     })
+    Write-GuestStage -Ordinal 55 -Stage 'v1-install-evidence-publication-starting'
     Write-ProgressEvidence
+    Write-GuestStage -Ordinal 56 -Stage 'v1-install-evidence-published'
 
     $updateToken1 = Get-RandomHex
     $update1 = Invoke-ExactProcess -Path $localV2 `
@@ -1943,9 +2318,9 @@ catch {
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
     }
     try {
-        Write-GuestStage -Ordinal 38 -Stage 'failure-checkpoint-starting'
+        Write-GuestStage -Ordinal 88 -Stage 'failure-checkpoint-starting'
         $script:evidence.FailureCheckpoint = Get-Checkpoint 'failure'
-        Write-GuestStage -Ordinal 39 -Stage 'failure-checkpoint-captured'
+        Write-GuestStage -Ordinal 89 -Stage 'failure-checkpoint-captured'
     }
     catch {
         $script:evidence.FailureCheckpointError = $_.Exception.Message
