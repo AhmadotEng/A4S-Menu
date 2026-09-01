@@ -116,6 +116,35 @@ foreach ($requiredParameter in @('V1SetupPath', 'V2SetupPath',
         'ExpectedV1SetupSha256', 'ExpectedV2SetupSha256', 'AllowInstallMutation')) {
     Assert-Contract ($parameterNames -ccontains $requiredParameter) "missing parameter $requiredParameter"
 }
+$evidenceParameters = @($ast.ParamBlock.Parameters | Where-Object {
+    $_.Name.VariablePath.UserPath -ceq 'EvidenceDirectory'
+})
+Assert-Contract ($evidenceParameters.Count -eq 1 -and
+    $null -eq $evidenceParameters[0].DefaultValue) `
+    'EvidenceDirectory still evaluates a default expression during parameter binding'
+Assert-OrderedMarkers $source @(
+    "if (-not `$PSBoundParameters.ContainsKey('EvidenceDirectory'))",
+    "(Join-Path `$PSScriptRoot '..\build\evidence\installer-lifecycle')",
+    'if (-not $AllowInstallMutation)',
+    '$evidenceRoot = Assert-LocalAbsolutePath $EvidenceDirectory') `
+    'post-binding evidence default, authorization guard, and path validation order'
+
+# Execute the real script without EvidenceDirectory or mutation authorization.
+# It must reach the deliberate authorization boundary before fixture, evidence,
+# registry, process, or product-state validation becomes reachable.
+$authorizationError = $null
+try {
+    & $harnessPath `
+        -V1SetupPath 'C:\A4S-contract-do-not-create\v1.exe' `
+        -V2SetupPath 'C:\A4S-contract-do-not-create\v2.exe' `
+        -ExpectedV1SetupSha256 ('0' * 64) `
+        -ExpectedV2SetupSha256 ('0' * 64) | Out-Null
+}
+catch { $authorizationError = $_ }
+Assert-Contract ($null -ne $authorizationError -and
+    $authorizationError.Exception.Message -ceq
+        'This is a LIVE per-user installer test. Re-run with -AllowInstallMutation only after reviewing the script and closing unrelated setup processes.') `
+    'omitted EvidenceDirectory did not reach the intended mutation-authorization guard'
 
 foreach ($identity in @(
         'DF282F8DC18B382B7AC28599294E2A371EF97D01F85AE6F66E9DF6A02ACBC7C2',

@@ -45,7 +45,7 @@ param(
 
     [switch] $AllowInstallMutation,
 
-    [string] $EvidenceDirectory = (Join-Path $PSScriptRoot '..\build\evidence\installer-lifecycle'),
+    [string] $EvidenceDirectory,
 
     [ValidateRange(30, 600)]
     [int] $OperationTimeoutSeconds = 120
@@ -54,6 +54,10 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+if (-not $PSBoundParameters.ContainsKey('EvidenceDirectory')) {
+    $EvidenceDirectory = [IO.Path]::GetFullPath(
+        (Join-Path $PSScriptRoot '..\build\evidence\installer-lifecycle'))
+}
 if (-not $AllowInstallMutation) {
     throw 'This is a LIVE per-user installer test. Re-run with -AllowInstallMutation only after reviewing the script and closing unrelated setup processes.'
 }
