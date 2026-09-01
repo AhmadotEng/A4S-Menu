@@ -24,3 +24,21 @@ When this refinement reaches the appropriate geometry/qualification work:
 - validate at 100%, 125%, 150%, and 200% scaling and on secondary monitors.
 
 Do not implement this as a hardcoded `-11 px` offset.
+
+## Evidence-based performance refinements after Step 3
+
+Status: deferred because the accepted build already meets its warm-opening and
+idle-CPU targets. No source change has been made.
+
+The [2026-09-01 Step 3 live record](../testing/A4S-plan2-step3-live-2026-09-01.md)
+identified only these concrete optimization candidates:
+
+- eliminate or cache the 30 A4S-attributed registry operations recorded during
+  every opening;
+- cancel the one icon-loading task observed 8.57 seconds after the menu had
+  closed; and
+- reduce full-menu repainting so unchanged regions are not repainted.
+
+These are not current release blockers. Implement one at a time only if a later
+measurement or reproduced defect justifies its regression risk, then compare a
+separately built candidate against the preserved Step 3 baseline.

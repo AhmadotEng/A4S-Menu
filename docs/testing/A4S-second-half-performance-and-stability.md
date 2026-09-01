@@ -9,7 +9,8 @@ or sign the user out.
 See also the [second-half requirement ledger](../architecture/A4S-second-half-requirements.md),
 [runtime-cache architecture](../architecture/A4S-runtime-cache.md),
 [custom runtime-trace reference](A4S-runtime-trace.md), and
-[failure-recovery plan](A4S-failure-recovery.md).
+[failure-recovery plan](A4S-failure-recovery.md). The current exact-build live
+result is the [2026-09-01 Plan 2 Step 3 record](A4S-plan2-step3-live-2026-09-01.md).
 
 ## Safety boundary
 
@@ -451,19 +452,38 @@ binaries, use `Test-A4SPerformanceTools.ps1 -SkipObservationSmokeTest` and
 
 ## Current qualification status
 
-The harness is implemented, but no second-half live performance run or full
-matrix run is implied by its existence. The following evidence still requires
-an explicit live test after the native-input, optimization, and installer work
-stabilizes:
+An exact-build, real-desktop Step 3 run now exists. Use the
+[2026-09-01 live record](A4S-plan2-step3-live-2026-09-01.md), not the earlier
+ignored `A4S-*unoptimized*` intermediate evidence, for the current baseline.
+The recorded Host/DLL SHA-256 prefixes are `8DD438DB` / `FF66AA07`, and the
+canonical cross-trace analysis is
+`07-analysis/step3-correlated-etw-v4.json` (SHA-256
+`8D404B4CAAD6A4206DAF5703B744780E544B6D14B6E37B44A4FC60D8BE8E0B00`).
 
-- clean same-Explorer before/after memory capture;
-- operator-attested cold opening and repeated warm-opening samples;
-- first-paint/pop-in image comparison;
-- ETW-attributed internal phase timings;
-- kernel file-I/O and compositor-presentation evidence (the custom provider
-  deliberately reports these as not measured);
-- all monitor, DPI, alignment, fullscreen, Explorer, and session scenarios;
-- installation, update, repair, rollback, uninstall, and crash-loop guard.
+That run now supplies:
+
+- a clean same-Explorer resource baseline and +3,842,048-byte private-memory
+  delta;
+- one operator-attested cold opening and 30 warm external samples;
+- 30 complete standalone custom-provider cycles and 30 more under WPR load;
+- pinned, icon, backdrop, Programs, and first-input search scopes;
+- a 15.359748-second passive-idle CPU trace;
+- a sampled pop-in image pair plus numerical pixel comparison; and
+- concurrent CPU, File I/O, registry, DWM, DirectComposition, DxgKrnl, DXGI,
+  Win32k, and RPC data correlated by raw same-boot QPC.
+
+The warm <=50 ms gate passes. Step 3 deliberately leaves these claims open:
+
+- exact physical first-presented and last-removed frame; the application close
+  p95 is within the nominal frame, while the external proxy is not;
+- a strict physical warm-disk guarantee; three first-cycle reads were observed
+  and physical candidates do not have joined attribution stacks;
+- the opening-path registry/COM gate; 900/900 registry events have joined A4S
+  stacks and no COM provider was captured;
+- proof of the initial idle preload, full search-results/Programs settlement,
+  and changed-rectangle-only repainting; and
+- all remaining monitor, DPI, fullscreen, Explorer/session, installer,
+  rollback, uninstall, and crash-loop scenarios.
 
 Installer and recovery execution are specified separately in the
 [current-profile lifecycle](A4S-current-profile-installer-lifecycle.md) and

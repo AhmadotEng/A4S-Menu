@@ -205,6 +205,23 @@ Offline `-EnforceTargets` cannot pass without an explicit
 The 20-sample minimums can be raised, but lowering them weakens the evidence and
 must be recorded with the result.
 
+### Cross-trace timestamp rule
+
+Do not join `tracerpt` wall-clock timestamps to a concurrent WPR/system ETL.
+On the 2026-09-01 Dubai qualification machine, whose actual Windows offset was
+`+04:00`, `tracerpt.exe` serialized the offset as `+03:59`; its decoded A4S UTC
+timestamps were therefore exactly 60 seconds late. Durations calculated
+between events in the same decoded trace remained valid, but the decoded UTC
+values were not a safe cross-trace key.
+
+Correlate concurrent custom and system ETLs only with raw, same-boot
+`TimeStampQPC`, after validating that the two observed QPC ranges overlap.
+Preserve the raw ETLs and record the QPC frequency/method with the derived
+report. Do not "correct" or rewrite the raw ETL or silently subtract 60 seconds
+from general-purpose decoded output. The exact-build example and canonical
+raw-QPC analysis are in the
+[2026-09-01 Step 3 live record](A4S-plan2-step3-live-2026-09-01.md).
+
 ## Interpretation limits and follow-up evidence
 
 `firstPaint` is an application paint marker. `windowVisible` records the menu's

@@ -121,16 +121,21 @@ warm/cold open, compositor removal, enumeration, icons/metadata, backdrop,
 search, Programs, Explorer memory, idle CPU, and disk/registry/COM activity,
 with median and p95.
 
-Status: instrumentation/tooling is implemented; a genuine unoptimized
-intermediate baseline exists, but final exact-build coverage is incomplete.
-Principal commits are `81924b7`, `2bfa587`, `1e48515`, `37c2df9`, `6f8841b`,
-and hardening through `86b48f6`. The preserved ignored
-`build\test-results\A4S-*unoptimized*` evidence contains 30 warm samples:
-proxy warm p95 41.529 ms, custom ETW visible p95 24.584 ms, custom close p95
-3.907 ms, proxy close p95 15.302 ms against a 4.184 ms frame, host idle 0%,
-Explorer private-byte delta +3,436,544, pinned p95 12.919 ms, icon p95 0.075
-ms, and backdrop p95 0.053 ms. It is not the current binary pair and lacks
-exact DWM, physical I/O, registry/COM, Programs, and manual-search coverage.
+Status: **complete as the exact-build measurement baseline for the next
+evidence-based pass**, with named release gaps retained. Principal
+instrumentation commits are `81924b7`, `2bfa587`, `1e48515`, `37c2df9`,
+`6f8841b`, and hardening through `86b48f6`. The real-desktop 2026-09-01 run
+measured source checkpoint `34b0939` with Host/DLL hashes `8DD438DB...` and
+`FF66AA07...`: external warm-open p95 26.273 ms (37.938 ms through the
+observer's DWM proxy), standalone A4S-marker p95 15.541 ms, WPR-load p95
+23.8565 ms, host idle 0%, same-Explorer private-byte delta +3,842,048,
+Programs p95 3.987 ms, icon p95 3.523 ms, and search initialization 0.0936
+ms. Concurrent raw-QPC correlation found 900/900 registry events with joined
+A4S stacks, three first-cycle file reads without A4S frames, and 29 later
+logically quiet open intervals. Exact physical first/removal frame remains not
+measured and COM was not captured, so P3 and P8 are not closed. Full evidence,
+hashes, capture limitations, and the invalid `04/.../capture-01` conversion are
+recorded in [the Step 3 live record](../testing/A4S-plan2-step3-live-2026-09-01.md).
 
 ### 4. Perform evidence-based optimization
 
