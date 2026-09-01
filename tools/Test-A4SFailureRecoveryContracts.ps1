@@ -59,6 +59,9 @@ $automaticHostReferences = @($ast.FindAll({
 }, $true))
 Assert-Contract ($automaticHostReferences.Count -eq 0) `
     'harness declares or references PowerShell automatic variable $Host'
+Assert-Contract (-not [regex]::IsMatch($harness,
+        '(?im)^\s*return\s+if\b')) `
+    'harness uses an if statement as a return argument, which invokes a nonexistent command in Windows PowerShell 5.1'
 
 function Get-FunctionText {
     param([Parameter(Mandatory)][string] $Name)

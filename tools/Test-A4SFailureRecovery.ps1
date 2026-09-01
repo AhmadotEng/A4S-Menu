@@ -2980,7 +2980,10 @@ function Get-A4SPendingHostSafetyTransaction {
     if ($pending.Count -gt 1) {
         throw 'Multiple nonterminal HostSafety transactions exist; automatic recovery is ambiguous.'
     }
-    return if ($pending.Count -eq 1) { $pending[0] } else { $null }
+    if ($pending.Count -eq 1) {
+        return $pending[0]
+    }
+    return $null
 }
 
 function Restore-HostSafety {
