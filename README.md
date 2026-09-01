@@ -28,36 +28,50 @@ Current source profile: `A4SMenu/phase4-source-profile/23`.
 - Context flyouts open at the clicked program and can be replaced immediately
   by left- or right-clicking another eligible pinned or All Programs entry.
 
-## Runtime boundary
+## Product and package boundary
 
-The first-half staged x64 product contains exactly:
+The current x64 product has two deliberately separate stages:
 
-- `A4SMenuHost.exe` - the small per-session Explorer injector and reconnect
-  watchdog.
-- `A4SMenu.dll` - the popup menu UI, fixed environment model, search, commands,
-  and interactions.
+- `build\stage\A4SProduct` contains exactly `A4SMenuHost.exe` and
+  `A4SMenu.dll` for direct development and qualification.
+- `build\stage\A4SSetup` contains exactly `A4SMenuSetup.exe`, the one-file
+  per-user installer with the matching host and DLL embedded as resources.
 
-The full Open-Shell repository remains the development environment; it is not
-the installed payload. The general settings/skin application, Classic
-Explorer, Classic IE, updater, installer, taskbar styling, File Explorer
-integration, help files, language DLLs, and preview tools are not staged.
+An installed immutable version slot contains `A4SMenuHost.exe`, `A4SMenu.dll`,
+and a dormant `A4SMenuSetup.exe` maintenance copy. Only the host is a resident
+process; the DLL runs in Explorer, and setup runs only for servicing. The full
+Open-Shell repository remains the development environment and is not installed.
+The general settings/skin application, Classic Explorer, Classic IE, updater,
+taskbar styling, File Explorer integration, help bundle, language DLLs, and
+preview tools are outside the product package.
 
-The one-file installer is intentionally deferred to the second half. The
-current first-half product boundary and Explorer lifecycle are documented in
+The historical two-file milestone is recorded in
 [docs/architecture/A4S-product-first-half.md](docs/architecture/A4S-product-first-half.md).
+The current installer, native-input/recovery, cache, and evidence boundaries are
+documented in:
+
+- [docs/architecture/A4S-product-installer.md](docs/architecture/A4S-product-installer.md)
+- [docs/architecture/A4S-native-input-recovery.md](docs/architecture/A4S-native-input-recovery.md)
+- [docs/architecture/A4S-runtime-cache.md](docs/architecture/A4S-runtime-cache.md)
+- [docs/architecture/A4S-second-half-requirements.md](docs/architecture/A4S-second-half-requirements.md)
 
 ## Product build
 
-Build the isolated `A4SProduct|x64` solution, atomically stage the exact
-two-file payload, and run the non-injecting static gate:
+Build the isolated `A4SProduct|x64` solution, atomically stage the direct
+two-file runtime and one-file setup package, and run the non-injecting gates:
 
 ```powershell
 .\tools\Build-A4SProduct.ps1
 ```
 
-The staged product is written to `build\stage\A4SProduct`. The staging and
-static gates reject extra files, non-x64 binaries, dependency drift, export or
-ABI drift, mismatched product metadata, and a resident `--version` command.
+The direct runtime is written to `build\stage\A4SProduct`; the distributable is
+written to `build\stage\A4SSetup`. The build runs the product-boundary,
+native-lifecycle, cache, performance-tool, recovery, installer-lifecycle,
+runtime, and setup contract gates. Staging and static validation reject extra
+files, non-x64 binaries, dependency or export drift, an ABI other than ABI4,
+mismatched product metadata, and a resident `--version` command. These gates do
+not by themselves qualify live Explorer, installer, session, or performance
+behavior.
 
 To rerun only the static gate against an existing stage:
 
@@ -81,7 +95,7 @@ That wrapper builds the upstream development target and launches its standalone
 preview without injecting Explorer. Its legacy output under
 `build\stage\A4SMenu` must not be distributed as the product.
 
-### Explicit live lifecycle gate
+### Direct-runtime live lifecycle gate
 
 After the static and visual gates pass, run the Explorer-mutating lifecycle
 test only from a fresh Explorer process with no prior A4S mapping:
@@ -130,31 +144,38 @@ Finish the session through the supported logical disarm path:
 After `--exit`, restart Explorer before another test session. Do not force-kill
 the host and do not use same-process `--rehook`.
 
-## Validation
+## Validation status
 
-The first-half validation set combines accepted visual references, isolated
-builds, an automated static product gate, and an explicit live lifecycle gate:
+The accepted UI baseline still consists of **14 StartAllBack reference images**
+covering **10 required-state entries**: nine captured states and one user-menu
+state that is not applicable to this configuration. The first-half build and
+fresh-Explorer lifecycle results remain historical evidence for their exact
+binaries; they do not qualify the current second-half build.
 
-- **14 accepted StartAllBack reference images** covering **10 required-state
-  entries**: nine captured states and one user-menu state that is not
-  applicable to this configuration.
-- Clean x64 product and retained upstream development builds: **PASS**.
-- Exact two-file staging and `tools\Test-A4SProduct.ps1`: **PASS**.
-- Fresh-Explorer `tools\Test-A4SProductLifecycle.ps1`: **PASS** against the
-  exact staged ABI3 binaries; READY, open, close, logical disarm, host exit,
-  and the expected inert DLL pin were verified.
-- Manual standalone visual and interaction review at 96 DPI through
-  `tools\Preview-A4SProduct.ps1 -CenterBottom`.
+The second-half source and qualification harnesses are implemented. The build
+gate covers product/package boundaries, ABI4 native lifecycle, cache
+publication, lazy search, asynchronous Programs enumeration, trace conversion,
+performance-tool safety, installer transactions, legacy-Sandbox contracts, and
+failure-recovery contracts. Live performance, current-profile installation,
+legacy upgrade/rollback, Windows input/session transitions, DPI/monitor rows,
+and controlled Explorer-failure tests remain pending until their exact reviewed
+build and evidence are recorded. See:
+
+- [docs/testing/A4S-second-half-performance-and-stability.md](docs/testing/A4S-second-half-performance-and-stability.md)
+- [docs/testing/A4S-current-profile-installer-lifecycle.md](docs/testing/A4S-current-profile-installer-lifecycle.md)
+- [docs/testing/A4S-legacy-sandbox-lifecycle.md](docs/testing/A4S-legacy-sandbox-lifecycle.md)
+- [docs/testing/A4S-failure-recovery.md](docs/testing/A4S-failure-recovery.md)
 
 The measured visual and interaction contract is in
 [docs/reference/StartAllBack-visual-spec.md](docs/reference/StartAllBack-visual-spec.md).
-The exact toolchain, binary hashes, dependency allowlists, and current gate
-results are recorded in
+The exact toolchain, binary hashes, dependency allowlists, and results for the
+historical first-half build are recorded in
 [docs/architecture/A4S-product-build-record.md](docs/architecture/A4S-product-build-record.md).
 
 [A4SMENU-PHASE4.md](A4SMENU-PHASE4.md) remains the accepted UI/profile
-implementation history. The first-half architecture document is authoritative
-for the new product package and host lifecycle.
+implementation history. Current second-half architecture and release status are
+defined by the linked architecture documents and requirement ledger, not by the
+historical first-half record.
 
 ## Upstream
 

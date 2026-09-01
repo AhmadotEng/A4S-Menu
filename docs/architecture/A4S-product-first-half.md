@@ -1,5 +1,11 @@
 # A4S Menu product architecture - first half
 
+> Historical milestone: this document is frozen to the completed first-half
+> ABI3/two-file runtime and explains what was intentionally deferred at that
+> time. It is not the current package, ABI, installer, cache, or qualification
+> contract. Follow the current documents linked from the repository README for
+> second-half behavior.
+
 This document is the first-half product contract. It describes the two-binary
 build split and the safe Explorer lifecycle that are completed before native
 Windows-key routing, performance optimization, and installer work.

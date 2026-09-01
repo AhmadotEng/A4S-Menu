@@ -1,5 +1,9 @@
 # A4S Menu first-half build record
 
+> Historical evidence: every hash, ABI, PID, toolchain version, and PASS result
+> below applies only to the recorded first-half binaries. It must not be reused
+> as evidence for the current second-half source or package.
+
 This record captures the verified first-half build that established the
 two-binary product boundary and passed the explicit live Explorer lifecycle
 gate on 2026-08-31 at 20:53 (+04:00).

@@ -6,8 +6,10 @@ changes: they never install the product, start or inject the host, restart or
 kill Explorer, change display settings, lock the session, sleep the computer,
 or sign the user out.
 
-See also the [second-half requirement ledger](../architecture/A4S-second-half-requirements.md)
-and the [custom runtime-trace reference](A4S-runtime-trace.md).
+See also the [second-half requirement ledger](../architecture/A4S-second-half-requirements.md),
+[runtime-cache architecture](../architecture/A4S-runtime-cache.md),
+[custom runtime-trace reference](A4S-runtime-trace.md), and
+[failure-recovery plan](A4S-failure-recovery.md).
 
 ## Safety boundary
 
@@ -19,8 +21,11 @@ window observations are restricted to `A4SMenu.CMenuContainer` windows owned
 by the taskbar Explorer process, and failure cleanup uses the normal toggle
 path to close exactly one menu that the test opened. They refuse an ambiguous
 cleanup toggle if more than one matching Explorer-owned menu is visible. A
-shared session-local qualification mutex also prevents the performance, trace,
-and automated-scenario tools from overlapping their menu cycles. Scenario
+shared `Local\A4SMenu.QualificationAutomation.v1.<session-id>` mutex also
+prevents the performance, trace, and automated-scenario tools in this Windows
+session from overlapping their menu cycles. It coordinates only these
+cooperating tools; it neither blocks manual input nor serializes another Windows
+session. Scenario
 cleanup records the exact window it opened and will not close a newly opened
 menu after the scenario's own dismissal was already observed.
 
@@ -134,6 +139,15 @@ poll also inherits scheduler granularity and can create conservative timing
 failures. Product-side QPC/ETW markers and a presentation trace are required
 for authoritative frame claims.
 
+Window ownership checks re-resolve class/title, HWND, owner PID, process start
+time, session/logon identity, and host READY state throughout a run. They detect
+process/PID replacement and ordinary host-window replacement, but a numeric
+HWND is a recyclable kernel value: there is no independent window-creation
+generation in the external observer. A same-process destroy-and-recreate event
+that reused the same value inside a narrow observation interval is therefore a
+residual ambiguity. Correlate the product operation IDs/window markers in the
+custom trace when that distinction matters.
+
 The staged product directory is the default, but qualification commands pass it
 explicitly so a baseline cannot be reused accidentally against another source.
 The installed product root itself does **not** contain the active binaries.
@@ -185,6 +199,14 @@ The current external proxy gates are:
 - resident host idle CPU at or below 0.05% of total machine capacity;
 - no change to Explorer's process-wide read/write I/O counters during every
   warm open.
+
+The frame comparison uses the actual menu monitor's current-mode **nominal**
+integer refresh rate. It does not measure variable-refresh scheduling or prove
+which composed frame reached the display. Likewise, observer-process `DwmFlush`
+is pacing/observation evidence, not a presentation timestamp, and Explorer CPU,
+memory, and I/O counters are process-wide rather than A4S-attributed. Treat all
+four as screening proxies until the required compositor, stack, and File I/O
+traces are attached.
 
 The report includes p50, p95, and maximum timings, every raw sample, exact
 binary paths/build identities, host and Explorer IDs/start times/logon identity, same-process memory deltas, and
@@ -432,3 +454,9 @@ stabilizes:
   deliberately reports these as not measured);
 - all monitor, DPI, alignment, fullscreen, Explorer, and session scenarios;
 - installation, update, repair, rollback, uninstall, and crash-loop guard.
+
+Installer and recovery execution are specified separately in the
+[current-profile lifecycle](A4S-current-profile-installer-lifecycle.md),
+[legacy Sandbox lifecycle](A4S-legacy-sandbox-lifecycle.md), and
+[failure-recovery plan](A4S-failure-recovery.md). The presence of those tools
+does not change any pending status above.

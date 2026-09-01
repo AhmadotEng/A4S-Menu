@@ -11,20 +11,33 @@ failure-path check where one is practical.
 - Exact first-half rollback commit:
   `42d61a4844f08f3a86752f41f54dac1b977987e4`.
 - The full Open-Shell tree remains the development environment.
-- The installed runtime must contain only `A4SMenuHost.exe` and `A4SMenu.dll`.
-  `A4SMenuSetup.exe` is the distributable installer, not a resident component.
+- Each installed immutable slot contains `A4SMenuHost.exe`, `A4SMenu.dll`, and a
+  dormant `A4SMenuSetup.exe` maintenance/uninstall copy. The resident runtime is
+  only the host process plus the DLL mapped in Explorer; setup is never a
+  resident component.
 - StartAllBack is disabled for qualification. Its still-mapped loader/runtime
   modules are recorded separately from the A4S result.
 - A failed or crash-loop-disabled A4S initialization must leave Windows' native
   Start path available.
 
+Implementation and test procedures are documented in the
+[native input/recovery contract](A4S-native-input-recovery.md),
+[runtime-cache architecture](A4S-runtime-cache.md),
+[one-file installer contract](A4S-product-installer.md),
+[performance/stability plan](../testing/A4S-second-half-performance-and-stability.md),
+[current-profile installer plan](../testing/A4S-current-profile-installer-lifecycle.md),
+[legacy Sandbox plan](../testing/A4S-legacy-sandbox-lifecycle.md), and
+[failure-recovery plan](../testing/A4S-failure-recovery.md). These links show
+that the implementation and harnesses exist; the rows below remain pending
+until their required evidence is actually recorded.
+
 ## Native input and lifecycle
 
 | ID | Requirement | Required evidence | Status |
 | --- | --- | --- | --- |
-| N1 | A lone left or right Windows-key press toggles A4S Menu. | Automated input trace plus visible-window assertion on a fresh Explorer. | Pending |
-| N2 | A second lone Windows-key press closes the open menu. | Open/close timing and visible-window assertion. | Pending |
-| N3 | Clicking the primary taskbar Start button uses the same toggle path. | Centered and left-aligned taskbar interaction tests. | Pending |
+| N1 | A lone left or right Windows-key press toggles A4S Menu. | Manual physical-key action on a fresh Explorer, activation-source trace, and visible-window assertion; do not synthesize Windows-key input. | Pending |
+| N2 | A second lone Windows-key press closes the open menu. | Manual physical-key action, activation-source trace, and visible-window assertion. | Pending |
+| N3 | Clicking the primary taskbar Start button uses the same toggle path. | Manual physical Start-button clicks plus activation-source trace for centered and left-aligned taskbars. | Pending |
 | N4 | Win+R, Win+E, Win+L, Win+X, Win+Tab, and other modified Windows-key chords remain native and do not flash A4S Menu. | Shortcut matrix; disruptive lock test run separately. | Pending |
 | N5 | Clicking or activating another application dismisses the menu normally; the menu is not permanently topmost. | Focus-transition window assertion and visual check. | Pending |
 | N6 | Explorer restart/crash reconnects without polling or duplicate hooks. | Explorer PID transition, host status, exact DLL mapping, and one-menu assertion. | Pending |
@@ -39,12 +52,12 @@ failure-path check where one is practical.
 | --- | --- | --- | --- |
 | P1 | Measure cold and warm toggle-to-first-visible latency. | Timestamped samples and summary statistics. | Pending |
 | P2 | Warm opening is at most 50 ms on the qualification machine. | Repeated warm sample report. | Pending |
-| P3 | Closing completes within one display frame. | Close sample report with detected display refresh interval. | Pending |
-| P4 | Idle host and injected runtime consume effectively 0% CPU. | Timed process CPU delta while idle. | Pending |
-| P5 | A warm toggle performs no filesystem reads/writes attributable to A4S. | I/O-counter and/or ETW evidence with documented scope. | Pending |
+| P3 | Closing completes within one display frame. | Custom close markers plus compositor-presentation trace at the actual menu monitor's nominal refresh mode. | Pending |
+| P4 | Idle host and injected runtime consume effectively 0% CPU. | Timed host delta plus ETW/WPA attribution of Explorer CPU to the injected A4S code. | Pending |
+| P5 | A warm toggle performs no filesystem reads/writes attributable to A4S. | WPR/ETW File I/O activity and stacks filtered to the exact Explorer PID and measured intervals. | Pending |
 | P6 | Record Explorer private-memory delta caused by A4S. | Before/after process-memory samples on a fresh Explorer. | Pending |
 | P7 | Measure pinned enumeration, icon loading, backdrop preparation, Programs enumeration, and search initialization. | Internal phase markers exported to the measurement tool or trace. | Pending |
-| P8 | The opening path avoids filesystem, registry, and shell-COM discovery calls. | Trace plus reviewed opening-path call graph. | Pending |
+| P8 | The opening path avoids filesystem, registry, and shell-COM discovery calls. | Reviewed opening-path call graph plus system trace/stacks for the exact measured intervals. | Pending |
 | P9 | Pinned metadata/icons are preloaded after Explorer is idle and reusable resources are cached. | Instrumented cache warm-up and repeat-open trace. | Pending |
 | P10 | Programs enumeration does not block first-frame presentation; search initializes only on first input. | Phase trace and cold interactive checks. | Pending |
 | P11 | Opening shows no visible icon/text pop-in and repainting is bounded to required regions. | Frame capture/visual check and paint counters. | Pending |

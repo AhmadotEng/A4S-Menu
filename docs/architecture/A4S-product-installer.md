@@ -47,39 +47,49 @@ previous slot paths are under `HKCU\Software\A4SMenu`.
 
 ## Serialized, recoverable servicing
 
-Every state-changing operation first takes a named, per-user mutex. A second
-installer returns `ERROR_INSTALL_ALREADY_RUNNING`; it cannot race registry or
-slot changes made by the first.
+Every state-changing operation takes the current-user lifecycle mutex and then
+the exact setup-payload mutex. A HostSafety mutation takes the separate global
+current-user HostSafety mutex after those two locks. A second installer returns
+`ERROR_INSTALL_ALREADY_RUNNING`; setup, the lifecycle harness, the host crash
+guard, and explicit safety recovery therefore share one reviewed lock order
+rather than racing registry or slot changes.
 
 Install, update, and repair use this order:
 
 1. Validate all embedded x64 payloads and the setup image.
-2. Build and verify a new staging directory under `versions`, flush each file,
-   compare all three byte-for-byte, and rename the directory to its immutable
-   final name on the same volume. This fallible work occurs while the current
-   host is still running.
-3. Capture the exact native type and bytes of every owned Run, RunOnce,
-   uninstall, and product-state value in a durable servicing journal. Queue a
-   `!A4SMenuServicingRecovery` RunOnce command that invokes the setup copy in
-   the target slot.
-4. Request the running host's authenticated logical exit and wait for its
+2. Plan every root, versions, staging, final-slot path and its required absence
+   before filesystem mutation. Capture the exact native type and bytes of every
+   owned Run, RunOnce, uninstall, lifecycle, and product-state value. Persist
+   and flush that intent, ownership metadata, operation sequence/token, and the
+   complete snapshot in the servicing journal.
+3. Only after `SnapshotComplete` is durable, create and verify the planned
+   staging directory under `versions`, flush each file, compare all three
+   payloads byte-for-byte, and rename it to the planned immutable final slot on
+   the same volume. Each materialization/ownership phase is persisted in the
+   journal. This fallible work occurs while the current host is still running.
+4. Queue and flush the exact `!A4SMenuServicingRecovery` RunOnce command that
+   invokes the setup copy in the target slot.
+5. Request the running host's authenticated logical exit and wait for its
    Explorer callbacks to disarm. Setup does not force-kill it.
-5. Durably prepare uninstall metadata and `ActiveSlot`/`PreviousSlot` while the
+6. Durably prepare uninstall metadata and `ActiveSlot`/`PreviousSlot` while the
    old `Run` value remains authoritative.
-6. Durably set `ReadyToCommit`, then write and flush the new `Run` command as
+7. Durably set `ReadyToCommit`, then write and flush the new `Run` command as
    the final externally visible commit marker.
-7. For an explicit repair, clear the HostSafety crash-loop latch only after the
-   target registration has committed. Durably remove the journal, then remove
-   the recovery RunOnce value.
+8. For explicit `--repair` only, clear the HostSafety crash-loop state after the
+   target registration has committed. `--update`, automatic repair, install,
+   and rollback preserve HostSafety. Mark completion, durably delete the
+   journal as the transaction completion point, and only then remove and flush
+   the now-idempotent recovery RunOnce value.
 
-An in-process failure replays the exact raw snapshot and restarts the former
-host when it had been present. It never deletes `%LocalAppData%\A4SMenu`, user
-settings, or caches. A process or power interruption is resolved by
-`--reconcile`: an incomplete/pre-commit operation restores the snapshot; a
-fully matching committed target is completed. The durable RunOnce continuation
-makes this reconciliation automatic at the next sign-in after registry changes
-have begun. A journal created before any registration change is harmless even
-if its RunOnce continuation had not yet been queued.
+An in-process failure replays the exact raw snapshot, releases only filesystem
+objects still proven to be owned by that journal, and restarts the former host
+when it had been present. It never broadly deletes `%LocalAppData%\A4SMenu`,
+user settings, or caches. A process or power interruption is resolved by
+`--reconcile`: an intent record without a durable complete snapshot owns no
+paths and is discarded; an incomplete/pre-commit operation restores the exact
+snapshot and releases only identity-bound owned artifacts; a fully matching
+committed target is completed. The recovery RunOnce continuation makes this
+automatic at the next sign-in once it has been queued.
 
 Fixed product versions are read from setup, host, and DLL. An older installer
 cannot replace a newer active slot; an intentional downgrade uses `--rollback`
@@ -104,13 +114,18 @@ Uninstall uses the same journal and mutex. Before removing registration, it
 writes and flushes one native helper at `%TEMP%\A4SMenuCleanup.exe` and queues a
 `!A4SMenuCleanup` RunOnce continuation. It then disarms the host, removes
 metadata while retaining the old `Run` value, marks the journal ready, and
-deletes/flushed `Run` as the final uninstall commit. A crash therefore leaves
-either the old exact registration or a durable cleanup path—never an
+deletes and flushes `Run` as the final uninstall commit. A crash therefore leaves
+either the old exact registration or a durable cleanup path, never an
 unregistered orphan with no continuation. Failure to launch the immediate
 helper is non-fatal because RunOnce remains queued.
 
-The helper waits on process handles without polling and deletes only the three
-known product files in direct, non-reparse-point version directories. It never
+The helper waits for the setup process handle and, when an Explorer blocker was
+recorded, waits in 100-ms process-handle intervals. Between waits it checks for
+installer registration so a reinstall wakes it promptly. Under both product
+locks it reconciles an exact servicing continuation, then rechecks registration:
+a fully committed reinstall cancels deletion, while malformed or partial
+registration fails closed. Cleanup deletes only the three known, hash/version-
+valid product files in direct, non-reparse-point version directories. It never
 recursively follows reparse points and never deletes unknown content. Known
 runtime caches (`DataCache.db`, `DataCache.tmp`, `DataCache.txt`, and
 `StartupLog.txt`) survive install/update/repair and are removed only by explicit
@@ -125,9 +140,10 @@ The executable uses Windows error codes as process exit codes.
 
 | Command | Behavior |
 | --- | --- |
-| no operation | Install if no active slot is registered; otherwise repair/update. |
+| no operation | Install if no active slot is registered; otherwise redeploy/register while preserving HostSafety. |
 | `--install` | Install the embedded version for the current user. |
-| `--repair` or `--update` | Validate and atomically redeploy/register the embedded version; reset HostSafety only after commit. |
+| `--repair` | Validate and atomically redeploy/register the embedded version; clear HostSafety only after commit. |
+| `--update` | Validate and atomically redeploy/register the embedded version while preserving HostSafety. |
 | `--uninstall` | Logically disarm, unregister, and schedule safe known-file cleanup. |
 | `--rollback` | Restore the fully validated recorded previous slot. |
 | `--silent`, `/quiet`, or `/s` | Suppress all prompts. |
@@ -161,8 +177,9 @@ Examples:
 - the full payload identity and every recovery-state decision pass the native
   `--self-test` truth table;
 - source contracts retain mutex serialization, immutable repair slots,
-  journal/RunOnce ordering, exact rollback, post-commit HostSafety reset,
-  uninstall handoff, reparse boundaries, and absolute Explorer launch;
+  journal/RunOnce ordering, exact rollback, explicit-repair-only post-commit
+  HostSafety reset plus update preservation, uninstall handoff, reparse
+  boundaries, and absolute Explorer launch;
 - `--version`, `--verify`, self-test, and temporary extraction terminate
   successfully;
 - extraction produces exactly setup, host, and DLL byte-for-byte; and
@@ -175,3 +192,8 @@ logon startup, upgrade/rollback, restart consent, deliberately interrupted
 servicing, locked-DLL cleanup, and uninstall recovery remain release-matrix
 tests. Static and isolated tests do not claim those Windows interactions have
 run.
+
+The guarded live current-profile procedure is documented in
+[A4S-current-profile-installer-lifecycle.md](../testing/A4S-current-profile-installer-lifecycle.md).
+Frozen-V1 mutation and V1-to-V2 rollback are confined to the disposable
+[Windows Sandbox matrix](../testing/A4S-legacy-sandbox-lifecycle.md).

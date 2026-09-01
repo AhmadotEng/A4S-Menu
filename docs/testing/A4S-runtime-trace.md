@@ -4,8 +4,9 @@
 TraceLogging provider that is built into the A4S product DLL.
 
 Use this reference with the
-[performance/stability qualification procedure](A4S-second-half-performance-and-stability.md)
-and [second-half requirement ledger](../architecture/A4S-second-half-requirements.md).
+[performance/stability qualification procedure](A4S-second-half-performance-and-stability.md),
+the [runtime-cache architecture](../architecture/A4S-runtime-cache.md), and the
+[second-half requirement ledger](../architecture/A4S-second-half-requirements.md).
 
 - Provider: `A4SMenu.Runtime`
 - GUID: `74a9f986-c7ab-429a-9571-df0fb7f4a33c`
@@ -109,9 +110,11 @@ a `finally` block, including failed or partial starts. A successful start whose
 stop fails is a terminal error; after a failed start, the tool also queries a
 failed stop to detect a residual named session. If Windows denies ETW session
 creation, run the same command from an elevated 64-bit PowerShell; do not weaken
-the product preflight. A shared session-local qualification mutex refuses a
-capture while the performance or scenario automation tool owns the menu, so
-their extra cycles cannot enter this trace.
+the product preflight. The shared
+`Local\A4SMenu.QualificationAutomation.v1.<session-id>` mutex refuses a capture
+while the performance or scenario automation tool in this Windows session owns
+the menu, so their extra cycles cannot enter this trace. It coordinates only
+these cooperating tools and does not block manual input or another session.
 
 For automated cycles, refresh-rate evidence comes from the monitor containing
 the actual visible menu window, not blindly from the primary taskbar. All
@@ -191,6 +194,11 @@ These safeguards prevent accidental/concurrent converter collisions; they are
 not presented as a security boundary against a privileged process racing the
 filesystem. An existing target must parse as the corresponding A4S schema-2
 report or A4S tracerpt XML, so `-Force` is not a general replacement switch.
+The two-file publication is exception-safe inside the running converter, but it
+is not a filesystem transaction spanning both destinations. A process crash or
+power loss between the two per-file replacements can leave a mixed or incomplete
+pair; the next run deliberately rejects that state rather than claiming atomic
+recovery.
 `-EventJsonPath` exists for deterministic synthetic/offline tests.
 Offline `-EnforceTargets` cannot pass without an explicit
 `-ExpectedCycleCount`; this prevents a truncated ETL from validating itself.

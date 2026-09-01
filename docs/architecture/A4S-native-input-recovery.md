@@ -75,6 +75,26 @@ remains the authoritative reconnect boundary; no polling timer is added.
 
 ## Crash-loop fail-safe
 
+Every production read-modify-write or reset of
+`HKCU\Software\A4SMenu\HostSafety` is serialized by
+`Global\A4SMenu.HostSafety.v1.<current-user-SID>`. The host holds that mutex
+while loading, advancing, persisting, or resetting the guard. Setup acquires it
+after its current-user lifecycle and payload-specific setup mutexes; the
+failure-recovery harness uses the same `Lifecycle -> Setup -> HostSafety ->
+current-desktop host` order. A lock/open/read/write failure is fail-closed and
+cannot silently authorize injection.
+
+The persisted product schema is flat, contains no subkeys, and after an
+abnormal exit contains exactly these five values:
+
+| Value | Registry type | Meaning |
+| --- | --- | --- |
+| `InjectionDisabled` | `REG_DWORD` | Nonzero after the rolling threshold trips. |
+| `AbnormalExplorerExitCount` | `REG_DWORD` | Current retained timestamp count, at most three. |
+| `AbnormalExplorerExitTimes` | `REG_BINARY` | Exactly three little-endian QWORD timestamp slots (24 bytes). |
+| `AbnormalExplorerWindowStart` | `REG_QWORD` | First nonzero retained crash timestamp. |
+| `LastExplorerExitCode` | `REG_DWORD` | Exit code from the most recently classified abnormal boundary. |
+
 The host records abnormal Explorer exit times only when an authenticated A4S
 initialization or ready activation was in flight. It persists the three exact
 timestamps as `AbnormalExplorerExitTimes` (`REG_BINARY`), prunes every timestamp
@@ -95,11 +115,11 @@ maintenance exemption because a crash during teardown may identify a faulty
 DLL. Only a latched OS session ending (`WM_QUERYENDSESSION` or WTS logoff), or
 the authenticated state after callbacks are inert, suppresses the abnormal
 classification. The installer restarts Explorer only after disarm/host exit, so
-that intended restart is no longer observed by this guard. Installer repair or
-an explicit
-`A4SMenuHost.exe --reset-safety` clears the latch and begins a fresh validated
-connection. The reset is fail-closed: a registry deletion failure does not
-clear the in-memory latch.
+that intended restart is no longer observed by this guard. Only explicit
+installer `--repair` or an explicit `A4SMenuHost.exe --reset-safety` clears the
+latch and begins a fresh validated connection. Installer `--update`, automatic
+repair, install, and rollback preserve the latch. Reset is fail-closed: a mutex,
+registry-open, or registry-deletion failure does not clear the in-memory latch.
 
 The key classifier, pre-held modifier rule, and rolling crash-window transitions
 have compile-time tests. Direct A4S product builds compile the dedicated owner
@@ -114,3 +134,8 @@ Run the source-only lifecycle gate without injection or registry writes:
 ```powershell
 powershell -NoProfile -ExecutionPolicy Bypass -File tools/Test-A4SNativeLifecycle.ps1
 ```
+
+The offline, isolated-DLL, and deliberately destructive Explorer qualification
+procedures are separated in
+[the failure-recovery test plan](../testing/A4S-failure-recovery.md). Their
+existence is not evidence that the isolated or live modes have run.

@@ -8,6 +8,12 @@ per-run results directory is the only writable host mapping. The request,
 Sandbox configuration, and host result therefore are not writable from the
 guest.
 
+The complementary real-profile harness deliberately verifies V1 read-only and
+mutates only V2; see
+[A4S-current-profile-installer-lifecycle.md](A4S-current-profile-installer-lifecycle.md).
+Neither document claims its live matrix has run merely because the harness is
+present.
+
 The Sandbox configuration disables networking, vGPU, microphone and camera
 input, printers, clipboard sharing, and enables Protected Client. The runner
 will not launch without the explicit `-AllowSandboxLaunch` switch. It also
