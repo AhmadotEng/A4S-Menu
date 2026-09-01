@@ -15,9 +15,12 @@ remains available.
 
 Explorer's existing TwinUI registration classifies a bare left or right
 Windows-key gesture and posts thread hotkey ID 1 on the thread that owns
-`ApplicationManager_ImmersiveShellWindow`. The DLL installs a thread-specific
-`WH_GETMESSAGE` hook on that validated Explorer thread without unregistering or
-replacing TwinUI's hotkeys. It handles only a removed `WM_HOTKEY` whose ID is 1,
+`ApplicationManager_ImmersiveShellWindow`. During early Explorer startup the
+equivalent `ApplicationManager_DesktopShellWindow` may be created first; the
+DLL accepts either class only after confirming that its owner is the current
+Explorer process. It installs a thread-specific `WH_GETMESSAGE` hook on that
+validated shell-manager thread without unregistering or replacing TwinUI's
+hotkeys. It handles only a removed `WM_HOTKEY` whose ID is 1,
 modifier field is exactly `MOD_WIN`, and virtual-key field is zero. The hook
 first queues `A4S_MENU_COMMAND_TOGGLE`; only after that succeeds does it replace
 the shell message with `WM_NULL`. A queue failure leaves the original message

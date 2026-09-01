@@ -3160,6 +3160,8 @@ static DWORD RemoveA4SNativeHotkeyHook( void )
 static bool InstallA4SNativeHotkeyHook( void )
 {
 	HWND shellWindow=FindWindow(L"ApplicationManager_ImmersiveShellWindow",NULL);
+	if (!shellWindow)
+		shellWindow=FindWindow(L"ApplicationManager_DesktopShellWindow",NULL);
 	DWORD shellProcessId=0;
 	const DWORD shellThreadId=shellWindow?
 		GetWindowThreadProcessId(shellWindow,&shellProcessId):0;

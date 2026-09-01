@@ -35,12 +35,13 @@ if (-not $installMatch.Success) {
 }
 foreach ($pattern in @(
     'FindWindow\(L"ApplicationManager_ImmersiveShellWindow",NULL\)',
+    'if\s*\(!shellWindow\)[\s\S]*FindWindow\(L"ApplicationManager_DesktopShellWindow",NULL\)',
     'GetWindowThreadProcessId\(shellWindow,&shellProcessId\)',
     'shellProcessId!=GetCurrentProcessId\(\)',
     'SetWindowsHookEx\(WH_GETMESSAGE,HookA4SNativeHotkey'
 )) {
     Assert-Match $installMatch.Value $pattern `
-        'The native shell-hotkey hook is not bound to the validated Explorer shell thread.'
+        'The native shell-hotkey hook is not bound to an available validated Explorer shell-manager thread.'
 }
 
 $callbackMatch = [Regex]::Match(
