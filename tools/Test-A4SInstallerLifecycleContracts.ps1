@@ -99,6 +99,13 @@ $ast = [Management.Automation.Language.Parser]::ParseFile(
     $harnessPath, [ref]$tokens, [ref]$parseErrors)
 Assert-Contract ($parseErrors.Count -eq 0) ('PowerShell parse errors: ' +
     (($parseErrors | ForEach-Object Message) -join ' | '))
+$automaticHostReferences = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.VariablePath.UserPath -ieq 'Host'
+}, $true))
+Assert-Contract ($automaticHostReferences.Count -eq 0) `
+    'lifecycle harness declares or references PowerShell automatic variable $Host'
 $source = [IO.File]::ReadAllText($harnessPath)
 $setupSource = [IO.File]::ReadAllText($setupPath)
 
@@ -640,6 +647,86 @@ $wrongSession = [ordered]@{
 }
 Assert-Contract (-not (Test-ExactInstalledProcessSet @($wrongSession) @($hostProcess) `
     $hostIdentity $session)) 'installed process model accepted a wrong-session host'
+
+# Execute both host-observation call paths with an in-memory process stub. This
+# catches collisions with PowerShell's read-only automatic $Host variable while
+# proving the exact active-host path/hash is forwarded without launching it.
+$hostInteractionModule = New-Module -Name A4SInstallerHostInteractionContract `
+    -ScriptBlock {
+        param([string] $StatusFunctionSource, [string] $StopFunctionSource)
+        $script:CapturedCalls = [Collections.Generic.List[object]]::new()
+        function Invoke-CapturedProcess {
+            param(
+                [Parameter(Mandatory)][string] $Label,
+                [Parameter(Mandatory)][string] $FilePath,
+                [Parameter(Mandatory)][string[]] $Arguments,
+                [Parameter(Mandatory)][string] $ExpectedSha256,
+                [Parameter(Mandatory)][int] $TimeoutSeconds
+            )
+            [void]$script:CapturedCalls.Add([ordered]@{
+                Label = $Label
+                FilePath = $FilePath
+                Arguments = @($Arguments)
+                ExpectedSha256 = $ExpectedSha256
+                TimeoutSeconds = $TimeoutSeconds
+            })
+            return [ordered]@{
+                Label = $Label
+                StartError = $null
+                TimedOut = $false
+                ExitCode = if ($Arguments -contains '--status') { 1062 } else { 0 }
+                ExplorerPidUnchanged = $true
+                ExplorerPidBefore = 101
+                ExplorerPidAfter = 101
+            }
+        }
+        function Assert-ProcessSucceededWithoutExplorerRestart {
+            param([Parameter(Mandatory)] $Record)
+            if ($Record.StartError -or $Record.TimedOut -or $Record.ExitCode -ne 0 -or
+                -not $Record.ExplorerPidUnchanged) {
+                throw 'The in-memory host interaction fixture returned an unexpected result.'
+            }
+        }
+        function Get-HostProcessRecords {
+            param([AllowNull()] $ActiveSlot)
+            return @()
+        }
+        . ([scriptblock]::Create($StatusFunctionSource))
+        . ([scriptblock]::Create($StopFunctionSource))
+    } -ArgumentList `
+        (Get-FunctionAst -Ast $ast -Name 'Get-HostStatusRecord').Extent.Text,
+        (Get-FunctionAst -Ast $ast -Name 'Stop-FinalHostQuiescent').Extent.Text
+$activeSlotFixture = [ordered]@{ Files = [ordered]@{ Host = $hostIdentity } }
+$hostInteraction = & $hostInteractionModule {
+    param($activeSlot)
+    $status = Get-HostStatusRecord -ActiveSlot $activeSlot -Label 'contract-status'
+    $checkpoint = [ordered]@{
+        HostStatus = [ordered]@{ State = 'ready' }
+        HostProcesses = @([ordered]@{ Id = 101 })
+        ActiveSlot = $activeSlot
+    }
+    $stopped = Stop-FinalHostQuiescent -Checkpoint $checkpoint
+    return [ordered]@{
+        Status = $status
+        Stopped = $stopped
+        Calls = @($script:CapturedCalls)
+    }
+} $activeSlotFixture
+Assert-Contract ($hostInteraction.Status.State -ceq 'stopped' -and
+    $hostInteraction.Stopped.After.State -ceq 'stopped' -and
+    $hostInteraction.Stopped.Exit.ExitCode -eq 0) `
+    'in-memory host status/quiescence execution returned the wrong state'
+Assert-Contract ($hostInteraction.Calls.Count -eq 3 -and
+    $hostInteraction.Calls[0].Arguments[0] -ceq '--status' -and
+    $hostInteraction.Calls[1].Arguments[0] -ceq '--exit' -and
+    $hostInteraction.Calls[2].Arguments[0] -ceq '--status') `
+    'host status/quiescence execution did not issue the exact expected commands'
+foreach ($call in $hostInteraction.Calls) {
+    Assert-Contract ($call.FilePath -ceq $hostIdentity.Path -and
+        $call.ExpectedSha256 -ceq $hostIdentity.Sha256 -and
+        $call.TimeoutSeconds -eq 10) `
+        'host status/quiescence execution did not preserve active-host identity'
+}
 
 Assert-OrderedMarkers $mainSource @(
     "-Label 'preflight-v1-verify'", "-Label 'preflight-v2-verify'",

@@ -2339,9 +2339,10 @@ function Get-HostStatusRecord {
     if ($null -eq $ActiveSlot) {
         return [ordered]@{ Available = $false; State = 'no-active-slot' }
     }
-    $host = $ActiveSlot.Files.Host
-    $probe = Invoke-CapturedProcess -Label ($Label + '-host-status') -FilePath $host.Path `
-        -Arguments @('--status') -ExpectedSha256 $host.Sha256 -TimeoutSeconds 10
+    $activeHost = $ActiveSlot.Files.Host
+    $probe = Invoke-CapturedProcess -Label ($Label + '-host-status') `
+        -FilePath $activeHost.Path -Arguments @('--status') `
+        -ExpectedSha256 $activeHost.Sha256 -TimeoutSeconds 10
     if ($probe.StartError) { throw "$Label host-status probe could not start: $($probe.StartError)" }
     if ($probe.TimedOut) { throw "$Label host-status probe timed out and was not force-killed." }
     if (-not $probe.ExplorerPidUnchanged) { throw "$Label host-status probe changed Explorer." }
@@ -3070,9 +3071,10 @@ function Stop-FinalHostQuiescent {
     }
     if ($Checkpoint.HostStatus.State -cne 'stopped' -or
         @($Checkpoint.HostProcesses).Count -ne 0) {
-        $host = $Checkpoint.ActiveSlot.Files.Host
-        $result.Exit = Invoke-CapturedProcess -Label 'final-host-exit' -FilePath $host.Path `
-            -Arguments @('--exit') -ExpectedSha256 $host.Sha256 -TimeoutSeconds 10
+        $activeHost = $Checkpoint.ActiveSlot.Files.Host
+        $result.Exit = Invoke-CapturedProcess -Label 'final-host-exit' `
+            -FilePath $activeHost.Path -Arguments @('--exit') `
+            -ExpectedSha256 $activeHost.Sha256 -TimeoutSeconds 10
         Assert-ProcessSucceededWithoutExplorerRestart $result.Exit
         $deadline = [DateTime]::UtcNow.AddSeconds(10)
         do {
