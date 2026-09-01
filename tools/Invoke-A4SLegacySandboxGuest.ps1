@@ -1187,6 +1187,14 @@ function Invoke-ExactProcess {
             throw [TimeoutException]::new(
                 "$Label exceeded the $TimeoutSeconds second guest-only timeout.")
         }
+        $stdoutText = ''
+        $stderrText = ''
+        if (Test-Path -LiteralPath $stdoutPath) {
+            $stdoutText = [string](Get-Content -Raw -LiteralPath $stdoutPath)
+        }
+        if (Test-Path -LiteralPath $stderrPath) {
+            $stderrText = [string](Get-Content -Raw -LiteralPath $stderrPath)
+        }
         $record = [ordered]@{
             Label = $Label
             Path = [IO.Path]::GetFullPath($Path)
@@ -1195,8 +1203,8 @@ function Invoke-ExactProcess {
             CompletedUtc = [DateTime]::UtcNow.ToString('o')
             DurationMilliseconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds, 3)
             ExitCode = [int]$process.ExitCode
-            Stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -Raw -LiteralPath $stdoutPath } else { '' }
-            Stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -Raw -LiteralPath $stderrPath } else { '' }
+            Stdout = [string]$stdoutText
+            Stderr = [string]$stderrText
         }
         if (-not $acceptedExitCodeSet.Contains([int]$record.ExitCode)) {
             throw "$Label returned unaccepted exit code $($record.ExitCode)."
@@ -1529,11 +1537,86 @@ function Assert-NetworkDisabled {
     return [ordered]@{ OperationalNonLoopbackInterfaces = @(); NetworkAvailable = $false }
 }
 
+function ConvertTo-A4SEvidenceDataSnapshot {
+    param(
+        [AllowNull()] $Value,
+        [ValidateRange(0, 24)][int] $Depth = 0,
+        [object[]] $Ancestors = @()
+    )
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return [string]$Value }
+    if ($Value -is [bool] -or $Value -is [sbyte] -or $Value -is [byte] -or
+        $Value -is [int16] -or $Value -is [uint16] -or
+        $Value -is [int] -or $Value -is [uint32] -or
+        $Value -is [long] -or $Value -is [uint64] -or
+        $Value -is [single] -or $Value -is [double] -or
+        $Value -is [decimal]) {
+        return $Value
+    }
+    if ($Depth -ge 24) {
+        throw 'The evidence data graph exceeds the maximum supported depth of 24.'
+    }
+    foreach ($ancestor in $Ancestors) {
+        if ([object]::ReferenceEquals($ancestor, $Value)) {
+            throw 'The evidence data graph contains a reference cycle.'
+        }
+    }
+    $nextAncestors = [object[]]::new($Ancestors.Count + 1)
+    if ($Ancestors.Count -gt 0) {
+        [Array]::Copy($Ancestors, $nextAncestors, $Ancestors.Count)
+    }
+    $nextAncestors[$Ancestors.Count] = $Value
+    if ($Value -is [Collections.IDictionary]) {
+        $copy = [ordered]@{}
+        foreach ($key in $Value.Keys) {
+            if ($key -isnot [string] -or [string]::IsNullOrWhiteSpace([string]$key)) {
+                throw 'Evidence object keys must be non-empty strings.'
+            }
+            $copy.Add([string]$key, (ConvertTo-A4SEvidenceDataSnapshot `
+                -Value $Value[$key] -Depth ($Depth + 1) -Ancestors $nextAncestors))
+        }
+        return $copy
+    }
+    if ($Value -is [Collections.IList]) {
+        $items = [Collections.Generic.List[object]]::new()
+        foreach ($item in $Value) {
+            $items.Add((ConvertTo-A4SEvidenceDataSnapshot -Value $item `
+                -Depth ($Depth + 1) -Ancestors $nextAncestors))
+        }
+        return ,([object[]]$items.ToArray())
+    }
+    if ($Value -is [pscustomobject]) {
+        $copy = [ordered]@{}
+        foreach ($property in $Value.PSObject.Properties) {
+            if ($property.MemberType -ne
+                    [Management.Automation.PSMemberTypes]::NoteProperty) {
+                throw "Evidence object property '$($property.Name)' is not data-only."
+            }
+            $copy.Add([string]$property.Name, (ConvertTo-A4SEvidenceDataSnapshot `
+                -Value $property.Value -Depth ($Depth + 1) `
+                -Ancestors $nextAncestors))
+        }
+        return $copy
+    }
+    throw "Evidence contains unsupported runtime type '$($Value.GetType().FullName)'."
+}
+
+function ConvertTo-A4SEvidenceJson {
+    param([Parameter(Mandatory)][Collections.IDictionary] $Evidence)
+    $snapshot = ConvertTo-A4SEvidenceDataSnapshot -Value $Evidence
+    $json = $snapshot | ConvertTo-Json -Depth 32 -WarningAction Stop
+    $byteCount = [Text.Encoding]::UTF8.GetByteCount($json)
+    if ($byteCount -le 1 -or $byteCount -gt 16777216) {
+        throw 'Serialized evidence is empty or exceeds the 16 MiB safety bound.'
+    }
+    return [string]$json
+}
+
 function Write-ProgressEvidence {
     if ($null -eq $script:evidence -or [string]::IsNullOrWhiteSpace($script:evidenceRoot)) { return }
     $script:evidence.LastUpdatedUtc = [DateTime]::UtcNow.ToString('o')
     Write-Utf8NoBomAtomic -Path (Join-Path $script:evidenceRoot 'progress.json') `
-        -Text ($script:evidence | ConvertTo-Json -Depth 100)
+        -Text (ConvertTo-A4SEvidenceJson -Evidence $script:evidence)
 }
 
 function Assert-ContractModel {
@@ -1716,6 +1799,215 @@ function Assert-ContractModel {
     }
     Write-Host 'A4S legacy Sandbox guest PS5 strict typed Explorer child JSON rejection contract passed.'
 
+    $decoratedCaptureRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ('A4SEvidenceStringContract-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($decoratedCaptureRoot) | Out-Null
+    $expectedDecoratedCaptureText = "A4SMenuHost: ready`r`n"
+    try {
+        $decoratedCapturePath = Join-Path $decoratedCaptureRoot 'stdout.txt'
+        [IO.File]::WriteAllText($decoratedCapturePath, $expectedDecoratedCaptureText,
+            [Text.UTF8Encoding]::new($false))
+        $decoratedCapturedText = Get-Content -Raw -LiteralPath $decoratedCapturePath
+        $sourcePsDrive = $decoratedCapturedText.PSObject.Properties['PSDrive']
+        $sourcePsProvider = $decoratedCapturedText.PSObject.Properties['PSProvider']
+        if ($null -eq $sourcePsDrive -or $null -eq $sourcePsProvider -or
+            $sourcePsDrive.MemberType -ne
+                [Management.Automation.PSMemberTypes]::NoteProperty -or
+            $sourcePsProvider.MemberType -ne
+                [Management.Automation.PSMemberTypes]::NoteProperty) {
+            throw 'Windows PowerShell Get-Content -Raw did not reproduce decorated process text.'
+        }
+        $plainCapturedText = ConvertTo-A4SEvidenceDataSnapshot `
+            -Value $decoratedCapturedText
+        if ([string]$plainCapturedText -cne $expectedDecoratedCaptureText -or
+            $null -ne $plainCapturedText.PSObject.Properties['PSDrive'] -or
+            $null -ne $plainCapturedText.PSObject.Properties['PSProvider']) {
+            throw 'Evidence string normalization retained Get-Content ETS metadata.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($decoratedCaptureRoot)) {
+            [IO.Directory]::Delete($decoratedCaptureRoot, $true)
+        }
+    }
+    $evidenceContractExecution = [ordered]@{
+        Label = 'v1-host-status-attempt-02'
+        Path = 'C:\A4SMenu\A4SMenuHost.exe'
+        Arguments = [object[]]@('--status')
+        StartedUtc = '2026-09-01T00:00:00.0000000Z'
+        CompletedUtc = '2026-09-01T00:00:00.0100000Z'
+        DurationMilliseconds = [double]10
+        ExitCode = [int]0
+        Stdout = $decoratedCapturedText
+        Stderr = ''
+    }
+    $evidenceContractAttempts = [Collections.Generic.List[object]]::new()
+    $evidenceContractAttempts.Add([ordered]@{
+        Attempt = [int]1
+        CapturedUtc = '2026-09-01T00:00:00.0000000Z'
+        State = 'injecting'
+        Disposition = 'retry'
+        Execution = [ordered]@{
+            Label = 'v1-host-status-attempt-01'
+            Path = 'C:\A4SMenu\A4SMenuHost.exe'
+            Arguments = [object[]]@('--status')
+            StartedUtc = '2026-09-01T00:00:00.0000000Z'
+            CompletedUtc = '2026-09-01T00:00:00.0050000Z'
+            DurationMilliseconds = [double]5
+            ExitCode = [int]2
+            Stdout = "A4SMenuHost: injecting`r`n"
+            Stderr = ''
+        }
+    })
+    $evidenceContractFinalAttempt = [ordered]@{
+        Attempt = [int]2
+        CapturedUtc = '2026-09-01T00:00:00.0100000Z'
+        State = 'ready'
+        Disposition = 'ready'
+        Execution = $evidenceContractExecution
+    }
+    $evidenceContractAttempts.Add($evidenceContractFinalAttempt)
+    $evidenceContractReadiness = [ordered]@{
+        Ready = $true
+        StartedUtc = '2026-09-01T00:00:00.0000000Z'
+        CompletedUtc = '2026-09-01T00:00:00.0100000Z'
+        TimeoutSeconds = [int]20
+        ProbeTimeoutSeconds = [int]5
+        MaximumAttempts = [int]64
+        RetryDelayMilliseconds = [int]250
+        AttemptCount = [int]2
+        FinalStatus = $evidenceContractFinalAttempt
+        Attempts = $evidenceContractAttempts
+    }
+    $evidenceContractIdentity = [ordered]@{
+        Path = 'C:\A4SMenu\A4SMenu.dll'
+        Length = [long]4096
+        Sha256 = 'A' * 64
+        ProductVersion = '1.0.0.0'
+        OriginalFilename = 'A4SMenu.dll'
+    }
+    $evidenceContractModules = [ordered]@{
+        SchemaVersion = [int]1
+        ExplorerPid = [int]4242
+        Complete = $true
+        Error = $null
+        TotalModuleCount = [int]137
+        MainModulePath = 'C:\Windows\explorer.exe'
+        Modules = [object[]]@($evidenceContractIdentity)
+    }
+    $evidenceContractRegistry = [ordered]@{
+        Present = $true
+        Nodes = [object[]]@([ordered]@{
+            RelativePath = ''
+            Values = [object[]]@([ordered]@{
+                Name = 'ActiveSlot'
+                Kind = 'String'
+                Data = 'C:\A4SMenu\versions\1.0.0.0'
+            })
+        })
+    }
+    $evidenceContractCheckpoint = [ordered]@{
+        Label = 'install-v1-host-quiescent-cache-baseline'
+        CapturedUtc = '2026-09-01T00:00:01.0000000Z'
+        ExplorerPid = [int]4242
+        ExplorerModules = $evidenceContractModules
+        Product = $evidenceContractRegistry
+        Lifecycle = $evidenceContractRegistry
+        Run = [ordered]@{ Present = $true; Value = [ordered]@{
+            Name = 'A4SMenu'; Kind = 'String'; Data = 'A4SMenuHost.exe' } }
+        CleanupRunOnce = [ordered]@{ Present = $false }
+        RecoveryRunOnce = [ordered]@{ Present = $false }
+        Uninstall = $evidenceContractRegistry
+        UserState = [ordered]@{
+            Config = $evidenceContractRegistry
+            Menu = $evidenceContractRegistry
+            InstallPath = [ordered]@{ Present = $true; Value = [ordered]@{
+                Name = 'InstallPath'; Kind = 'String'; Data = 'C:\A4SMenu' } }
+            Enabled = [ordered]@{ Present = $true; Value = [ordered]@{
+                Name = 'Enabled'; Kind = 'DWord'; Data = '1' } }
+        }
+        DataCache = [ordered]@{
+            Present = $true
+            Path = 'C:\A4SMenu\DataCache.db'
+            Length = [long]512
+            Sha256 = 'B' * 64
+        }
+        InstallInventory = [ordered]@{
+            Present = $true
+            Root = 'C:\A4SMenu'
+            Entries = [object[]]@([ordered]@{
+                RelativePath = 'versions\1.0.0.0\A4SMenu.dll'
+                Kind = 'File'
+                Length = [long]4096
+                Sha256 = 'A' * 64
+            })
+        }
+        Processes = [object[]]@()
+    }
+    $evidenceContractSteps = [Collections.Generic.List[object]]::new()
+    $evidenceContractSteps.Add([ordered]@{
+        Name = 'install-v1'
+        Execution = $evidenceContractExecution
+        HostStatus = $evidenceContractExecution
+        HostReadiness = $evidenceContractReadiness
+        HostExit = $evidenceContractExecution
+        ExplorerMappingBeforeReadiness = $evidenceContractModules
+        ExplorerMappingAfterReadiness = $evidenceContractModules
+        Checkpoint = $evidenceContractCheckpoint
+    })
+    $evidenceContract = [ordered]@{
+        SchemaVersion = [int]1
+        Test = 'A4S evidence serializer regression'
+        SessionId = '00000000-0000-0000-0000-000000000001'
+        Nonce = 'C' * 64
+        RequestSha256 = 'D' * 64
+        StartedUtc = '2026-09-01T00:00:00.0000000Z'
+        LastUpdatedUtc = '2026-09-01T00:00:01.0000000Z'
+        Environment = [ordered]@{ ExplorerPid = [int]4242 }
+        Inputs = [ordered]@{ V1 = $evidenceContractIdentity; V2 = $evidenceContractIdentity }
+        Seed = [ordered]@{ DataCache = $evidenceContractCheckpoint.DataCache }
+        V1Readiness = $evidenceContractReadiness
+        Steps = $evidenceContractSteps
+        FinalDisposition = $null
+        Succeeded = $false
+        Failure = $null
+        FailureCheckpoint = $null
+        FailureCheckpointError = $null
+    }
+    $evidenceSerializationStopwatch = [Diagnostics.Stopwatch]::StartNew()
+    $evidenceContractJson = ConvertTo-A4SEvidenceJson -Evidence $evidenceContract
+    $evidenceContractParsed = $evidenceContractJson | ConvertFrom-Json -ErrorAction Stop
+    $evidenceSerializationStopwatch.Stop()
+    $evidenceContractBytes = [Text.Encoding]::UTF8.GetByteCount($evidenceContractJson)
+    if ($evidenceSerializationStopwatch.Elapsed.TotalSeconds -gt 5 -or
+        $evidenceContractBytes -le 1 -or $evidenceContractBytes -gt 1048576 -or
+        @($evidenceContractParsed.V1Readiness.Attempts).Count -ne 2 -or
+        [int]$evidenceContractParsed.V1Readiness.FinalStatus.Attempt -ne 2 -or
+        [string]$evidenceContractParsed.V1Readiness.FinalStatus.Execution.Label -cne
+            'v1-host-status-attempt-02' -or
+        [string]$evidenceContractParsed.V1Readiness.FinalStatus.Execution.Stdout -cne
+            $expectedDecoratedCaptureText -or
+        @($evidenceContractParsed.Steps).Count -ne 1 -or
+        [string]$evidenceContractParsed.Steps[0].HostStatus.Label -cne
+            'v1-host-status-attempt-02' -or
+        [string]$evidenceContractParsed.Steps[0].HostReadiness.FinalStatus.State -cne
+            'ready' -or
+        [string]$evidenceContractParsed.Steps[0].Checkpoint.ExplorerModules.Modules[0].Sha256 -cne
+            ('A' * 64) -or
+        [string]$evidenceContractParsed.Steps[0].Checkpoint.Uninstall.Nodes[0].Values[0].Data -cne
+            'C:\A4SMenu\versions\1.0.0.0') {
+        throw 'Bounded acyclic evidence serialization did not preserve the populated evidence model.'
+    }
+    $cycleRejected = $false
+    $cyclicEvidence = [ordered]@{ SchemaVersion = [int]1 }
+    $cyclicEvidence['Self'] = $cyclicEvidence
+    try { ConvertTo-A4SEvidenceJson -Evidence $cyclicEvidence | Out-Null }
+    catch { $cycleRejected = $true }
+    if (-not $cycleRejected) {
+        throw 'Evidence data snapshot accepted a reference cycle.'
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 bounded acyclic evidence serialization contract passed.'
+
     $statusModels = @(
         [ordered]@{ ExitCode = 0; Stdout = "A4SMenuHost: ready`r`n"; State = 'ready'; Disposition = 'ready' },
         [ordered]@{ ExitCode = 1; Stdout = "A4SMenuHost: starting`r`n"; State = 'starting'; Disposition = 'retry' },
@@ -1756,6 +2048,26 @@ function Assert-ContractModel {
     [IO.Directory]::CreateDirectory($processContractRoot) | Out-Null
     $script:workRoot = $processContractRoot
     try {
+        $captureChildScript = Join-Path $processContractRoot 'capture-child.ps1'
+        [IO.File]::WriteAllText($captureChildScript,
+            '[Console]::Out.Write("A4S exact-process capture`r`n"); [Console]::Error.Write("A4S exact-process error`r`n")',
+            [Text.UTF8Encoding]::new($false))
+        $captureExecution = Invoke-ExactProcess -Path $windowsPowerShell -Arguments @(
+            '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy',
+            'Bypass', '-File', $captureChildScript) -Label 'plain-text-capture-contract' `
+            -TimeoutSeconds 8 -KillWaitMilliseconds 5000
+        if ($captureExecution.Stdout -isnot [string] -or
+            $captureExecution.Stderr -isnot [string] -or
+            [string]$captureExecution.Stdout -cne "A4S exact-process capture`r`n" -or
+            [string]$captureExecution.Stderr -cne "A4S exact-process error`r`n") {
+            throw 'Exact-process output capture did not return exact plain strings.'
+        }
+        if ($null -ne $captureExecution.Stdout.PSObject.Properties['PSDrive'] -or
+            $null -ne $captureExecution.Stdout.PSObject.Properties['PSProvider'] -or
+            $null -ne $captureExecution.Stderr.PSObject.Properties['PSDrive'] -or
+            $null -ne $captureExecution.Stderr.PSObject.Properties['PSProvider']) {
+            throw 'Exact-process output capture retained Get-Content ETS metadata.'
+        }
         $childScript = Join-Path $processContractRoot 'bounded-child.ps1'
         $childPidPath = Join-Path $processContractRoot 'bounded-child.pid'
         $childSource = @"
@@ -1855,9 +2167,14 @@ Start-Sleep -Seconds 30
             -KillWaitMilliseconds 5000 -AcceptedExitCodes @(0, 1)
         $hiddenProbeStopwatch.Stop()
         if (-not [string]::IsNullOrEmpty([string]$hiddenProbeRejection.Stdout) -or
+            $hiddenProbeRejection.Stderr -isnot [string] -or
             [string]::IsNullOrWhiteSpace([string]$hiddenProbeRejection.Stderr) -or
             $hiddenProbeStopwatch.Elapsed.TotalSeconds -gt 13) {
             throw "Hidden Explorer child mode did not reject a non-taskbar/non-Sandbox probe fail-closed and in time (exit=$($hiddenProbeRejection.ExitCode), stdout='$($hiddenProbeRejection.Stdout)', stderr='$($hiddenProbeRejection.Stderr)')."
+        }
+        if ($null -ne $hiddenProbeRejection.Stderr.PSObject.Properties['PSDrive'] -or
+            $null -ne $hiddenProbeRejection.Stderr.PSObject.Properties['PSProvider']) {
+            throw 'Hidden Explorer child stderr retained Get-Content ETS metadata.'
         }
     }
     finally {
@@ -1865,6 +2182,7 @@ Start-Sleep -Seconds 30
             [IO.Directory]::Delete($processContractRoot, $true)
         }
     }
+    Write-Host 'A4S legacy Sandbox guest PS5 plain exact-process text capture contract passed.'
     Write-Host 'A4S legacy Sandbox guest PS5 bounded process timeout contract passed.'
     Write-Host 'A4S legacy Sandbox guest PS5 started-stage failure cleanup contract passed.'
     Write-Host 'A4S legacy Sandbox guest PS5 hidden Explorer child rejection contract passed.'
@@ -2331,7 +2649,7 @@ finally {
     $script:evidence.LastUpdatedUtc = $script:evidence.CompletedUtc
     $evidencePath = Join-Path $script:evidenceRoot 'evidence.json'
     Write-Utf8NoBomAtomic -Path $evidencePath `
-        -Text ($script:evidence | ConvertTo-Json -Depth 100)
+        -Text (ConvertTo-A4SEvidenceJson -Evidence $script:evidence)
     $evidenceSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $evidencePath).Hash.ToUpperInvariant()
     $completion = [ordered]@{
         SchemaVersion = 1

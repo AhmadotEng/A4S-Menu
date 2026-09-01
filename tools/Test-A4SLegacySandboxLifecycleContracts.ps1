@@ -84,6 +84,8 @@ foreach ($marker in @(
         '$acceptedExitCodeSet = [Collections.Generic.HashSet[int]]::new()',
         '$acceptedExitCodeSet.Contains([int]$record.ExitCode)',
         '$process.WaitForExit($TimeoutSeconds * 1000)',
+        '[string](Get-Content -Raw -LiteralPath $stdoutPath)',
+        '[string](Get-Content -Raw -LiteralPath $stderrPath)',
         '$failureKind = ''timeout''',
         'throw [TimeoutException]::new(',
         '$causalError = $_',
@@ -301,6 +303,102 @@ foreach ($marker in @('schema-string', 'schema-boolean', 'schema-fractional',
         'length-string', 'length-boolean', 'length-fractional')) {
     Assert-ContainsOrdinal $guestSource $marker `
         'guest strict Explorer child JSON negative self-test matrix'
+}
+
+$evidenceSnapshotDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'ConvertTo-A4SEvidenceDataSnapshot'
+}, $true))
+Assert-Contract ($evidenceSnapshotDefinitions.Count -eq 1) `
+    'guest must define exactly one data-only evidence snapshot function'
+$evidenceSnapshotText = $evidenceSnapshotDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[ValidateRange(0, 24)][int] $Depth = 0',
+        'if ($Value -is [string]) { return [string]$Value }',
+        '$Value -is [bool] -or $Value -is [sbyte]',
+        '$Depth -ge 24',
+        '[object]::ReferenceEquals($ancestor, $Value)',
+        '$Value -is [Collections.IDictionary]',
+        '$Value -is [Collections.IList]',
+        'return ,([object[]]$items.ToArray())',
+        '$Value -is [pscustomobject]',
+        '[Management.Automation.PSMemberTypes]::NoteProperty',
+        "Evidence contains unsupported runtime type")) {
+    Assert-ContainsOrdinal $evidenceSnapshotText $marker `
+        'guest data-only acyclic evidence snapshot'
+}
+Assert-Contract ($evidenceSnapshotText.IndexOf('ConvertTo-Json',
+        [StringComparison]::OrdinalIgnoreCase) -lt 0) `
+    'guest evidence snapshot must not serialize its mutable runtime graph recursively'
+
+$evidenceJsonDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'ConvertTo-A4SEvidenceJson'
+}, $true))
+Assert-Contract ($evidenceJsonDefinitions.Count -eq 1) `
+    'guest must define exactly one bounded evidence serializer'
+$evidenceJsonText = $evidenceJsonDefinitions[0].Extent.Text
+Assert-OrderedMarkers $evidenceJsonText @(
+    '$snapshot = ConvertTo-A4SEvidenceDataSnapshot -Value $Evidence',
+    '$snapshot | ConvertTo-Json -Depth 32 -WarningAction Stop',
+    '[Text.Encoding]::UTF8.GetByteCount($json)',
+    '$byteCount -gt 16777216',
+    'return [string]$json') `
+    'guest bounded data-snapshot evidence serialization order'
+
+$progressEvidenceDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Write-ProgressEvidence'
+}, $true))
+Assert-Contract ($progressEvidenceDefinitions.Count -eq 1) `
+    'guest must define exactly one progress evidence writer'
+$progressEvidenceText = $progressEvidenceDefinitions[0].Extent.Text
+Assert-OrderedMarkers $progressEvidenceText @(
+    '$script:evidence.LastUpdatedUtc = [DateTime]::UtcNow.ToString(''o'')',
+    "Join-Path `$script:evidenceRoot 'progress.json'",
+    '-Text (ConvertTo-A4SEvidenceJson -Evidence $script:evidence)') `
+    'guest progress evidence data-snapshot publication order'
+Assert-Contract ($progressEvidenceText.IndexOf('ConvertTo-Json',
+        [StringComparison]::OrdinalIgnoreCase) -lt 0) `
+    'guest progress writer serializes the mutable evidence graph directly'
+Assert-Contract ([regex]::Matches($guestSource,
+        '-Text \(ConvertTo-A4SEvidenceJson -Evidence \$script:evidence\)').Count -eq 2) `
+    'guest progress and final evidence must both use the bounded data snapshot serializer'
+foreach ($marker in @(
+        '$decoratedCapturedText = Get-Content -Raw -LiteralPath $decoratedCapturePath',
+        '$decoratedCapturedText.PSObject.Properties[''PSDrive'']',
+        '$decoratedCapturedText.PSObject.Properties[''PSProvider'']',
+        '$plainCapturedText = ConvertTo-A4SEvidenceDataSnapshot',
+        '$plainCapturedText.PSObject.Properties[''PSDrive'']',
+        '$plainCapturedText.PSObject.Properties[''PSProvider'']',
+        '$evidenceContractAttempts = [Collections.Generic.List[object]]::new()',
+        'FinalStatus = $evidenceContractFinalAttempt',
+        'Attempts = $evidenceContractAttempts',
+        'HostStatus = $evidenceContractExecution',
+        'HostReadiness = $evidenceContractReadiness',
+        'Checkpoint = $evidenceContractCheckpoint',
+        '$evidenceSerializationStopwatch = [Diagnostics.Stopwatch]::StartNew()',
+        '$evidenceSerializationStopwatch.Elapsed.TotalSeconds -gt 5',
+        '$evidenceContractBytes -gt 1048576',
+        '$evidenceContractJson | ConvertFrom-Json -ErrorAction Stop',
+        '$evidenceContractParsed.Steps[0].Checkpoint.ExplorerModules.Modules[0].Sha256',
+        '$cyclicEvidence[''Self''] = $cyclicEvidence',
+        'Evidence data snapshot accepted a reference cycle.')) {
+    Assert-ContainsOrdinal $guestSource $marker `
+        'guest populated alias-heavy evidence serialization self-test'
+}
+foreach ($marker in @(
+        '[string]$captureExecution.Stderr -cne "A4S exact-process error`r`n"',
+        "$null -ne `$captureExecution.Stdout.PSObject.Properties['PSDrive']",
+        "$null -ne `$captureExecution.Stderr.PSObject.Properties['PSProvider']",
+        "$null -ne `$hiddenProbeRejection.Stderr.PSObject.Properties['PSDrive']",
+        "$null -ne `$hiddenProbeRejection.Stderr.PSObject.Properties['PSProvider']",
+        'A4S legacy Sandbox guest PS5 plain exact-process text capture contract passed.')) {
+    Assert-ContainsOrdinal $guestSource $marker `
+        'guest exact-process decorated-string normalization self-test'
 }
 
 $probeChildBlocks = @($guestAst.FindAll({
@@ -826,8 +924,14 @@ Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 strict typed Explorer child JSON rejection contract passed') `
     'guest strict typed Explorer child JSON rejection matrix was not dynamically exercised by Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 bounded acyclic evidence serialization contract passed') `
+    'guest alias-heavy bounded evidence snapshot/serialization was not dynamically exercised by Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 bounded V1 host readiness model contract passed') `
     'guest strict bounded V1 host readiness model was not dynamically exercised by Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 plain exact-process text capture contract passed') `
+    'guest exact-process stdout/stderr ETS normalization was not dynamically exercised by Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 bounded process timeout contract passed') `
     'guest direct-child timeout/kill/final-wait bound was not dynamically exercised by explicit Windows PowerShell 5.1'
