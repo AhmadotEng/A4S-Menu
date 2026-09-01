@@ -9,29 +9,32 @@ those rows still require a fresh Explorer and the release test matrix.
 The native taskbar Start button, a lone left or right Windows-key gesture, and
 the host `--toggle` command all queue `A4S_MENU_COMMAND_TOGGLE` to the validated
 taskbar thread. That thread is the only place that calls `ToggleStartMenu`.
-No physical keyboard event is intercepted or suppressed. If initialization is
-incomplete, the taskbar is invalid, or queuing fails, Windows' native Start path
-remains available.
+No physical keyboard event is intercepted or suppressed. Once initialization
+commits, native Start is intentionally unavailable; `SC_TASKLIST` is consumed
+even if a late teardown prevents the A4S toggle from being queued.
 
-Explorer's existing TwinUI registration classifies a bare left or right
-Windows-key gesture and posts thread hotkey ID 1 on the thread that owns
-`ApplicationManager_ImmersiveShellWindow`. During early Explorer startup the
-equivalent `ApplicationManager_DesktopShellWindow` may be created first; the
-DLL accepts either class only after confirming that its owner is the current
-Explorer process. It installs a thread-specific `WH_GETMESSAGE` hook on that
-validated shell-manager thread without unregistering or replacing TwinUI's
-hotkeys. It handles only a removed `WM_HOTKEY` whose ID is 1,
-modifier field is exactly `MOD_WIN`, and virtual-key field is zero. The hook
-first queues `A4S_MENU_COMMAND_TOGGLE`; only after that succeeds does it replace
-the shell message with `WM_NULL`. A queue failure leaves the original message
-untouched, so native Start handles it.
+The product patches only TwinUI's imported `ShellRegisterHotKey` call for the
+two exact native-Start registrations: ID 1 (`MOD_WIN`, virtual key zero) and ID
+2 (`MOD_CONTROL`, `VK_ESCAPE`). Every other registration is forwarded to the
+original user32 ordinal 2671. A thread-specific `WH_GETMESSAGE` hook is bound to
+the validated Explorer owner of `ApplicationManager_ImmersiveShellWindow`, or
+the earlier `ApplicationManager_DesktopShellWindow`. Through an acknowledged
+private control message, that owning thread unregisters the already-live ID 1
+and ID 2 before the product reports `READY`. Windows then emits its standard
+`WM_SYSCOMMAND/SC_TASKLIST` path, which the validated shell-manager, taskbar,
+and Explorer shell-window queues route to the shared A4S toggle and replace
+with `WM_NULL`. An already-queued ID 1 or ID 2 `WM_HOTKEY` is consumed by the
+same manager hook during the handoff.
 
-Because Windows retains ownership of classification and every real key down/up,
-left/right Windows keys, autorepeat, pre-held keys, Win+R, Win+E, Win+L, Win+X,
-Win+Tab, accessibility shortcuts, and future chords keep native input semantics.
-The A4S callback does not allocate, access the registry or filesystem, invoke
-the shell, synchronously message the taskbar, inject input, or return a
-nonzero keyboard-hook result.
+Because Windows still owns every real key down/up and only the two Start
+registrations are taken over, autorepeat, pre-held keys, Win+R, Win+E, Win+L,
+Win+X, Win+Tab, Win+D, Win+number, accessibility shortcuts, and future chords
+retain native input semantics. The A4S callbacks do not allocate, access the
+registry or filesystem, invoke the shell, synchronously message the taskbar,
+inject input, or return a nonzero keyboard-hook result. Clean disarm restores
+the two exact registrations on their owning thread before clearing the TwinUI
+IAT guard; uninstall or an Explorer restart is the authoritative reset if that
+restoration cannot be acknowledged.
 
 ## Focus and session behavior
 
@@ -56,16 +59,18 @@ Lock, logoff, remote disconnect, and suspend queue `SUSPEND_INPUT`. The product
 UI thread synchronously hides root, search, submenu, context, and power popups,
 cancels context results, and queues their non-reentrant close path without
 activating the taskbar or restoring another foreground window. The suspended
-latch makes the shell-hotkey callback pass through natively. A taskbar-side
+latch prevents shell-message callbacks from toggling A4S. A taskbar-side
 suspended latch rejects a toggle already queued by a racing shell-hotkey or
 Start-button callback, and the host rejects explicit toggles while
 the interactive desktop is suspended.
 Unlock, logon, remote connect, and resume recompute the combined state and queue
 `REFRESH_INPUT` only after both latches are interactive. Refresh repeats the
-transient cancellation and revalidates/replaces the targeted shell-message
-hook. If rebinding fails, the DLL logically disarms all activation callbacks
-and reports the inert state to the host. Explorer process exit remains the
-authoritative reconnect boundary; no polling timer is added.
+transient cancellation and revalidates/replaces the targeted shell-manager
+hook while native-Start registration ownership remains with A4S. If rebinding
+fails, clean disarm first attempts acknowledged registration restoration;
+otherwise the existing takeover and routing stay intact until Explorer is
+restarted. Explorer process exit remains the authoritative reconnect boundary;
+no polling timer is added.
 
 ## Crash-loop fail-safe
 

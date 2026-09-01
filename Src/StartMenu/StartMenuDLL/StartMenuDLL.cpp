@@ -78,7 +78,31 @@ static const LPARAM A4S_MOUSE_TOGGLE=0x4134534D; // "A4SM"
 static const LPARAM A4S_KEYBOARD_TOGGLE=0x4134534B; // "A4SK"
 #ifdef A4S_PRODUCT
 static HHOOK g_A4SNativeHotkeyHook;
+static DWORD g_A4SNativeHotkeyThreadId;
+static UINT g_A4SNativeControlMessage;
+static HANDLE g_A4SNativeControlEvent;
+static volatile LONG g_A4SNativeControlGeneration;
+static volatile LONG g_A4SNativeControlResult=ERROR_SUCCESS;
+
+enum A4SNativeTakeoverState
+{
+	A4S_NATIVE_DISARMED,
+	A4S_NATIVE_GUARD_INSTALLED,
+	A4S_NATIVE_TAKEOVER_PENDING,
+	A4S_NATIVE_TAKEOVER_EXECUTING,
+	A4S_NATIVE_OWNED,
+	A4S_NATIVE_RESTORE_PENDING,
+	A4S_NATIVE_RESTORE_EXECUTING,
+	A4S_NATIVE_RESTART_REQUIRED,
+};
+
+static volatile LONG g_A4SNativeTakeoverState=A4S_NATIVE_DISARMED;
+static const WPARAM A4S_NATIVE_CONTROL_TAKEOVER=1;
+static const WPARAM A4S_NATIVE_CONTROL_RESTORE=2;
 static const int A4S_NATIVE_WINDOWS_HOTKEY_ID=1;
+static const int A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID=2;
+static const int A4S_PROBE_WINDOWS_HOTKEY_ID=0xA451;
+static const int A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID=0xA452;
 
 constexpr UINT A4SHotkeyModifiers(LPARAM data)
 {
@@ -90,18 +114,21 @@ constexpr UINT A4SHotkeyVirtualKey(LPARAM data)
 	return static_cast<UINT>((static_cast<ULONG_PTR>(data)>>16)&0xFFFFu);
 }
 
-constexpr bool IsA4SNativeWindowsHotkey(UINT message, WPARAM id, LPARAM data)
+constexpr bool IsA4SNativeStartHotkey(UINT message, WPARAM id, LPARAM data)
 {
-	return message==WM_HOTKEY && id==A4S_NATIVE_WINDOWS_HOTKEY_ID &&
-		A4SHotkeyModifiers(data)==MOD_WIN && A4SHotkeyVirtualKey(data)==0;
+	return message==WM_HOTKEY &&
+		(((id==A4S_NATIVE_WINDOWS_HOTKEY_ID || id==A4S_PROBE_WINDOWS_HOTKEY_ID) &&
+			A4SHotkeyModifiers(data)==MOD_WIN && A4SHotkeyVirtualKey(data)==0) ||
+		((id==A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID || id==A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID) &&
+			A4SHotkeyModifiers(data)==MOD_CONTROL && A4SHotkeyVirtualKey(data)==VK_ESCAPE));
 }
 
-static_assert(IsA4SNativeWindowsHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
+static_assert(IsA4SNativeStartHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
 	static_cast<LPARAM>(MOD_WIN)),"the shell lone-Windows-key hotkey must toggle A4S");
-static_assert(!IsA4SNativeWindowsHotkey(WM_HOTKEY,2,
+static_assert(IsA4SNativeStartHotkey(WM_HOTKEY,A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID,
 	static_cast<LPARAM>(MOD_CONTROL)|(static_cast<LPARAM>(VK_ESCAPE)<<16)),
-	"Ctrl+Esc must remain native");
-static_assert(!IsA4SNativeWindowsHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
+	"Ctrl+Esc must use the A4S Start path");
+static_assert(!IsA4SNativeStartHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
 	static_cast<LPARAM>(MOD_WIN)|(static_cast<LPARAM>('R')<<16)),
 	"Win+R must remain native");
 static const WPARAM A4S_COMMAND_TOGGLE=A4S_MENU_COMMAND_TOGGLE;
@@ -570,6 +597,7 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM lParam);
 #ifdef A4S_PRODUCT
 static LRESULT CALLBACK HookA4SNativeHotkey(int code, WPARAM wParam, LPARAM lParam);
+static bool HandleA4SSystemStartMessage(MSG *message);
 #endif
 
 static BOOL CALLBACK FindTooltipEnum( HWND hwnd, LPARAM lParam )
@@ -3082,6 +3110,18 @@ static ShellRegisterHotKey_t g_ShellRegisterHotKey;
 
 static BOOL WINAPI ShellRegisterHotKeyHook(HWND hWnd, int id, UINT fsModifiers, UINT vk, HWND hWndTarget)
 {
+#ifdef A4S_PRODUCT
+	const LONG state=InterlockedCompareExchange(&g_A4SNativeTakeoverState,
+		A4S_NATIVE_DISARMED,A4S_NATIVE_DISARMED);
+	const bool takeoverBlocksRegistration=
+		state>=A4S_NATIVE_TAKEOVER_PENDING;
+	const bool nativeStartRegistration=
+		hWnd==NULL && hWndTarget==NULL &&
+		((id==A4S_NATIVE_WINDOWS_HOTKEY_ID && fsModifiers==MOD_WIN && vk==0) ||
+		(id==A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID && fsModifiers==MOD_CONTROL && vk==VK_ESCAPE));
+	if (takeoverBlocksRegistration && nativeStartRegistration)
+		return FALSE;
+#else
 	// Win key
 	if (fsModifiers == MOD_WIN && vk == 0)
 		return FALSE;
@@ -3089,6 +3129,7 @@ static BOOL WINAPI ShellRegisterHotKeyHook(HWND hWnd, int id, UINT fsModifiers, 
 	// Ctrl+Esc
 	if (fsModifiers == MOD_CONTROL && vk == VK_ESCAPE)
 		return FALSE;
+#endif
 
 	return g_ShellRegisterHotKey(hWnd, id, fsModifiers, vk, hWndTarget);
 }
@@ -3099,6 +3140,218 @@ void NTAPI DisableShellHotkeysFunc(ULONG_PTR Parameter)
 	UnregisterHotKey(NULL, 1);
 	UnregisterHotKey(NULL, 2);
 }
+#ifdef A4S_PRODUCT
+static DWORD A4SNativeApiError( DWORD fallback )
+{
+	const DWORD error=GetLastError();
+	return error?error:fallback;
+}
+
+enum A4SNativeProbeResult
+{
+	A4S_NATIVE_PROBE_OCCUPIED,
+	A4S_NATIVE_PROBE_FREE,
+	A4S_NATIVE_PROBE_RETAINED,
+};
+
+static A4SNativeProbeResult ProbeA4SNativeCombinationFree( int probeId,
+	UINT modifiers, UINT vk )
+{
+	if (!g_ShellRegisterHotKey(NULL,probeId,modifiers,vk,NULL))
+		return A4S_NATIVE_PROBE_OCCUPIED;
+	return UnregisterHotKey(NULL,probeId)?A4S_NATIVE_PROBE_FREE:
+		A4S_NATIVE_PROBE_RETAINED;
+}
+
+static bool HandleA4SNativeControlMessage( MSG *message )
+{
+	if (!message || !g_A4SNativeControlMessage ||
+		message->message!=g_A4SNativeControlMessage)
+		return false;
+
+	const WPARAM command=message->wParam;
+	const LONG generation=static_cast<LONG>(message->lParam);
+	DWORD result=ERROR_CANCELLED;
+	const bool currentGeneration=
+		generation==InterlockedCompareExchange(&g_A4SNativeControlGeneration,0,0);
+	if (currentGeneration)
+	{
+		if (command==A4S_NATIVE_CONTROL_TAKEOVER &&
+			InterlockedCompareExchange(&g_A4SNativeTakeoverState,
+				A4S_NATIVE_TAKEOVER_EXECUTING,A4S_NATIVE_TAKEOVER_PENDING)==
+				A4S_NATIVE_TAKEOVER_PENDING)
+		{
+			SetLastError(ERROR_SUCCESS);
+			const BOOL windowsRemoved=UnregisterHotKey(NULL,A4S_NATIVE_WINDOWS_HOTKEY_ID);
+			const DWORD windowsError=windowsRemoved?ERROR_SUCCESS:A4SNativeApiError(ERROR_GEN_FAILURE);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL ctrlEscapeRemoved=UnregisterHotKey(NULL,A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID);
+			const DWORD ctrlEscapeError=ctrlEscapeRemoved?ERROR_SUCCESS:A4SNativeApiError(ERROR_GEN_FAILURE);
+			const A4SNativeProbeResult windowsProbe=ProbeA4SNativeCombinationFree(
+				A4S_PROBE_WINDOWS_HOTKEY_ID,MOD_WIN,0);
+			const A4SNativeProbeResult ctrlEscapeProbe=ProbeA4SNativeCombinationFree(
+				A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID,
+				MOD_CONTROL,VK_ESCAPE);
+			const bool windowsFree=windowsProbe!=A4S_NATIVE_PROBE_OCCUPIED;
+			const bool ctrlEscapeFree=ctrlEscapeProbe!=A4S_NATIVE_PROBE_OCCUPIED;
+
+			if (windowsFree && ctrlEscapeFree)
+			{
+				InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_OWNED);
+				result=ERROR_SUCCESS;
+			}
+			else
+			{
+				// Roll back a partial transaction on the same registration thread.
+				if (windowsProbe==A4S_NATIVE_PROBE_RETAINED)
+					UnregisterHotKey(NULL,A4S_PROBE_WINDOWS_HOTKEY_ID);
+				if (ctrlEscapeProbe==A4S_NATIVE_PROBE_RETAINED)
+					UnregisterHotKey(NULL,A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID);
+				const BOOL windowsRolledBack=!windowsRemoved ||
+					g_ShellRegisterHotKey(NULL,A4S_NATIVE_WINDOWS_HOTKEY_ID,MOD_WIN,0,NULL);
+				const BOOL ctrlEscapeRolledBack=!ctrlEscapeRemoved ||
+					g_ShellRegisterHotKey(NULL,A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID,
+						MOD_CONTROL,VK_ESCAPE,NULL);
+				if (windowsRolledBack && ctrlEscapeRolledBack)
+					InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_GUARD_INSTALLED);
+				else
+					InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_RESTART_REQUIRED);
+				result=windowsError?windowsError:
+					(ctrlEscapeError?ctrlEscapeError:ERROR_HOTKEY_ALREADY_REGISTERED);
+			}
+		}
+		else if (command==A4S_NATIVE_CONTROL_RESTORE &&
+			InterlockedCompareExchange(&g_A4SNativeTakeoverState,
+				A4S_NATIVE_RESTORE_EXECUTING,A4S_NATIVE_RESTORE_PENDING)==
+				A4S_NATIVE_RESTORE_PENDING)
+		{
+			// A probe whose unregister failed is still a supported A4S hotkey
+			// owner. Remove either probe ID before restoring the exact native IDs.
+			UnregisterHotKey(NULL,A4S_PROBE_WINDOWS_HOTKEY_ID);
+			UnregisterHotKey(NULL,A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL windowsRestored=g_ShellRegisterHotKey(NULL,
+				A4S_NATIVE_WINDOWS_HOTKEY_ID,MOD_WIN,0,NULL);
+			const DWORD windowsError=windowsRestored?ERROR_SUCCESS:A4SNativeApiError(ERROR_GEN_FAILURE);
+			SetLastError(ERROR_SUCCESS);
+			const BOOL ctrlEscapeRestored=g_ShellRegisterHotKey(NULL,
+				A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID,MOD_CONTROL,VK_ESCAPE,NULL);
+			const DWORD ctrlEscapeError=ctrlEscapeRestored?ERROR_SUCCESS:A4SNativeApiError(ERROR_GEN_FAILURE);
+
+			if (windowsRestored && ctrlEscapeRestored)
+			{
+				InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_GUARD_INSTALLED);
+				result=ERROR_SUCCESS;
+			}
+			else
+			{
+				// Preserve the no-native-Start invariant if restoration was partial.
+				if (windowsRestored)
+					UnregisterHotKey(NULL,A4S_NATIVE_WINDOWS_HOTKEY_ID);
+				if (ctrlEscapeRestored)
+					UnregisterHotKey(NULL,A4S_NATIVE_CTRL_ESCAPE_HOTKEY_ID);
+				const A4SNativeProbeResult windowsProbe=ProbeA4SNativeCombinationFree(
+					A4S_PROBE_WINDOWS_HOTKEY_ID,MOD_WIN,0);
+				const A4SNativeProbeResult ctrlEscapeProbe=ProbeA4SNativeCombinationFree(
+					A4S_PROBE_CTRL_ESCAPE_HOTKEY_ID,MOD_CONTROL,VK_ESCAPE);
+				const bool windowsFree=windowsProbe!=A4S_NATIVE_PROBE_OCCUPIED;
+				const bool ctrlEscapeFree=ctrlEscapeProbe!=A4S_NATIVE_PROBE_OCCUPIED;
+				InterlockedExchange(&g_A4SNativeTakeoverState,
+					windowsFree && ctrlEscapeFree?A4S_NATIVE_OWNED:
+					A4S_NATIVE_RESTART_REQUIRED);
+				result=windowsError?windowsError:ctrlEscapeError;
+			}
+		}
+	}
+
+	if (currentGeneration)
+	{
+		InterlockedExchange(&g_A4SNativeControlResult,static_cast<LONG>(result));
+		if (g_A4SNativeControlEvent)
+			SetEvent(g_A4SNativeControlEvent);
+	}
+	message->hwnd=NULL;
+	message->message=WM_NULL;
+	message->wParam=0;
+	message->lParam=0;
+	return true;
+}
+
+static DWORD InvokeA4SNativeControl( WPARAM command, LONG expectedState,
+	LONG pendingState )
+{
+	if (!g_A4SNativeControlEvent || !g_A4SNativeControlMessage ||
+		!g_A4SNativeHotkeyThreadId)
+		return ERROR_INVALID_STATE;
+	if (InterlockedCompareExchange(&g_A4SNativeTakeoverState,pendingState,
+		expectedState)!=expectedState)
+		return ERROR_INVALID_STATE;
+
+	ResetEvent(g_A4SNativeControlEvent);
+	InterlockedExchange(&g_A4SNativeControlResult,ERROR_IO_PENDING);
+	const LONG generation=InterlockedIncrement(&g_A4SNativeControlGeneration);
+	if (!PostThreadMessage(g_A4SNativeHotkeyThreadId,g_A4SNativeControlMessage,
+		command,static_cast<LPARAM>(generation)))
+	{
+		const DWORD error=A4SNativeApiError(ERROR_GEN_FAILURE);
+		InterlockedCompareExchange(&g_A4SNativeTakeoverState,expectedState,pendingState);
+		return error;
+	}
+
+	DWORD waitResult=WaitForSingleObject(g_A4SNativeControlEvent,2000);
+	if (waitResult!=WAIT_OBJECT_0)
+	{
+		// Cancel only while the callback has not started. If it is already
+		// executing, it owns a two-call user32 transaction and must run down
+		// before any hook can be removed.
+		if (InterlockedCompareExchange(&g_A4SNativeTakeoverState,expectedState,
+			pendingState)!=pendingState)
+			waitResult=WaitForSingleObject(g_A4SNativeControlEvent,INFINITE);
+	}
+	if (waitResult!=WAIT_OBJECT_0)
+		return waitResult==WAIT_TIMEOUT?ERROR_TIMEOUT:A4SNativeApiError(ERROR_GEN_FAILURE);
+	return static_cast<DWORD>(InterlockedCompareExchange(
+		&g_A4SNativeControlResult,0,0));
+}
+
+static DWORD InstallA4SNativeStartTakeover( void )
+{
+	g_ShellRegisterHotKey=(ShellRegisterHotKey_t)GetProcAddress(
+		GetModuleHandle(L"user32.dll"),MAKEINTRESOURCEA(2671));
+	HMODULE twinui=GetModuleHandle(L"twinui.dll");
+	if (!g_ShellRegisterHotKey || !twinui)
+		return ERROR_PROC_NOT_FOUND;
+
+	g_ShellRegisterHotKeyHook=SetIatHook(twinui,"user32.dll",
+		MAKEINTRESOURCEA(2671),ShellRegisterHotKeyHook);
+	if (!g_ShellRegisterHotKeyHook)
+		return ERROR_INVALID_HOOK_HANDLE;
+	InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_GUARD_INSTALLED);
+
+	if (!g_A4SNativeControlEvent)
+		g_A4SNativeControlEvent=CreateEvent(NULL,FALSE,FALSE,NULL);
+	if (!g_A4SNativeControlMessage)
+		g_A4SNativeControlMessage=RegisterWindowMessage(
+			L"A4SMenu.NativeStartControl.v1");
+	if (!g_A4SNativeControlEvent || !g_A4SNativeControlMessage)
+		return A4SNativeApiError(ERROR_GEN_FAILURE);
+
+	return InvokeA4SNativeControl(A4S_NATIVE_CONTROL_TAKEOVER,
+		A4S_NATIVE_GUARD_INSTALLED,A4S_NATIVE_TAKEOVER_PENDING);
+}
+
+static DWORD RestoreA4SNativeStart( void )
+{
+	const LONG state=InterlockedCompareExchange(&g_A4SNativeTakeoverState,
+		A4S_NATIVE_DISARMED,A4S_NATIVE_DISARMED);
+	if (state==A4S_NATIVE_DISARMED || state==A4S_NATIVE_GUARD_INSTALLED)
+		return ERROR_SUCCESS;
+	if (state!=A4S_NATIVE_OWNED)
+		return ERROR_FAIL_RESTART;
+	return InvokeA4SNativeControl(A4S_NATIVE_CONTROL_RESTORE,
+		A4S_NATIVE_OWNED,A4S_NATIVE_RESTORE_PENDING);
+}
+#endif
 
 ///////////////////////////////////////////////////////////////////////////////
 
@@ -3146,12 +3399,14 @@ static DWORD RemoveA4SNativeHotkeyHook( void )
 	if (UnhookWindowsHookEx(g_A4SNativeHotkeyHook))
 	{
 		g_A4SNativeHotkeyHook=NULL;
+		g_A4SNativeHotkeyThreadId=0;
 		return ERROR_SUCCESS;
 	}
 	const DWORD error=GetLastError();
 	if (error==ERROR_INVALID_HOOK_HANDLE)
 	{
 		g_A4SNativeHotkeyHook=NULL;
+		g_A4SNativeHotkeyThreadId=0;
 		return ERROR_SUCCESS;
 	}
 	return error?error:ERROR_GEN_FAILURE;
@@ -3174,6 +3429,7 @@ static bool InstallA4SNativeHotkeyHook( void )
 		g_Instance,shellThreadId);
 	if (!g_A4SNativeHotkeyHook)
 		return false;
+	g_A4SNativeHotkeyThreadId=shellThreadId;
 	return true;
 }
 
@@ -3194,10 +3450,33 @@ static bool RefreshA4SNativeHotkeyHook( void )
 // small and reversible: one taskbar-thread message hook, one shell-hotkey
 // message hook, and (on Windows 11) one native Start mouse hook. Physical
 // keyboard events are never intercepted or suppressed.
-static bool ClearA4SActivationHooks( void )
+enum A4SActivationClearResult
+{
+	A4S_ACTIVATION_CLEAR_COMPLETE,
+	A4S_ACTIVATION_CLEAR_RESTORE_FAILED,
+	A4S_ACTIVATION_CLEAR_HOOK_FAILED,
+};
+
+static A4SActivationClearResult ClearA4SActivationHooks( void )
 {
 	bool cleared=true;
 #ifdef A4S_PRODUCT
+	const DWORD restoreResult=RestoreA4SNativeStart();
+	if (restoreResult!=ERROR_SUCCESS)
+	{
+		LogToFile(STARTUP_LOG,L"A4S native Start registration restoration failed: %u",
+			restoreResult);
+		// Keep the IAT guard and every activation hook intact. Removing the
+		// routing hooks after a failed restoration would leave Start disabled
+		// with no A4S path until Explorer restarts.
+		return A4S_ACTIVATION_CLEAR_RESTORE_FAILED;
+	}
+	else if (g_ShellRegisterHotKeyHook)
+	{
+		ClearIatHook(g_ShellRegisterHotKeyHook);
+		g_ShellRegisterHotKeyHook=NULL;
+		InterlockedExchange(&g_A4SNativeTakeoverState,A4S_NATIVE_DISARMED);
+	}
 	const DWORD hotkeyResult=RemoveA4SNativeHotkeyHook();
 	if (hotkeyResult!=ERROR_SUCCESS)
 	{
@@ -3237,7 +3516,7 @@ static bool ClearA4SActivationHooks( void )
 	}
 	g_bA4SStartLeftCapture=false;
 	g_bA4SQueuedStartLeftCapture=false;
-	return cleared;
+	return cleared?A4S_ACTIVATION_CLEAR_COMPLETE:A4S_ACTIVATION_CLEAR_HOOK_FAILED;
 }
 
 static bool InstallA4SActivationHooks( void )
@@ -3258,6 +3537,30 @@ static bool InstallA4SActivationHooks( void )
 #ifdef A4S_PRODUCT
 	if (!InstallA4SNativeHotkeyHook())
 		goto failed;
+	if (!IsWindow(g_ProgWin))
+		goto failed;
+	{
+		DWORD progProcessId=0;
+		const DWORD progThreadId=GetWindowThreadProcessId(g_ProgWin,&progProcessId);
+		if (!progThreadId || progProcessId!=GetCurrentProcessId())
+			goto failed;
+		if (progThreadId!=g_TaskbarThreadId &&
+			progThreadId!=g_A4SNativeHotkeyThreadId)
+		{
+			g_ProgHook=SetWindowsHookEx(WH_GETMESSAGE,HookProgManThread,NULL,
+				progThreadId);
+			if (!g_ProgHook)
+				goto failed;
+		}
+	}
+	{
+		const DWORD takeoverResult=InstallA4SNativeStartTakeover();
+		if (takeoverResult!=ERROR_SUCCESS)
+		{
+			SetLastError(takeoverResult);
+			goto failed;
+		}
+	}
 #endif
 	return true;
 
@@ -3295,7 +3598,19 @@ static void AbortA4SInitialization( HWND hookWindow )
 	InterlockedExchange(&g_A4SInitializationState,A4S_INIT_DISARMING);
 	InterlockedExchange(&g_A4SInputSuspended,1);
 #endif
-	ClearA4SActivationHooks();
+	const A4SActivationClearResult clearResult=ClearA4SActivationHooks();
+#ifdef A4S_PRODUCT
+	if (clearResult==A4S_ACTIVATION_CLEAR_RESTORE_FAILED)
+	{
+		// The registration guard and all routing hooks are still intact. Keep
+		// the proven A4S path active instead of tearing down into a state where
+		// native Start is disabled but no menu can answer the gesture.
+		InterlockedExchange(&g_A4SInputSuspended,0);
+		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_READY);
+		NotifyA4SHost(A4S_MENU_DLL_STATUS_READY);
+		return;
+	}
+#endif
 	g_TaskbarInfos.clear();
 	if (g_Owner.m_hWnd)
 		g_Owner.DestroyWindow();
@@ -3471,7 +3786,11 @@ static void InitStartMenuDLL( void )
 		g_bCrashDump=true;
 	}
 	FindTaskBar();
+#ifdef A4S_PRODUCT
+	g_ProgWin=GetShellWindow();
+#else
 	g_ProgWin=FindWindowEx(NULL,NULL,L"Progman",NULL);
+#endif
 
 	if (A4SMenuProfile::IsEnabled())
 	{
@@ -3506,9 +3825,10 @@ static void InitStartMenuDLL( void )
 			return;
 		}
 
-		// Do not unregister or replace TwinUI's Win or Ctrl+Esc hotkeys. The
-		// product observes only the existing lone-Windows-key shell message and
-		// leaves every physical key event and Explorer registration untouched.
+		// InstallA4SActivationHooks commits the native-Start takeover before READY:
+		// TwinUI cannot re-register ID 1/2, their existing registrations are gone,
+		// and the resulting SC_TASKLIST command is owned by the shared A4S toggle.
+		// Physical keyboard events and every Win+key registration remain untouched.
 #ifdef A4S_PRODUCT
 		InterlockedExchange(&g_A4SInputSuspended,0);
 		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_READY);
@@ -3758,7 +4078,21 @@ static void CleanStartMenuDLL( void )
 		// This branch is intentionally symmetric with the activation-only init.
 		// It never revokes a native drop target, removes an uninstalled subclass,
 		// asks Explorer to rebuild/repaint the taskbar, or touches hot corners.
-		ClearA4SActivationHooks();
+		const A4SActivationClearResult clearResult=ClearA4SActivationHooks();
+		if (clearResult==A4S_ACTIVATION_CLEAR_RESTORE_FAILED)
+		{
+#ifdef A4S_PRODUCT
+			// Restoration failed, so the no-native-Start takeover and its routing
+			// must remain operational. A later servicing attempt can restart
+			// Explorer instead of leaving the session without any Start path.
+			InterlockedExchange(&g_A4SInputSuspended,0);
+			InterlockedExchange(&g_A4SInitializationState,A4S_INIT_READY);
+			NotifyA4SHost(A4S_MENU_DLL_STATUS_READY);
+#endif
+			return;
+		}
+		if (clearResult==A4S_ACTIVATION_CLEAR_HOOK_FAILED)
+			LogToFile(STARTUP_LOG,L"A4S clean disarm retained a passive hook after native Start restoration");
 		CMenuContainer::CloseStartMenu();
 		CMenuFader::ClearAll();
 		if (g_Owner.m_hWnd)
@@ -4009,6 +4343,10 @@ static void OpenStartScreen( HMONITOR monitor )
 // WH_GETMESSAGE hook for the Progman window
 static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lParam )
 {
+#ifdef A4S_PRODUCT
+	if (code==HC_ACTION && wParam==PM_REMOVE && IsA4SInputActive())
+		HandleA4SSystemStartMessage(reinterpret_cast<MSG *>(lParam));
+#else
 	if (A4SMenuProfile::IsEnabled())
 		return CallNextHookEx(NULL,code,wParam,lParam);
 
@@ -4118,6 +4456,7 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 			msg->message=WM_NULL;
 		}
 	}
+#endif
 	return CallNextHookEx(NULL,code,wParam,lParam);
 }
 
@@ -4133,23 +4472,44 @@ static bool QueueA4SToggle( TaskbarInfo *taskBar, LPARAM activationData )
 }
 
 #ifdef A4S_PRODUCT
-// TwinUI already classifies a bare left/right Windows-key gesture and posts
-// thread hotkey ID 1 to ApplicationManager_ImmersiveShellWindow's thread. Hook
-// only that shell message; every physical key event reaches Windows unchanged.
-// If the A4S toggle cannot be queued, leave the message intact so native Start
-// remains the automatic fallback.
+static bool HandleA4SSystemStartMessage( MSG *message )
+{
+	if (!message || message->message!=WM_SYSCOMMAND ||
+		(message->wParam&0xFFF0)!=SC_TASKLIST)
+		return false;
+
+	// Native Start is intentionally unavailable while the product owns Start.
+	// Queue the shared A4S toggle, then consume SC_TASKLIST even if Explorer is
+	// already tearing down and the queue operation can no longer succeed.
+	QueueA4SToggle(g_TaskBar,A4S_KEYBOARD_TOGGLE);
+	message->hwnd=NULL;
+	message->message=WM_NULL;
+	message->wParam=0;
+	message->lParam=0;
+	return true;
+}
+
+// The shell-manager hook doubles as the deterministic takeover-control
+// executor. It also consumes any already-queued ID 1/2 hotkey during the
+// registration handoff. No physical keyboard event is hooked or suppressed.
 static LRESULT CALLBACK HookA4SNativeHotkey(int code, WPARAM wParam, LPARAM lParam)
 {
-	if (code==HC_ACTION && wParam==PM_REMOVE && IsA4SInputActive())
+	if (code==HC_ACTION && wParam==PM_REMOVE)
 	{
 		MSG *message=reinterpret_cast<MSG*>(lParam);
-		if (message && IsA4SNativeWindowsHotkey(message->message,message->wParam,
-			message->lParam) && QueueA4SToggle(g_TaskBar,A4S_KEYBOARD_TOGGLE))
+		if (HandleA4SNativeControlMessage(message))
+			return CallNextHookEx(g_A4SNativeHotkeyHook,code,wParam,lParam);
+		if (IsA4SInputActive() && message)
 		{
-			message->hwnd=NULL;
-			message->message=WM_NULL;
-			message->wParam=0;
-			message->lParam=0;
+			if (!HandleA4SSystemStartMessage(message) &&
+				IsA4SNativeStartHotkey(message->message,message->wParam,message->lParam))
+			{
+				QueueA4SToggle(g_TaskBar,A4S_KEYBOARD_TOGGLE);
+				message->hwnd=NULL;
+				message->message=WM_NULL;
+				message->wParam=0;
+				message->lParam=0;
+			}
 		}
 	}
 	return CallNextHookEx(g_A4SNativeHotkeyHook,code,wParam,lParam);
@@ -4236,6 +4596,9 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 #ifdef A4S_PRODUCT
 	if (InterlockedCompareExchange(&g_A4SInitializationState,
 		A4S_INIT_UNINITIALIZED,A4S_INIT_UNINITIALIZED)!=A4S_INIT_READY)
+		return CallNextHookEx(NULL,code,wParam,lParam);
+	if (code==HC_ACTION && wParam==PM_REMOVE && IsA4SInputActive() &&
+		HandleA4SSystemStartMessage(reinterpret_cast<MSG *>(lParam)))
 		return CallNextHookEx(NULL,code,wParam,lParam);
 #endif
 	if (code==HC_ACTION && wParam && !g_bInMenu)

@@ -109,8 +109,8 @@ A mapped DLL is never overwritten or hot-unloaded. If Explorer still maps an
 old DLL, interactive setup asks before using Windows Restart Manager to restart
 Explorer. Silent setup does not restart Explorer unless the caller explicitly
 adds `--restart-explorer`. Declining is safe: the new registration is durable,
-native Start remains the fallback, and the registered host activates after a
-manual Explorer restart or at the next sign-in. The fallback Explorer launch
+the current Explorer behavior remains unchanged, and the registered host
+activates after a manual Explorer restart or at the next sign-in. The fallback Explorer launch
 uses an absolute path resolved from the Windows directory; setup never executes
 an `explorer.exe` found through its current directory.
 

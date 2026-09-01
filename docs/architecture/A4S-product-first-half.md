@@ -125,9 +125,12 @@ Consequently:
   a new host launch;
 - no first-half tool automatically restarts or kills Explorer.
 
-The native Start path remains the fail-safe before `READY`, after a failed
-initialization, and after logical disarm. The first half does not yet make the
-full native-keyboard-routing guarantee planned for the second half.
+The owner superseded the earlier active-product fallback contract on
+2026-09-01. A `READY` A4S mapping takes ownership of the two native Start
+registrations and consumes the standard shell Start command; native Start is
+not an alternate path while the installed product is active. Before takeover
+commits, or after an acknowledged clean servicing/uninstall disarm restores the
+two registrations, Explorer owns its normal Start behavior.
 
 ## Host command surface
 

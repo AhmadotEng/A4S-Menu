@@ -69,13 +69,16 @@ and **pending** means no passing claim exists yet.
 
 Required: one DLL dispatcher for the left/right Windows key, Start button, and
 external command; toggle only after a lone Windows-key release; preserve key
-repeat and Win+R/E/L/X/Tab/D/number behavior; normal focus loss; preserve native
-Start until initialization succeeds and restore it on failure/shutdown.
+repeat and Win+R/E/L/X/Tab/D/number behavior; normal focus loss. The owner
+explicitly superseded the earlier fallback requirement on 2026-09-01: after
+A4S reaches `READY`, native Start must remain disabled for the installed
+product. Clean servicing/uninstall may restore the exact registrations before
+Explorer replacement.
 
 Status: implemented and source/offline tested, but not live qualified. Principal
 commits are `af76b87`, `04b2d6f`, `3d1a1e4`, `9abcd2e`, and source/binary binding
 checkpoint `ea8e35c`. Physical left/right Windows-key, Start-click, shortcut,
-key-repeat, modifier, focus-loss, and native fallback rows remain pending.
+key-repeat, modifier, focus-loss, and native-suppression rows remain pending.
 Rollback to the state before this work: `81924b7`; rollback to all of Plan 1:
 `42d61a4`.
 
@@ -83,8 +86,9 @@ Rollback to the state before this work: `81924b7`; rollback to all of Plan 1:
 
 Required: event-driven recovery for Explorer restart/crash, taskbar recreation,
 lock/unlock, sleep/resume, sign-out, and taskbar monitor/alignment changes;
-three failures in a suggested two-minute window; native fallback; diagnostic
-reason; manual recovery through `--status` and `--rehook`.
+three failures in a suggested two-minute window; preserve the intentional
+native-Start suppression policy; diagnostic reason; manual recovery through
+`--status` and `--rehook`.
 
 Status: substantially implemented and partially isolated-tested, not fully live
 qualified. Principal commits span `88240cf` through `1fc38dd`, with serialization
@@ -182,8 +186,9 @@ count as evidence for any row.
 ### 8. Final release gate
 
 Required: installed Host + DLL only; achieved performance targets; unchanged
-native shortcuts; stable Explorer; native fallback on every initialization
-failure; clean uninstall; tested rollback; final README and technical evidence.
+native shortcuts; stable Explorer; no native-Start escape path while A4S is
+installed and active; clean uninstall; tested rollback; final README and
+technical evidence.
 
 Status: not reached. `ea8e35c` documents and binds source, and `c155ae2` records
 a Host/DLL identity, but neither is a qualification/release checkpoint. Every

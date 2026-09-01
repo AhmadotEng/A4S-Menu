@@ -39,8 +39,9 @@ enum A4SMenuCommand : UINT32
 	A4S_MENU_COMMAND_EXIT = 2,
 	// Close transient UI before the interactive desktop is suspended or locked.
 	A4S_MENU_COMMAND_SUSPEND_INPUT = 3,
-	// Re-establish the low-level Windows-key route after the interactive desktop
-	// returns. Failure disarms the product so native Start remains available.
+	// Re-establish the shell-manager route after the interactive desktop returns.
+	// Native Start registration remains owned by A4S until clean restoration or
+	// Explorer process replacement.
 	A4S_MENU_COMMAND_REFRESH_INPUT = 4,
 };
 
