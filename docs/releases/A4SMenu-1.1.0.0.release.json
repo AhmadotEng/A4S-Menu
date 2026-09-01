@@ -1,0 +1,10 @@
+{
+  "schemaVersion": 1,
+  "product": "A4SMenu",
+  "sourceCommit": "ea8e35cf3bd404d33f2d4cf0b867f8654696b20c",
+  "hostSha256": "8115F85209E937DFE88C377284C30275F3562334E040B19DEF072B78B13DED73",
+  "dllSha256": "8A9ACE1D4AA30DDCA522FF22814F84D96DAF766E8453C58BC3099B1F66FAA905",
+  "hostFileVersion": "1.1.0.0",
+  "dllFileVersion": "1.1.0.0",
+  "hostReportedVersion": "A4SMenuHost 1.1.0.0"
+}
