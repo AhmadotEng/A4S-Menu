@@ -1751,6 +1751,12 @@ int CMenuContainer::ShowA4SContextFlyout( int parentIndex, const POINT *pPt, boo
 void CMenuContainer::ActivateItem( int index, TActivateType type, const POINT *pPt, ActivateData *pData )
 {
 	LOG_MENU(LOG_EXECUTE,L"Activate Item, ptr=%p, index=%d, type=%d",this,index,type);
+#ifdef A4S_PRODUCT
+	// Fail closed even if a future input path accidentally requests one of
+	// the legacy mutating verbs omitted from the A4S product resources.
+	if (type==ACTIVATE_RENAME || type==ACTIVATE_DELETE)
+		return;
+#endif
 	if (index<0)
 	{
 		if (type==ACTIVATE_SELECT)

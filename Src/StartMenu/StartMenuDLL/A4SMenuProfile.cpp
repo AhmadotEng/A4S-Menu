@@ -228,6 +228,12 @@ namespace A4SMenuProfile
 		ForceBool(L"EnableStartButton",false);
 		ForceBool(L"AllTaskbars",false);
 		ForceBool(L"CustomTaskbar",false);
+#ifndef A4S_PRODUCT
+		// Keep the existing development/upstream preview from probing for
+		// Open-Shell updates. The product build compiles the updater out and
+		// intentionally carries neither this setting nor its identifying text.
+		ForceBool(L"CheckWinUpdates",false);
+#endif
 		ForceInt(L"MouseClick",1); // OPEN_CLASSIC
 		ForceInt(L"WinKey",1);     // OPEN_CLASSIC
 		ForceInt(L"ShiftClick",1);
@@ -236,6 +242,10 @@ namespace A4SMenuProfile
 		// Fixed StartAllBack-compatible model: the normal left pane contains only
 		// user pins, with inline All Programs and fixed right links.
 		ForceInt(L"ProgramsStyle",PROGRAMS_INLINE);
+		// Keep All Programs inside the accepted popup. A stale legacy value must
+		// never request the separate SKIN_TYPE_ALL_PROGRAMS presentation, which
+		// is intentionally absent from the product resource boundary.
+		ForceBool(L"CascadeAll",false);
 		ForceBool(L"OpenPrograms",false);
 		ForceBool(L"AllProgramsMetro",true);
 		ForceBool(L"FoldersFirst",false);
@@ -294,7 +304,6 @@ namespace A4SMenuProfile
 		ForceInt(L"SubMenuAnimation",0);
 
 		// Strip feature surfaces that are not part of the popup menu contract.
-		ForceBool(L"CheckWinUpdates",false);
 		ForceBool(L"EnableDragDrop",false);
 		ForceBool(L"EnableContextMenu",false);
 		ForceBool(L"EnableExplorer",false);

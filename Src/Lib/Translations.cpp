@@ -5,6 +5,42 @@
 #include <stdafx.h>
 #include "SettingsParser.h"
 
+#ifdef A4S_PRODUCT
+
+// A4S Menu is one fixed English environment. Only its embedded L10N resource
+// participates in lookup; external translation files, language filtering and
+// locale-dependent RTL selection are outside the product boundary.
+static CSettingsParser g_A4STranslations;
+
+void ParseTranslations( const wchar_t *fname, const wchar_t *forceLang )
+{
+	UNREFERENCED_PARAMETER(fname);
+	UNREFERENCED_PARAMETER(forceLang);
+	g_A4STranslations.Reset();
+}
+
+void LoadTranslationOverrides( HMODULE hModule )
+{
+	HRSRC resource=FindResource(hModule,MAKEINTRESOURCE(1),L"L10N");
+	if (resource)
+	{
+		g_A4STranslations.LoadText(hModule,resource);
+		g_A4STranslations.ParseText();
+	}
+}
+
+const wchar_t *FindTranslation( const wchar_t *name, const wchar_t *def )
+{
+	return g_A4STranslations.FindSetting(name,def);
+}
+
+bool IsLanguageRTL( void )
+{
+	return false;
+}
+
+#else
+
 static CSettingsParser g_Translations;
 static CSettingsParser g_TranslationOverrides;
 static bool g_bRTL;
@@ -81,3 +117,5 @@ bool IsLanguageRTL( void )
 {
 	return g_bRTL;
 }
+
+#endif

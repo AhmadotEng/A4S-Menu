@@ -50,7 +50,7 @@
       <AdditionalIncludeDirectories>..\..\StartMenu\StartMenuDLL;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
     </ResourceCompile>
     <Link>
-      <AdditionalDependencies>$(A4SProductBuildRoot)lib\$(Platform)\A4SMenuRuntime.lib;comctl32.lib;uxtheme.lib;WtsApi32.lib;Secur32.lib;Msimg32.lib;Netapi32.lib;dwmapi.lib;PowrProf.lib;Oleacc.lib;winmm.lib;structuredquery.lib;Propsys.lib;wintrust.lib;crypt32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>$(A4SProductBuildRoot)lib\$(Platform)\A4SMenuRuntime.lib;comctl32.lib;uxtheme.lib;WtsApi32.lib;Secur32.lib;Msimg32.lib;dwmapi.lib;PowrProf.lib;Oleacc.lib;winmm.lib;structuredquery.lib;Propsys.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <ModuleDefinitionFile>A4SMenu.def</ModuleDefinitionFile>
       <ImportLibrary>$(IntDir)A4SMenu.lib</ImportLibrary>
       <ProgramDatabaseFile>$(IntDir)A4SMenu.pdb</ProgramDatabaseFile>
@@ -64,7 +64,7 @@
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\Accessibility.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\StartButton.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.cpp" />
-    <ClCompile Include="..\..\StartMenu\StartMenuDLL\CustomMenu.cpp" />
+    <ClCompile Include="A4SFixedMenu.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\dllmain.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\ItemManager.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\LogManager.cpp" />
@@ -74,7 +74,7 @@
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\MetroLinkManager.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\ProgramsTree.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\SearchManager.cpp" />
-    <ClCompile Include="..\..\StartMenu\StartMenuDLL\SettingsUI.cpp" />
+    <ClCompile Include="A4SFixedSettings.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\SkinManager.cpp" />
     <ClCompile Include="..\..\StartMenu\StartMenuDLL\stdafx.cpp">
       <PrecompiledHeader>Create</PrecompiledHeader>
@@ -118,7 +118,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ResourceCompile Include="..\..\StartMenu\StartMenuDLL\StartMenuDLL.rc" />
+    <ResourceCompile Include="A4SMenuProduct.rc" />
   </ItemGroup>
 
   <ItemGroup>

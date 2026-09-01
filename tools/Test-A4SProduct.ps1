@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+	[string] $ProductDirectory
+)
 
 $ErrorActionPreference = 'Stop'
 
@@ -114,36 +116,41 @@ if (-not $versionMatch.Success) {
     throw "Could not derive the product version from $identityPath."
 }
 $expectedProductVersion = $versionMatch.Groups[1].Value
-$stageDir = [IO.Path]::GetFullPath((Join-Path $repoRoot 'build\stage\A4SProduct'))
-$hostExePath = Join-Path $stageDir 'A4SMenuHost.exe'
-$menuDllPath = Join-Path $stageDir 'A4SMenu.dll'
+$productDir = if ($ProductDirectory) {
+	[IO.Path]::GetFullPath($ProductDirectory)
+}
+else {
+	[IO.Path]::GetFullPath((Join-Path $repoRoot 'build\stage\A4SProduct'))
+}
+$hostExePath = Join-Path $productDir 'A4SMenuHost.exe'
+$menuDllPath = Join-Path $productDir 'A4SMenu.dll'
 $expectedNames = @('A4SMenu.dll', 'A4SMenuHost.exe')
 
-if (-not (Test-Path -LiteralPath $stageDir -PathType Container)) {
-    throw "Missing staged product directory: $stageDir"
+if (-not (Test-Path -LiteralPath $productDir -PathType Container)) {
+    throw "Missing product directory: $productDir"
 }
-$stageDirectoryItem = Get-Item -LiteralPath $stageDir -Force
-if (($stageDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-    throw "The staged product directory is a reparse point: $stageDir"
+$productDirectoryItem = Get-Item -LiteralPath $productDir -Force
+if (($productDirectoryItem.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
+    throw "The product directory is a reparse point: $productDir"
 }
-$stageItems = @(Get-ChildItem -LiteralPath $stageDir -Force)
-$stageDirectories = @($stageItems | Where-Object { $_.PSIsContainer })
-$stageFiles = @($stageItems | Where-Object { -not $_.PSIsContainer })
-$actualNames = @($stageFiles | Select-Object -ExpandProperty Name | Sort-Object)
-if ($stageDirectories.Count -ne 0 -or $stageFiles.Count -ne 2 -or (Compare-Object $expectedNames $actualNames)) {
-    throw 'The staged product must contain exactly A4SMenu.dll and A4SMenuHost.exe as top-level files, with no directories.'
+$productItems = @(Get-ChildItem -LiteralPath $productDir -Force)
+$productDirectories = @($productItems | Where-Object { $_.PSIsContainer })
+$productFiles = @($productItems | Where-Object { -not $_.PSIsContainer })
+$actualNames = @($productFiles | Select-Object -ExpandProperty Name | Sort-Object)
+if ($productDirectories.Count -ne 0 -or $productFiles.Count -ne 2 -or (Compare-Object $expectedNames $actualNames)) {
+    throw 'The product directory must contain exactly A4SMenu.dll and A4SMenuHost.exe as top-level files, with no directories.'
 }
-foreach ($item in $stageItems) {
+foreach ($item in $productItems) {
     if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) {
-        throw "The staged product contains a reparse point: $($item.FullName)"
+        throw "The product directory contains a reparse point: $($item.FullName)"
     }
 }
 foreach ($binaryPath in @($hostExePath, $menuDllPath)) {
     if (-not (Test-Path -LiteralPath $binaryPath -PathType Leaf)) {
-        throw "Missing staged product binary: $binaryPath"
+        throw "Missing product binary: $binaryPath"
     }
     if ((Get-PeMachine -Path $binaryPath) -ne 0x8664) {
-        throw "The staged product binary is not x64: $binaryPath"
+        throw "The product binary is not x64: $binaryPath"
     }
 }
 
@@ -157,7 +164,7 @@ Assert-ExactDependencies -BinaryPath $hostExePath -Names $hostDependencies -Expe
 )
 Assert-ExactDependencies -BinaryPath $menuDllPath -Names $dllDependencies -ExpectedNames @(
 	'ADVAPI32.dll', 'COMCTL32.dll', 'dwmapi.dll', 'GDI32.dll', 'KERNEL32.dll',
-	'MSIMG32.dll', 'NETAPI32.dll', 'OLE32.dll', 'OLEACC.dll', 'OLEAUT32.dll',
+	'MSIMG32.dll', 'OLE32.dll', 'OLEACC.dll', 'OLEAUT32.dll',
 	'POWRPROF.dll', 'PROPSYS.dll', 'Secur32.dll', 'SHELL32.dll', 'SHLWAPI.dll',
 	'USER32.dll', 'UxTheme.dll', 'WINMM.dll', 'WTSAPI32.dll'
 )
@@ -274,4 +281,4 @@ if ($versionProcess.ExitCode -ne 0) {
 }
 
 Write-Host "Validated product ABI: $abiResult"
-Write-Host "Validated exact x64 stage contents, exact DLL exports, exact reviewed dependencies, product metadata, and the host --version exit path."
+Write-Host "Validated exact x64 product contents, exact DLL exports, exact reviewed dependencies, product metadata, and the host --version exit path."

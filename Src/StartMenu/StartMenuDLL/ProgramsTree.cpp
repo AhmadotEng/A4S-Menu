@@ -1109,6 +1109,11 @@ LRESULT CProgramsTree::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 	// Del to delete, F2 to rename
 	if (wParam==VK_DELETE || wParam==VK_F2)
 	{
+#ifdef A4S_PRODUCT
+		// A4S exposes only its fixed three-command context surface. Keep the
+		// legacy destructive/rename keyboard verbs unreachable as well.
+		return 0;
+#else
 		HTREEITEM hItem;
 		const CTreeItem *pItem=GetSelectedItem(hItem);
 		if (!pItem) return 0;
@@ -1141,6 +1146,7 @@ LRESULT CProgramsTree::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL&
 			}
 		}
 		return 0;
+#endif
 	}
 
 	if (wParam==VK_ESCAPE)

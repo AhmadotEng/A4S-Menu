@@ -6693,6 +6693,12 @@ LRESULT CMenuContainer::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 
 	if (index>=0 && m_SearchState==SEARCH_NONE)
 	{
+#ifdef A4S_PRODUCT
+		// Rename and shell deletion are not part of the fixed A4S interaction
+		// surface, regardless of the currently highlighted row.
+		if (wParam==VK_F2 || wParam==VK_DELETE)
+			return 0;
+#else
 		if (wParam==VK_F2)
 		{
 			if (m_Items[index].id==MENU_NO && m_Items[index].pItem1 && !m_Items[index].pItem2)
@@ -6711,6 +6717,7 @@ LRESULT CMenuContainer::OnKeyDown( UINT uMsg, WPARAM wParam, LPARAM lParam, BOOL
 			}
 			return 0;
 		}
+#endif
 	}
 	if (!m_bSubMenu && m_SearchIndex>=0 && wParam=='F' && GetKeyState(VK_CONTROL)<0)
 	{
@@ -8966,7 +8973,12 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 	if (bDiscoverA4SEnvironment)
 	{
 #endif
+#ifdef A4S_PRODUCT
+	// The fixed product has no updater or update-aware power variants.
+	s_bHasUpdates=false;
+#else
 	s_bHasUpdates=(!bRemote || GetSettingBool(L"RemoteShutdown")) && GetSettingBool(L"CheckWinUpdates") && CheckForUpdates();
+#endif
 
 	// Check control panel options for power buttons
 	bool bHibernate = true, bSleep = true, bLock = true;

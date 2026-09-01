@@ -3066,6 +3066,25 @@ bool MenuSkin::LoadSkin( HMODULE hMod, const wchar_t *variation, const wchar_t *
 bool MenuSkin::LoadMenuSkin( const wchar_t *fname, const wchar_t *variation, const wchar_t *optionsStr, TSkinType skinType, unsigned int flags, int dpi )
 {
 	s_SkinError[0]=0;
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(fname);
+	UNREFERENCED_PARAMETER(variation);
+	UNREFERENCED_PARAMETER(optionsStr);
+	// The product can load only its embedded bootstrap record. Keep the
+	// resulting fixed presentation warm, but do not compile the external
+	// .skin/.skin7 discovery and module-loading path into A4SMenu.dll.
+	const unsigned int profileKey[]={
+		0x41345317U,static_cast<unsigned int>(skinType),flags,
+		static_cast<unsigned int>(dpi)
+	};
+	const unsigned int profileHash=CalcFNVHash(profileKey,sizeof(profileKey));
+	if (Hash==profileHash && Dpi==dpi)
+		return true;
+	Reset();
+	const bool loaded=LoadSkin(g_Instance,NULL,L"",skinType,flags,dpi);
+	Hash=loaded?profileHash:0;
+	return loaded;
+#else
 	if (A4SMenuProfile::IsEnabled())
 	{
 		// This product has no skin-selection surface. The DLL's embedded default
@@ -3203,6 +3222,7 @@ bool MenuSkin::LoadMenuSkin( const wchar_t *fname, const wchar_t *variation, con
 	}
 
 	return true;
+#endif
 }
 
 static POINT g_ArrowSizes96[]=

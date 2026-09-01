@@ -38,6 +38,7 @@ if (-not $SkipStage) {
 }
 
 if (-not $SkipValidation) {
+    & (Join-Path $PSScriptRoot 'Test-A4SProductBoundary.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SNativeLifecycle.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SLifecycleTools.ps1')
     & (Join-Path $PSScriptRoot 'Test-A4SCacheStateNative.ps1')

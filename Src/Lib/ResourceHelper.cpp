@@ -21,6 +21,15 @@ static std::map<int,std::vector<char> > g_ResDialogs;
 void LoadTranslationResources( HINSTANCE hLngInstance, int *pDialogs )
 {
 	Assert(g_Instance);
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(hLngInstance);
+	UNREFERENCED_PARAMETER(pDialogs);
+	// The product has one embedded English vocabulary and no settings dialogs.
+	// Keep LoadStringEx backed by this module's string table, while excluding
+	// external language DLL discovery and dialog-template caching.
+	LoadTranslationOverrides(g_Instance);
+	g_ResStrings.Init(g_Instance);
+#else
 	DWORD lngVersion=0;
 	if (hLngInstance)
 	{
@@ -57,11 +66,18 @@ void LoadTranslationResources( HINSTANCE hLngInstance, int *pDialogs )
 			}
 		}
 	}
+#endif
 }
 
 // Loads the best DLL for the current language
 HINSTANCE LoadTranslationDll( const wchar_t *langSetting )
 {
+#ifdef A4S_PRODUCT
+	UNREFERENCED_PARAMETER(langSetting);
+	// A4SMenu.dll is self-contained. There is deliberately no per-user,
+	// machine-wide, or side-by-side language-module search path.
+	return NULL;
+#else
 	Assert(g_Instance);
 	CString language=langSetting;
 	wchar_t languages[100]={0};
@@ -131,6 +147,7 @@ HINSTANCE LoadTranslationDll( const wchar_t *langSetting )
 		}
 	}
 	return resInstance;
+#endif
 }
 
 // Returns a localized string
