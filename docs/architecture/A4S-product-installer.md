@@ -122,8 +122,13 @@ writes and flushes one native helper at `%TEMP%\A4SMenuCleanup.exe` and queues a
 metadata while retaining the old `Run` value, marks the journal ready, and
 deletes and flushes `Run` as the final uninstall commit. A crash therefore leaves
 either the old exact registration or a durable cleanup path, never an
-unregistered orphan with no continuation. Failure to launch the immediate
-helper is non-fatal because RunOnce remains queued.
+unregistered orphan with no continuation. The original design treated failure
+to launch the immediate helper as non-fatal because `RunOnce` had been queued.
+Real qualification on 2026-09-01 proved that assumption incomplete: Windows
+can consume the `!` value before the helper acquires its locks. The current
+tested setup then rejects the exact continuation and strands known product
+files. Until the consumed-wake-up fix is implemented and qualified, this setup
+is not releasable.
 
 When Explorer still maps the DLL, this logical-uninstall checkpoint can retain
 only the empty owned uninstall-key shell; all Windows Settings metadata values
@@ -142,8 +147,11 @@ runtime caches (`DataCache.db`, `DataCache.tmp`, `DataCache.txt`, and
 `StartupLog.txt`) survive install/update/repair and are removed only by explicit
 uninstall. Unknown root or slot content is preserved; it may leave data-only
 directories behind but does not create an endless cleanup retry. The helper
-uses Windows POSIX file-disposition semantics for best-effort self-deletion;
-otherwise its one deterministic temporary path remains bounded and reusable.
+uses Windows POSIX file-disposition semantics for best-effort self-deletion.
+The same live qualification removed the product tree but returned error `82`
+and left the exact helper at its deterministic temporary path. Reliable
+self-removal or a verified per-user fallback is therefore a remaining release
+gate; deterministic naming alone does not count as cleanup.
 
 ## Command line
 
@@ -199,11 +207,13 @@ Examples:
   RunOnce, and uninstall values unchanged.
 
 The full `tools/Build-A4SProduct.ps1` gate builds, atomically stages, and runs
-both runtime and setup validation. Live standard-user install, Settings UI,
-logon startup, upgrade/rollback, restart consent, deliberately interrupted
-servicing, locked-DLL cleanup, and uninstall recovery remain release-matrix
-tests. Static and isolated tests do not claim those Windows interactions have
-run.
+both runtime and setup validation. The real current-profile run has now
+exercised per-user install, logon startup, repair, compatible update, rollback,
+explicit restart consent, exact locked-DLL handoff, and logical uninstall.
+Physical cleanup failed after Explorer restart for the two reasons above, so
+clean uninstall remains unqualified. Static and isolated tests do not
+substitute for the required corrected-package regression. See the
+[combined Step 5 live record](../testing/A4S-plan2-step5-installer-live-2026-09-01.md).
 
 The guarded live current-profile procedure is documented in
 [A4S-current-profile-installer-lifecycle.md](../testing/A4S-current-profile-installer-lifecycle.md).

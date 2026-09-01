@@ -146,42 +146,71 @@ expensive work off Explorer's UI thread. Targets are warm open <= 50 ms, close
 on the next compositor frame, effectively 0% idle CPU, no warm-toggle disk
 access, and no visible pop-in.
 
-Status: most code changes are implemented, but final live target validation is
-pending. Pre-optimization checkpoint: `a568985`. Principal commits: `4177a4d`,
-`50b8d24`, `2f9e102`, `11d6700`, `430b7cc`, `86a7ae0`, `6f10a49`, `7ff3835`,
-`f3c3101`, `c1bcfef`, and repaint work `6cd3183`.
+Status: intentionally deferred on 2026-09-01 because the exact-build Step 3
+record already passes the accepted warm-opening and idle-CPU targets without
+visible sampled pop-in. No additional optimization source change was made.
+The three evidence-based candidates are retained in
+[A4S-deferred-refinements.md](A4S-deferred-refinements.md). Exact compositor
+removal, strict physical disk quiet, and COM attribution remain recorded
+evidence gaps rather than inferred optimization failures or passes.
 
-### 5. Prune remaining code and resources
+### 5. Clean, build, and qualify the one-file installer
 
-Required only after measurements: linker/dependency reports; split fixed
-settings from SettingsUI; replace skin and CustomMenu parsing with fixed
-records; then remove unused jump-list, drag/drop, touch, Start-button, dialog,
-string, bitmap, and stock-skin code while rebuilding and rerunning accepted
-tests after every removal.
+This combines the former pruning and installer-build steps. Required:
 
-Status: partial. Pre-step checkpoint: `86b48f6`; partial product-boundary
-milestone: `9554cfb`. SettingsUI, CustomMenu, jump-list, drag/drop, and touch
-implementations were excluded from the product DLL via fixed stubs. Linker and
-dependency reports are missing; SkinManager/parser, StartButton, some headers,
-stubs, and bitmaps remain; the pruned build has no accepted post-prune live
-qualification.
+- freeze the accepted `A4SMenuHost.exe` and `A4SMenu.dll` identities;
+- build `A4SMenuSetup.exe` with those exact embedded payloads;
+- inventory every embedded file, PE resource, direct dependency, installed
+  file, and maintenance-only subsystem;
+- remove only packaged content that has no demonstrated runtime, servicing,
+  diagnostics, repair, rollback, or uninstall purpose;
+- prove that extraction yields exactly Host, DLL, and the byte-identical setup
+  maintenance copy, with matching x64 version, ABI, hashes, imports, and
+  exports;
+- run real current-profile install, startup, repair, compatible update,
+  rollback, final update, and uninstall checks one action at a time;
+- never overwrite a mapped DLL, never restart Explorer without the owner's
+  explicit consent, and preserve unrelated registry values and cache bytes;
+- record final package size, hashes, installed layout, and every live result;
+  then commit and push the installer-ready checkpoint.
 
-### 6. Build the one-file installer
+The full Open-Shell source tree remains the development environment. Uncompiled
+source or headers do not enter the package and are not deleted merely to reduce
+repository size. A retained maintenance setup copy is required so Windows
+Settings repair/uninstall still works after the downloaded installer is moved
+or deleted.
 
-Required: `A4SMenuSetup.exe`; default `%LocalAppData%\Programs\A4SMenu\` with
-Host + DLL; install/upgrade/repair/uninstall and silent modes; per-user startup
-and uninstall registration; matching architecture/version checks; cooperative
-unhook; staged atomic activation and rollback; host restart; ask before an
-unavoidable Explorer restart; host never installs or repairs files.
+Status: in progress and blocked on corrected physical cleanup. The 2026-09-01
+non-installing audit found no useless packaged content: setup contains only its
+version/manifest and the exact accepted Host/DLL payloads; extraction and all
+static product/setup gates passed. The real current-profile matrix then passed
+compatible install, update, physical sign-in startup, repair, rollback, both
+approved activation boundaries, visible-menu checks, and the logical uninstall
+transaction.
 
-Status: substantially implemented and offline-tested, not live lifecycle
-qualified. Main commits: `c552851`, `06337dc`, `38dbb46`, `8a604fb`, with the
-latest exact-slot rollback fix preserved separately at `4b99c15` (`Reuse the
-exact previous installer slot after rollback`). The actual design currently
-diverges from the attachment: it installs below
-`%LocalAppData%\A4SMenu\versions\<slot>\`, and each slot contains Host, DLL,
-and a dormant Setup copy. Standard-user install/update/repair/uninstall, logon,
-restart-consent, and real rollback evidence remain pending.
+Physical uninstall did not converge after Explorer restarted. Windows consumed
+the cleanup `RunOnce` wake-up, while setup incorrectly required that value to
+remain present as cleanup authority. Exact slots, cache, helper, and the empty
+uninstall placeholder were stranded even though no runtime remained. Recovery
+also exposed a second defect: the helper removed the product tree and registry
+but failed its native self-deletion with error `82`. The failed state was backed
+up and recovered; the machine now has no installed A4S runtime or installer
+state. The old setup hash is not release-qualified, and no incomplete source
+fix is included in this checkpoint.
+
+The accepted Host/DLL identities stay frozen. Completion requires a corrected
+setup-only rebuild, static and self-test coverage of the cleanup races, and one
+focused real regression: install, uninstall without restart, approved Explorer
+restart, complete physical cleanup, then final install. Full evidence and the
+exact remaining work are recorded in
+[the combined Step 5 live record](../testing/A4S-plan2-step5-installer-live-2026-09-01.md).
+
+### 6. Merged into Step 5
+
+The former separate one-file-installer build step is now part of Step 5. Its
+existing implementation and offline safety work are retained; it is not being
+redesigned. Completion of the combined Step 5 gate proceeds directly to Step 7
+full stability and release testing.
 
 ### 7. Full stability and release testing
 
@@ -198,10 +227,12 @@ count as evidence for any row.
 
 ### 8. Final release gate
 
-Required: installed Host + DLL only; achieved performance targets; unchanged
-native shortcuts; stable Explorer; no native-Start escape path while A4S is
-installed and active; clean uninstall; tested rollback; final README and
-technical evidence.
+Required: one active immutable slot containing Host, DLL, and the dormant
+maintenance setup copy; at most one exact previous rollback slot; no transient
+helper or unrelated installed payloads; achieved performance targets;
+unchanged native shortcuts; stable Explorer; no native-Start escape path while
+A4S is installed and active; clean uninstall; tested rollback; final README
+and technical evidence.
 
 Status: not reached. `ea8e35c` documents and binds source, and `c155ae2` records
 a Host/DLL identity, but neither is a qualification/release checkpoint. Every
@@ -217,7 +248,7 @@ not declared released:
 | --- | ---: | --- |
 | `build\stage\A4SProduct\A4SMenuHost.exe` | 207872 | `8DD438DB3FF591CA14388431BD82F08854E87075E6C4E960654DA48FF9B97876` |
 | `build\stage\A4SProduct\A4SMenu.dll` | 1356800 | `FF66AA070F158D3C1C0732EE195CC88C06BA6034AD691BB969D4B30BEA37ED0A` |
-| `build\stage\A4SSetup\A4SMenuSetup.exe` | 1902080 | `11A8B530F34E3CA4010A069AF06C44C4687C124D3FBA80BB67F9B3CFBC1B7E76` |
+| `build\stage\A4SSetup\A4SMenuSetup.exe` | 1902080 | `11A8B530F34E3CA4010A069AF06C44C4687C124D3FBA80BB67F9B3CFBC1B7E76` (tested, cleanup-defective, not releasable) |
 
 ## Rollback rules
 

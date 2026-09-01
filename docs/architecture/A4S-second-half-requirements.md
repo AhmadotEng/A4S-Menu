@@ -68,16 +68,16 @@ until their required evidence is actually recorded.
 
 | ID | Requirement | Required evidence | Status |
 | --- | --- | --- | --- |
-| I1 | One `A4SMenuSetup.exe` embeds the exact host and DLL payload. | Resource/payload hash verification and clean-machine extraction test. | Pending |
-| I2 | Default install is per-user under `%LocalAppData%\A4SMenu` and needs no elevation. | Standard-user install test and installed-file inventory. | Pending |
-| I3 | Setup supports interactive install, repair/update, and uninstall. | End-to-end lifecycle test. | Pending |
-| I4 | Setup supports documented silent command-line modes with deterministic exit codes. | Automated silent lifecycle matrix. | Pending |
-| I5 | Current-user startup launches the installed host. | Startup registration inspection and fresh-logon test. | Pending |
-| I6 | Windows Settings contains a correct uninstall entry. | HKCU uninstall-record assertion and Settings visual check. | Pending |
-| I7 | Update/uninstall requests logical disarm before replacing or removing runtime files. | Host-state trace and locked-file/failure-path test. | Pending |
-| I8 | Updates are atomic and retain one recoverable previous version. | Injected copy/validation failure tests and rollback hash check. | Pending |
-| I9 | Setup does not force-restart Explorer; an interactive restart is requested only when actually needed. | Process-PID assertion and prompt-path test. | Pending |
-| I10 | Uninstall removes product startup/registration/current files while preserving a recoverable failed-operation state. | Post-uninstall inventory and interrupted-uninstall test. | Pending |
+| I1 | One `A4SMenuSetup.exe` embeds the exact host and DLL payload. | Resource/payload hash verification and clean-machine extraction test. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): exact resources and fresh-directory extraction passed; a separate clean-machine row was not run. |
+| I2 | Default install is per-user under `%LocalAppData%\A4SMenu` and needs no elevation. | Standard-user install test and installed-file inventory. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): the real current-profile install remained per-user and showed no elevation prompt; a separate non-admin account was not tested. |
+| I3 | Setup supports interactive install, repair/update, and uninstall. | End-to-end lifecycle test. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): install, repair, update, rollback, and logical uninstall passed; physical cleanup failed. |
+| I4 | Setup supports documented silent command-line modes with deterministic exit codes. | Automated silent lifecycle matrix. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): exercised servicing commands returned recorded codes, but cleanup returned error `82` during recovery. |
+| I5 | Current-user startup launches the installed host. | Startup registration inspection and fresh-logon test. | [PASS](../testing/A4S-plan2-step5-installer-live-2026-09-01.md) after physical sign-out/sign-in. |
+| I6 | Windows Settings contains a correct uninstall entry. | HKCU uninstall-record assertion and Settings visual check. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): exact HKCU record passed; Settings UI visual confirmation remains open. |
+| I7 | Update/uninstall requests logical disarm before replacing or removing runtime files. | Host-state trace and locked-file/failure-path test. | [PASS for logical disarm and exact pending handoff](../testing/A4S-plan2-step5-installer-live-2026-09-01.md); physical cleanup is tracked by I10. |
+| I8 | Updates are atomic and retain one recoverable previous version. | Injected copy/validation failure tests and rollback hash check. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): exact previous-version rollback passed live; injected failure rows remain open. |
+| I9 | Setup does not force-restart Explorer; an interactive restart is requested only when actually needed. | Process-PID assertion and prompt-path test. | [PASS for the exercised real lifecycle](../testing/A4S-plan2-step5-installer-live-2026-09-01.md); every Explorer boundary required explicit owner approval. |
+| I10 | Uninstall removes product startup/registration/current files while preserving a recoverable failed-operation state. | Post-uninstall inventory and interrupted-uninstall test. | [BLOCKED](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): logical state and recovery evidence were preserved, but automatic physical cleanup stranded all known files and the helper. |
 
 ## Windows qualification matrix
 
@@ -89,8 +89,8 @@ until their required evidence is actually recorded.
 | Q4 | Fullscreen application foreground behavior | Open/dismiss/no-steal-focus checks. | Pending |
 | Q5 | Normal, Programs, search, context popup, power popup, and pinned-item states | Same-size captures compared with accepted references. | Pending |
 | Q6 | Pin, unpin, run as administrator, and open-file-location commands | Functional checks for pinned and Programs entries. | Pending |
-| Q7 | Sign-out/logon and clean startup | Installed-build reconnect and single-host assertion. | Pending |
-| Q8 | Install, same-version repair, upgrade, rollback, uninstall, and load failure | Versioned end-to-end matrix with hashes and exit codes. | Pending |
+| Q7 | Sign-out/logon and clean startup | Installed-build reconnect and single-host assertion. | [PASS for the tested final build](../testing/A4S-plan2-step5-installer-live-2026-09-01.md). |
+| Q8 | Install, same-version repair, upgrade, rollback, uninstall, and load failure | Versioned end-to-end matrix with hashes and exit codes. | [PARTIAL](../testing/A4S-plan2-step5-installer-live-2026-09-01.md): all listed servicing transitions except physical uninstall passed; load-failure rows remain pending. |
 
 ## Completion rule
 

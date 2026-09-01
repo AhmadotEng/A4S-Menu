@@ -152,20 +152,23 @@ state that is not applicable to this configuration. The first-half build and
 fresh-Explorer lifecycle results remain historical evidence for their exact
 binaries; they do not qualify the current second-half build.
 
-The second-half source and qualification harnesses are implemented. The build
-gate covers product/package boundaries, ABI4 native lifecycle, cache
-publication, lazy search, asynchronous Programs enumeration, trace conversion,
-performance-tool safety, installer transactions, and failure-recovery
-contracts. Live performance, current-profile installation, legacy
-upgrade/rollback, Windows input/session transitions, DPI/monitor rows, and
-controlled Explorer-failure tests remain pending until their exact reviewed
-build and evidence are recorded. The authoritative execution boundary and
-step-by-step audit are recorded in
+The second-half source and qualification harnesses are implemented. Native
+input Step 1 and the exact-build Step 3 performance baseline have recorded live
+results. The real current-profile installer matrix passed compatible install,
+physical logon startup, repair, update, rollback, explicit activation
+boundaries, and logical uninstall, but physical cleanup failed after Explorer
+restart and exposed a second helper self-deletion failure. The tested setup is
+therefore not release-qualified; the accepted Host and DLL remain frozen while
+a setup-only correction and focused uninstall regression are pending. DPI/
+monitor rows, controlled Explorer-failure tests, and the remaining stability
+matrix are also open. The authoritative execution boundary and step-by-step
+audit are recorded in
 [docs/architecture/A4S-plan-2-execution-boundary.md](docs/architecture/A4S-plan-2-execution-boundary.md).
 See also:
 
 - [docs/testing/A4S-second-half-performance-and-stability.md](docs/testing/A4S-second-half-performance-and-stability.md)
 - [docs/testing/A4S-current-profile-installer-lifecycle.md](docs/testing/A4S-current-profile-installer-lifecycle.md)
+- [docs/testing/A4S-plan2-step5-installer-live-2026-09-01.md](docs/testing/A4S-plan2-step5-installer-live-2026-09-01.md)
 - [docs/testing/A4S-failure-recovery.md](docs/testing/A4S-failure-recovery.md)
 
 The measured visual and interaction contract is in
