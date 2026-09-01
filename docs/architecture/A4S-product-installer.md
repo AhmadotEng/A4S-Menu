@@ -32,8 +32,14 @@ SHA-256 digests of host, DLL, and setup. Every validation re-reads all three
 files, verifies their x64 PE type and matching fixed product versions, and
 recomputes this identity from their bytes. A version 1.0 20-hex identity is
 accepted only for one-step migration. If a canonical same-version slot is
-missing or corrupt, repair never overwrites it: setup deploys a fresh verified
-`<identity>.repair-<GUID>` slot.
+missing or corrupt, setup first checks the registered active slot, then the
+registered previous slot, and then the canonical slot for the exact incoming
+three-file payload. This makes update after rollback return to the same reviewed
+immutable slot. A candidate outside the direct canonical `versions` root, a
+directory or payload-leaf reparse point, a multiply linked payload leaf, or a
+candidate with invalid identity or bytes is never reused. If no candidate
+matches, repair never overwrites an existing slot: setup deploys a fresh
+verified `<identity>.repair-<GUID>` slot.
 
 This hash is an integrity/slot-addressing mechanism, not publisher
 authentication. Release artifacts still require Authenticode signing before
@@ -94,8 +100,8 @@ automatic at the next sign-in once it has been queued.
 Fixed product versions are read from setup, host, and DLL. An older installer
 cannot replace a newer active slot; an intentional downgrade uses `--rollback`
 and a fully validated previous slot. After a successful install or rollback,
-setup retains the active slot and one previous slot. A former active slot that
-is still mapped by Explorer is retained until a later safe prune.
+setup retains the active slot and one distinct previous slot. A former active
+slot that is still mapped by Explorer is retained until a later safe prune.
 
 ## Explorer restart boundary
 
@@ -118,6 +124,11 @@ deletes and flushes `Run` as the final uninstall commit. A crash therefore leave
 either the old exact registration or a durable cleanup path, never an
 unregistered orphan with no continuation. Failure to launch the immediate
 helper is non-fatal because RunOnce remains queued.
+
+When Explorer still maps the DLL, this logical-uninstall checkpoint can retain
+only the empty owned uninstall-key shell; all Windows Settings metadata values
+are already gone, so no uninstall entry remains visible. The verified helper
+deletes that empty key during physical cleanup after the blocker exits.
 
 The helper waits for the setup process handle and, when an Explorer blocker was
 recorded, waits in 100-ms process-handle intervals. Between waits it checks for
@@ -177,6 +188,7 @@ Examples:
 - the full payload identity and every recovery-state decision pass the native
   `--self-test` truth table;
 - source contracts retain mutex serialization, immutable repair slots,
+  active/previous/canonical reuse order, single-link non-reparse payload leaves,
   journal/RunOnce ordering, exact rollback, explicit-repair-only post-commit
   HostSafety reset plus update preservation, uninstall handoff, reparse
   boundaries, and absolute Explorer launch;

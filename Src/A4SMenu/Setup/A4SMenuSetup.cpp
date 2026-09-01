@@ -1153,13 +1153,36 @@ namespace
 
     bool SlotMatchesPayload(const std::wstring &slot, const PayloadSet &payloads)
     {
-        if (!ValidateSlotBasic(slot))
+        try
+        {
+            if (!ValidateSlotBasic(slot))
+                return false;
+            return ExactSingleLinkFile(Join(slot, A4S_PRODUCT_HOST_FILENAME_W),
+                       std::span(payloads.host.data, payloads.host.size), nullptr) &&
+                ExactSingleLinkFile(Join(slot, A4S_PRODUCT_DLL_FILENAME_W),
+                    std::span(payloads.menu.data, payloads.menu.size), nullptr) &&
+                ExactSingleLinkFile(Join(slot, kSetupFilename), payloads.setup, nullptr);
+        }
+        catch (const InstallerFailure &)
+        {
             return false;
-        return ExactFile(Join(slot, A4S_PRODUCT_HOST_FILENAME_W),
-                   std::span(payloads.host.data, payloads.host.size)) &&
-            ExactFile(Join(slot, A4S_PRODUCT_DLL_FILENAME_W),
-                std::span(payloads.menu.data, payloads.menu.size)) &&
-            ExactFile(Join(slot, kSetupFilename), payloads.setup);
+        }
+    }
+
+    bool IsDistinctValidSlot(const std::wstring &candidate,
+        const std::wstring &selected)
+    {
+        if (!ValidateSlotBasic(candidate))
+            return false;
+        try
+        {
+            return _wcsicmp(FullPath(candidate).c_str(),
+                FullPath(selected).c_str()) != 0;
+        }
+        catch (const InstallerFailure &)
+        {
+            return false;
+        }
     }
 
     bool InspectPlannedDirectory(const std::wstring &path)
@@ -1193,7 +1216,8 @@ namespace
     }
 
     DeploymentPlan PlanDeployment(const PayloadSet &payloads,
-        const std::wstring &preferredSlot, const OperationIdentity &identity)
+        const std::wstring &preferredSlot, const std::wstring &fallbackSlot,
+        const OperationIdentity &identity)
     {
         DeploymentPlan plan;
         plan.planned = true;
@@ -1213,6 +1237,17 @@ namespace
         if (SlotMatchesPayload(preferredSlot, payloads))
         {
             plan.selectedSlot = FullPath(preferredSlot);
+            return plan;
+        }
+        // Rollback swaps ActiveSlot and PreviousSlot. Reuse the registered
+        // previous slot when it is still the exact incoming payload instead
+        // of manufacturing another immutable repair slot. SlotMatchesPayload
+        // keeps this fallback under the canonical versions root, rejects
+        // reparse and multi-link payload leaves, validates all three PE
+        // identities, and compares all payload bytes before it can be selected.
+        if (SlotMatchesPayload(fallbackSlot, payloads))
+        {
+            plan.selectedSlot = FullPath(fallbackSlot);
             return plan;
         }
         const std::wstring canonical = Join(plan.versions.path, payloads.slotName.c_str());
@@ -3635,11 +3670,13 @@ namespace
         // filesystem mutation. Materialization starts only after this intent
         // and the complete registration snapshot have been flushed.
         DeploymentPlan deployment = PlanDeployment(payloads,
-            oldState.activeSlot, identity);
+            oldState.activeSlot, oldState.previousSlot, identity);
         const std::wstring newSlot = deployment.selectedSlot;
-        std::wstring previous = oldState.activeSlot != newSlot &&
-            ValidateSlotBasic(oldState.activeSlot) ? oldState.activeSlot :
-            (ValidateSlotBasic(oldState.previousSlot) ? oldState.previousSlot : L"");
+        std::wstring previous;
+        if (IsDistinctValidSlot(oldState.activeSlot, newSlot))
+            previous = FullPath(oldState.activeSlot);
+        else if (IsDistinctValidSlot(oldState.previousSlot, newSlot))
+            previous = FullPath(oldState.previousSlot);
         if (previous.empty())
         {
             // A reinstall can race a deferred uninstall helper while Explorer

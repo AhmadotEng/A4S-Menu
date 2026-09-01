@@ -2719,8 +2719,18 @@ function Assert-UninstalledCheckpoint {
         throw "$($Checkpoint.Label) retained installed-slot state after uninstall."
     }
     if ($Checkpoint.RunStartup.Present) { throw "$($Checkpoint.Label) retained the Run startup value." }
-    if ($Checkpoint.UninstallEntry.Exists) {
-        throw "$($Checkpoint.Label) retained the installer-owned uninstall key."
+    # When Explorer still maps the product DLL, logical uninstall has removed
+    # every Windows Settings value but the verified helper has not yet removed
+    # the empty owned key.  An existing key is valid only in that exact pending
+    # shape; quiescent cleanup must leave no key at all.
+    $uninstallNodes = @($Checkpoint.UninstallEntry.Nodes)
+    $exactEmptyPendingPlaceholder = $Checkpoint.UninstallEntry.Exists -and
+        $uninstallNodes.Count -eq 1 -and
+        [string]$uninstallNodes[0].RelativePath -ceq '' -and
+        @($uninstallNodes[0].Values).Count -eq 0
+    if ($Checkpoint.UninstallEntry.Exists -and
+        (-not $Checkpoint.CleanupRunOnce.Present -or -not $exactEmptyPendingPlaceholder)) {
+        throw "$($Checkpoint.Label) retained uninstall metadata, subkeys, or an empty uninstall key without verified pending cleanup."
     }
     Assert-NoTransientServicingState -Checkpoint $Checkpoint -AllowExactPendingCleanup
     if ($Checkpoint.CleanupRunOnce.Present) {

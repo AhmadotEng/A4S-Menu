@@ -65,8 +65,11 @@ installer-owned registration, then verifies stability again.
 The uninstall checkpoint may be either quiescent or pending because Explorer
 can still map the exact known DLL. Pending cleanup is accepted only when one
 identity-bound helper/RunOnce continuation and one explained mapped slot account
-for it. The immediate final install must cancel that stale helper promptly and
-must not let it delete the newly registered product.
+for it. If the uninstall key still exists in this pending state, it must be an
+exact empty root placeholder: every Windows Settings value and every subkey must
+already be gone. A quiescent checkpoint requires the key itself to be absent.
+The immediate final install must cancel that stale helper promptly and must not
+let it delete the newly registered product.
 
 ## Live command
 

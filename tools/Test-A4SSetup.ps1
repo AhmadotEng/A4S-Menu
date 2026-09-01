@@ -258,8 +258,29 @@ if ($setupSource.IndexOf('RestoreRegistrationBestEffort', [StringComparison]::Or
 }
 
 $installSource = Get-SourceSection -Source $setupSource -StartMarker 'int InstallOrRepair(' -EndMarker 'int Rollback('
+$deploymentSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'DeploymentPlan PlanDeployment(' -EndMarker 'void MaterializeDeployment('
+$slotMatchSource = Get-SourceSection -Source $setupSource `
+    -StartMarker 'bool SlotMatchesPayload(' -EndMarker 'bool InspectPlannedDirectory('
+foreach ($leafMarker in @(
+        'ExactSingleLinkFile(Join(slot, A4S_PRODUCT_HOST_FILENAME_W)',
+        'ExactSingleLinkFile(Join(slot, A4S_PRODUCT_DLL_FILENAME_W)',
+        'ExactSingleLinkFile(Join(slot, kSetupFilename)')) {
+    if ($slotMatchSource.IndexOf($leafMarker, [StringComparison]::Ordinal) -lt 0) {
+        throw "Immutable-slot reuse does not reject a reparse or multi-link payload leaf ('$leafMarker')."
+    }
+}
+Assert-SourceOrder -Description 'registered immutable-slot reuse order' `
+    -Source $deploymentSource -Markers @(
+    'SlotMatchesPayload(preferredSlot, payloads)',
+    'SlotMatchesPayload(fallbackSlot, payloads)',
+    'SlotMatchesPayload(canonical, payloads)',
+    'payloads.slotName + L".repair-" + suffix')
 Assert-SourceOrder -Description 'Install/repair transaction' -Source $installSource -Markers @(
     'PlanDeployment(payloads,',
+    'oldState.activeSlot, oldState.previousSlot, identity)',
+    'IsDistinctValidSlot(oldState.activeSlot, newSlot)',
+    'IsDistinctValidSlot(oldState.previousSlot, newSlot)',
     'InspectExplorerA4SModules(ExplorerProcessId())',
     'mapped.complete && !mapped.unknownA4SModule',
     'mapped.validatedSlots.size() == 1U',

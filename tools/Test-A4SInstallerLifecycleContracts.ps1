@@ -528,7 +528,11 @@ foreach ($marker in @('Assert-ExactUninstallMetadata', 'Assert-ExactVersionsInve
     Assert-ContainsOrdinal $installedSource $marker "installed checkpoint omits '$marker'"
 }
 $uninstalledSource = (Get-FunctionAst -Ast $ast -Name 'Assert-UninstalledCheckpoint').Extent.Text
-foreach ($marker in @('pending cleanup contains staging/orphan/reparse content',
+foreach ($marker in @('$exactEmptyPendingPlaceholder',
+        '$Checkpoint.CleanupRunOnce.Present',
+        '@($uninstallNodes[0].Values).Count -eq 0',
+        'empty uninstall key without verified pending cleanup',
+        'pending cleanup contains staging/orphan/reparse content',
         'pending cleanup contains an unowned slot',
         'quiescent uninstall retained a known product cache/log file')) {
     Assert-ContainsOrdinal $uninstalledSource $marker "uninstall inventory contract omits '$marker'"
@@ -832,8 +836,30 @@ Assert-Contract ($cleanupSource.IndexOf('DeleteValueChecked(kRunOnceKey, kCleanu
         [StringComparison]::Ordinal) -lt 0) 'cleanup directly deletes a non-canonical retry value'
 $installSource = Get-SourceSection -Text $setupSource -StartMarker 'int InstallOrRepair(' `
     -EndMarker 'int Rollback('
+$deploymentSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'DeploymentPlan PlanDeployment(' `
+    -EndMarker 'void MaterializeDeployment('
+$slotMatchSource = Get-SourceSection -Text $setupSource `
+    -StartMarker 'bool SlotMatchesPayload(' `
+    -EndMarker 'bool InspectPlannedDirectory('
+foreach ($leafMarker in @(
+        'ExactSingleLinkFile(Join(slot, A4S_PRODUCT_HOST_FILENAME_W)',
+        'ExactSingleLinkFile(Join(slot, A4S_PRODUCT_DLL_FILENAME_W)',
+        'ExactSingleLinkFile(Join(slot, kSetupFilename)')) {
+    Assert-ContainsOrdinal $slotMatchSource $leafMarker `
+        "immutable-slot reuse accepts an unsafe payload leaf ('$leafMarker')"
+}
+Assert-OrderedMarkers $deploymentSource @(
+    'SlotMatchesPayload(preferredSlot, payloads)',
+    'SlotMatchesPayload(fallbackSlot, payloads)',
+    'SlotMatchesPayload(canonical, payloads)',
+    'payloads.slotName + L".repair-" + suffix') `
+    'active, registered previous, canonical, then repair immutable-slot reuse'
 Assert-OrderedMarkers $installSource @(
     'PlanDeployment(payloads,',
+    'oldState.activeSlot, oldState.previousSlot, identity)',
+    'IsDistinctValidSlot(oldState.activeSlot, newSlot)',
+    'IsDistinctValidSlot(oldState.previousSlot, newSlot)',
     'InspectExplorerA4SModules(ExplorerProcessId())',
     'mapped.complete && !mapped.unknownA4SModule',
     'mapped.validatedSlots.size() == 1U',
