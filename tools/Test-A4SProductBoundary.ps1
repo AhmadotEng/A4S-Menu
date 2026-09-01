@@ -382,8 +382,11 @@ $literalGetterNames = @($literalSettingReferences |
     Where-Object { $_.Groups[1].Value.StartsWith('GetSetting',[StringComparison]::Ordinal) } |
     ForEach-Object { $_.Groups[2].Value } |
     Sort-Object -Unique)
-if ($literalGetterNames.Count -ne 168) {
-    throw "A4S active literal getter closure drifted. Expected 168 unique setting names; found $($literalGetterNames.Count)."
+# The product-specific SC_TASKLIST route does not compile the legacy WinKey or
+# OpenMouseMonitor policy branches. Those two settings remain in the upstream
+# catalog but are intentionally outside the A4S active getter closure.
+if ($literalGetterNames.Count -ne 166) {
+    throw "A4S active literal getter closure drifted. Expected 166 unique setting names; found $($literalGetterNames.Count)."
 }
 
 # Non-literal calls are deliberately few and reviewed. The exact signature set
