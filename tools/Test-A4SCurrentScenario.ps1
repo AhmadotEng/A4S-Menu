@@ -34,6 +34,7 @@ param(
     [switch] $ObserveManualFocusDismissal,
     [ValidateRange(2, 60)]
     [int] $DismissalTimeoutSeconds = 15,
+    [switch] $AllowDisabledStartAllBackModules,
     [string] $Notes
 )
 
@@ -279,6 +280,57 @@ function Get-StableFileEvidence {
     finally { $stream.Dispose() }
 }
 
+function Get-DisabledStartAllBackModuleEvidence {
+    param(
+        [Parameter(Mandatory)][object[]] $Modules,
+        [Parameter(Mandatory)][bool] $ExplicitlyAllowed
+    )
+    $paths = @($Modules | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) } | Sort-Object)
+    $evidence = [ordered]@{
+        explicitlyAllowed = $ExplicitlyAllowed
+        mappedCount = $paths.Count
+        accepted = $paths.Count -eq 0
+        disabledRegistryKind = $null
+        disabledRegistryValue = $null
+        files = @()
+    }
+    if ($paths.Count -eq 0 -or -not $ExplicitlyAllowed) {
+        return [pscustomobject]$evidence
+    }
+
+    $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Software\StartIsBack', $false)
+    try {
+        if (-not $key -or -not ($key.GetValueNames() -contains 'Disabled')) {
+            return [pscustomobject]$evidence
+        }
+        try { $kind = $key.GetValueKind('Disabled') }
+        catch { return [pscustomobject]$evidence }
+        $value = $key.GetValue('Disabled', $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        $evidence.disabledRegistryKind = [string]$kind
+        $evidence.disabledRegistryValue = $value
+        if ($kind -ne [Microsoft.Win32.RegistryValueKind]::DWord -or [uint32]$value -ne 1) {
+            return [pscustomobject]$evidence
+        }
+    }
+    finally {
+        if ($key) { $key.Dispose() }
+    }
+
+    $installRoot = [IO.Path]::GetFullPath((Join-Path $env:ProgramFiles 'StartAllBack')).TrimEnd('\') + '\'
+    $allowedNames = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    [void]$allowedNames.Add('StartAllBackLoaderX64.dll')
+    [void]$allowedNames.Add('StartAllBackX64.dll')
+    foreach ($path in $paths) {
+        if (-not $path.StartsWith($installRoot, [StringComparison]::OrdinalIgnoreCase) -or
+            -not $allowedNames.Contains([IO.Path]::GetFileName($path))) {
+            return [pscustomobject]$evidence
+        }
+    }
+    $evidence.files = @($paths | ForEach-Object { Get-StableFileEvidence -Path $_ })
+    $evidence.accepted = $true
+    return [pscustomobject]$evidence
+}
+
 function Write-A4SMatrixAtomically {
     param([Parameter(Mandatory)][string] $Path, [Parameter(Mandatory)] $Value)
     $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
@@ -463,8 +515,13 @@ if ($AllowMenuAutomation) {
         $mappedDllModules = @($explorerProcess.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
         $competingModules = @($explorerProcess.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
         $mappedDllPaths = @($mappedDllModules | ForEach-Object { [IO.Path]::GetFullPath($_.FileName) })
+        $disabledStartAllBackEvidence = Get-DisabledStartAllBackModuleEvidence -Modules $competingModules `
+            -ExplicitlyAllowed ([bool]$AllowDisabledStartAllBackModules)
+        if (-not $disabledStartAllBackEvidence.accepted) {
+            throw "A competing Start-menu module is mapped. Only the exact disabled StartAllBack loader/runtime pair may be accepted with -AllowDisabledStartAllBackModules. Found '$(@($competingModules.FileName) -join '; ')'."
+        }
         if (-not [StringComparer]::OrdinalIgnoreCase.Equals($actualHostPath, $expectedHost) -or
-            $mappedDllModules.Count -ne 1 -or $competingModules.Count -ne 0 -or
+            $mappedDllModules.Count -ne 1 -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals($mappedDllPaths[0], $expectedDll)) {
             throw "Scenario automation is not bound to the selected product directory '$resolvedProductDirectory'."
         }
@@ -561,9 +618,15 @@ if ($AllowMenuAutomation) {
     try {
         $postMapped = @($postExplorer.Modules | Where-Object { $_.ModuleName -ieq 'A4SMenu.dll' })
         $postCompeting = @($postExplorer.Modules | Where-Object { $_.ModuleName -match '(?i)^(?:Start(?:AllBack|IsBack).*|(?:Classic)?StartMenuDLL)\.dll$' })
+        $postDisabledStartAllBackEvidence = Get-DisabledStartAllBackModuleEvidence -Modules $postCompeting `
+            -ExplicitlyAllowed ([bool]$AllowDisabledStartAllBackModules)
+        $initialStartAllBackIdentity = $disabledStartAllBackEvidence | ConvertTo-Json -Depth 6 -Compress
+        $postStartAllBackIdentity = $postDisabledStartAllBackEvidence | ConvertTo-Json -Depth 6 -Compress
         if ($postProductRegistration.kind -ne $productRegistration.kind -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$postProductRegistration.activeSlot, [string]$productRegistration.activeSlot) -or
-            $postMapped.Count -ne 1 -or $postCompeting.Count -ne 0 -or $postHostEvidence.length -ne $hostFileEvidence.length -or
+            $postMapped.Count -ne 1 -or -not $postDisabledStartAllBackEvidence.accepted -or
+            $initialStartAllBackIdentity -cne $postStartAllBackIdentity -or
+            $postHostEvidence.length -ne $hostFileEvidence.length -or
             $postDllEvidence.length -ne $dllFileEvidence.length -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($postHost.MainModule.FileName), $expectedHost) -or
             -not [StringComparer]::OrdinalIgnoreCase.Equals([IO.Path]::GetFullPath($postMapped[0].FileName), $expectedDll) -or
@@ -592,6 +655,7 @@ if ($AllowMenuAutomation) {
             dllLength = $dllFileEvidence.length
             dllFileIdentity = $dllFileIdentity
             dllLoadedIdentity = $dllLoadedIdentity
+            disabledStartAllBackModules = $disabledStartAllBackEvidence
             hostPid = $residentHostProcessId
             hostStartTimeUtc = [DateTime]::new($hostStartTicks, [DateTimeKind]::Utc).ToString('o')
             explorerPid = $explorerProcessId

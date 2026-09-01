@@ -331,8 +331,18 @@ open/close cycle without changing that environment:
     -ExpectedPrimaryScalePercent 125 `
     -ExpectedTaskbarAlignment center `
     -ExpectedTaskbarEdge bottom `
+    -AllowDisabledStartAllBackModules `
     -AllowMenuAutomation
 ```
+
+`-AllowDisabledStartAllBackModules` is an explicit qualification exception for
+machines where StartAllBack remains installed. It accepts only
+`StartAllBackLoaderX64.dll` and `StartAllBackX64.dll` from
+`%ProgramFiles%\StartAllBack` while
+`HKCU\Software\StartIsBack\Disabled` is a `REG_DWORD` equal to `1`. Their
+paths, lengths, and SHA-256 hashes are recorded and must remain unchanged for
+the whole scenario. Without the switch—or for any active, unknown, relocated,
+or changing competing module—the scenario still fails.
 
 To test normal Start-menu focus dismissal, add
 `-ObserveManualFocusDismissal`. The tool opens the menu and asks the tester to

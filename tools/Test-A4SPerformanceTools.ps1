@@ -156,6 +156,13 @@ if ($scenarioSource -notmatch 'Get-A4SLoadedImageIdentity' -or
     $scenarioSource -match 'File\]::Replace\([^\r\n]*\$null') {
     throw 'The scenario tool lacks exact resident-image binding, atomic matrix persistence, or ambiguous-cleanup protection.'
 }
+if ($scenarioSource -notmatch 'AllowDisabledStartAllBackModules' -or
+    $scenarioSource -notmatch 'GetValueKind\(''Disabled''\)' -or
+    $scenarioSource -notmatch 'RegistryValueKind\]::DWord' -or
+    $scenarioSource -notmatch 'StartAllBackLoaderX64\.dll' -or
+    $scenarioSource -notmatch 'disabledStartAllBackModules') {
+    throw 'The scenario tool cannot explicitly distinguish the exact disabled StartAllBack modules from an active or unknown competing Start-menu module.'
+}
 $scenarioVisibleWait = $scenarioSource.IndexOf('$visibleWindows = @(Wait-MenuState -Visible $true', [StringComparison]::Ordinal)
 if ($scenarioVisibleWait -lt 0) { throw 'Scenario automation has no authoritative visible-window wait.' }
 $scenarioOwnershipRecord = $scenarioSource.IndexOf('$automationMenuWindow = $menuWindow', $scenarioVisibleWait, [StringComparison]::Ordinal)
