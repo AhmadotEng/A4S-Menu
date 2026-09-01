@@ -232,6 +232,19 @@ function Read-Utf8JsonSnapshot {
     }
 }
 
+function Resolve-GuestSetupSources {
+    param(
+        [Parameter(Mandatory)][string] $repoRoot,
+        [Parameter(Mandatory)][psobject] $request
+    )
+    return [ordered]@{
+        V1 = [IO.Path]::GetFullPath((Join-Path $repoRoot `
+            ([string]$request.V1SetupRelativePath)))
+        V2 = [IO.Path]::GetFullPath((Join-Path $repoRoot `
+            ([string]$request.V2SetupRelativePath)))
+    }
+}
+
 function ConvertTo-RegistryValueRecord {
     param(
         [Parameter(Mandatory)][Microsoft.Win32.RegistryKey] $Key,
@@ -899,6 +912,19 @@ function Assert-ContractModel {
     if ((Get-ObjectSha256 $sample) -notmatch '^[0-9A-F]{64}$') {
         throw 'Deterministic evidence hashing failed.'
     }
+    $pathRequest = [pscustomobject]@{
+        V1SetupRelativePath = 'build\fixtures\A4SMenuSetup-v1.exe'
+        V2SetupRelativePath = 'build\reviewed product\A4SMenuSetup-v2.exe'
+    }
+    $resolvedSources = Resolve-GuestSetupSources -RepoRoot 'C:\A4S\Repo' `
+        -Request $pathRequest
+    if ([string]$resolvedSources.V1 -cne
+            'C:\A4S\Repo\build\fixtures\A4SMenuSetup-v1.exe' -or
+        [string]$resolvedSources.V2 -cne
+            'C:\A4S\Repo\build\reviewed product\A4SMenuSetup-v2.exe') {
+        throw 'Windows PowerShell setup-source cast/Join-Path contract failed.'
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 setup-source path contract passed.'
     $publicationRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ('A4SGuestPublicationContract-' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($publicationRoot) | Out-Null
@@ -993,8 +1019,9 @@ foreach ($hash in @($request.V2.SetupSha256, $request.V2.HostSha256, $request.V2
 $repoRoot = [IO.Path]::GetFullPath([string]$request.GuestRepoRoot).TrimEnd('\')
 $controlRoot = [IO.Path]::GetFullPath([string]$request.GuestControlRoot).TrimEnd('\')
 $script:evidenceRoot = [IO.Path]::GetFullPath([string]$request.GuestEvidenceRoot).TrimEnd('\')
-$v1Source = [IO.Path]::GetFullPath((Join-Path $repoRoot [string]$request.V1SetupRelativePath))
-$v2Source = [IO.Path]::GetFullPath((Join-Path $repoRoot [string]$request.V2SetupRelativePath))
+$setupSources = Resolve-GuestSetupSources -RepoRoot $repoRoot -Request $request
+$v1Source = [string]$setupSources.V1
+$v2Source = [string]$setupSources.V2
 foreach ($source in @($v1Source, $v2Source)) {
     if (-not $source.StartsWith($repoRoot + '\', [StringComparison]::OrdinalIgnoreCase)) {
         throw 'A setup path escaped the read-only repository mapping.'

@@ -59,6 +59,46 @@ function Write-Utf8NoBomNewFile {
     }
 }
 
+function ConvertTo-PowerShellSingleQuotedLiteral {
+    param([Parameter(Mandatory)][AllowEmptyString()][string] $Value)
+    return "'" + $Value.Replace("'", "''") + "'"
+}
+
+function New-FailClosedScriptCommand {
+    param(
+        [Parameter(Mandatory)][string] $ScriptPath,
+        [Parameter(Mandatory)][Collections.IDictionary] $NamedArguments
+    )
+    $invocation = '& ' + (ConvertTo-PowerShellSingleQuotedLiteral $ScriptPath)
+    foreach ($entry in $NamedArguments.GetEnumerator()) {
+        $name = [string]$entry.Key
+        if ($name -notmatch '^[A-Za-z][A-Za-z0-9]*$') {
+            throw "Unsafe PowerShell parameter name: $name"
+        }
+        $invocation += ' -' + $name + ' ' +
+            (ConvertTo-PowerShellSingleQuotedLiteral ([string]$entry.Value))
+    }
+    return @"
+`$ErrorActionPreference = 'Stop'
+try {
+    $invocation
+    if (-not `$?) {
+        throw 'The invoked guest script reported a non-terminating error.'
+    }
+    exit 0
+}
+catch {
+    [Console]::Error.WriteLine((`$_ | Out-String))
+    exit 1
+}
+"@
+}
+
+function ConvertTo-EncodedPowerShellCommand {
+    param([Parameter(Mandatory)][string] $Command)
+    return [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($Command))
+}
+
 function Publish-BootstrapStage {
     param(
         [Parameter(Mandatory)][ValidateRange(1, 999)][int] $Ordinal,
@@ -98,6 +138,39 @@ function Assert-ContractModel {
             [IO.File]::ReadAllText($path) -cne '{"contract":true}') {
             throw 'Bootstrap UTF-8 publication contract failed.'
         }
+
+        $successScript = Join-Path $contractRoot 'success.ps1'
+        $terminatingScript = Join-Path $contractRoot 'terminating.ps1'
+        $nonTerminatingScript = Join-Path $contractRoot 'nonterminating.ps1'
+        [IO.File]::WriteAllText($successScript, "Write-Output 'success'",
+            [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($terminatingScript,
+            "throw 'synthetic terminating failure'", [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($nonTerminatingScript,
+            "Write-Error 'synthetic non-terminating failure'",
+            [Text.UTF8Encoding]::new($false))
+        $windowsPowerShell = Join-Path $env:SystemRoot `
+            'System32\WindowsPowerShell\v1.0\powershell.exe'
+        $exitCodes = [Collections.Generic.List[int]]::new()
+        $previousPreference = $ErrorActionPreference
+        try {
+            $ErrorActionPreference = 'Continue'
+            foreach ($contractScript in @($successScript, $terminatingScript,
+                    $nonTerminatingScript)) {
+                $command = New-FailClosedScriptCommand -ScriptPath $contractScript `
+                    -NamedArguments ([ordered]@{})
+                $encoded = ConvertTo-EncodedPowerShellCommand $command
+                $contractOutput = @(& $windowsPowerShell -NoLogo -NoProfile `
+                    -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1)
+                $exitCodes.Add([int]$LASTEXITCODE)
+            }
+        }
+        finally { $ErrorActionPreference = $previousPreference }
+        if ($exitCodes.Count -ne 3 -or $exitCodes[0] -ne 0 -or
+            $exitCodes[1] -eq 0 -or $exitCodes[2] -eq 0) {
+            throw "Fail-closed guest invocation contract failed (exit codes: $($exitCodes -join ','))."
+        }
+        Write-Host 'A4S legacy Sandbox bootstrap PS5 fail-closed child exit contract passed.'
     }
     finally {
         if ([IO.Directory]::Exists($contractRoot)) {
@@ -158,14 +231,17 @@ try {
         -not [IO.File]::Exists($windowsPowerShell)) {
         throw 'Canonical 64-bit Windows PowerShell is unavailable in Sandbox.'
     }
+    $guestCommand = New-FailClosedScriptCommand -ScriptPath $fixedGuestScript `
+        -NamedArguments ([ordered]@{
+            RequestPath = $fixedRequest
+            ExpectedSessionId = $SessionId
+            ExpectedNonce = $Nonce
+            ExpectedRequestSha256 = $RequestSha256
+            ExpectedGuestScriptSha256 = $GuestScriptSha256
+        })
     $arguments = @(
         '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass',
-        '-File', ('"' + $fixedGuestScript + '"'),
-        '-RequestPath', ('"' + $fixedRequest + '"'),
-        '-ExpectedSessionId', $SessionId,
-        '-ExpectedNonce', $Nonce,
-        '-ExpectedRequestSha256', $RequestSha256,
-        '-ExpectedGuestScriptSha256', $GuestScriptSha256
+        '-EncodedCommand', (ConvertTo-EncodedPowerShellCommand $guestCommand)
     )
     $guestProcess = Start-Process -FilePath $windowsPowerShell `
         -ArgumentList $arguments -WindowStyle Hidden -PassThru `
@@ -174,6 +250,12 @@ try {
     # for detached descendants such as the intentionally pending cleanup helper.
     $guestProcess.WaitForExit()
     $exitCode = [int]$guestProcess.ExitCode
+    if ($exitCode -eq 0 -and [IO.File]::Exists($stderrPath) -and
+        (Get-Item -LiteralPath $stderrPath -Force).Length -ne 0) {
+        $exitCode = 1
+        $consoleParts.Add(
+            'Guest PowerShell returned zero but emitted stderr; bootstrap failed closed.')
+    }
     Publish-BootstrapStage -Ordinal 90 -Stage 'guest-process-exited' `
         -Details @{ ExitCode = $exitCode }
 }

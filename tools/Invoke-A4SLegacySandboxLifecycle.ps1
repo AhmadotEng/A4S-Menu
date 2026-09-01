@@ -639,14 +639,33 @@ function Assert-ContractModel {
         throw 'The in-memory Sandbox isolation contract is incomplete.'
     }
     $mappings = @($xml.Configuration.MappedFolders.MappedFolder)
+    $mappedHostFolders = @($mappings | ForEach-Object { [string]$_.HostFolder })
     if ($mappings.Count -ne 3 -or $mappings[0].ReadOnly -cne 'true' -or
+        [string]$mappings[0].HostFolder -cne 'C:\Qualification\Repo' -or
         $mappings[0].SandboxFolder -cne 'C:\A4S\Repo' -or
         $mappings[1].ReadOnly -cne 'true' -or
+        [string]$mappings[1].HostFolder -cne
+            'D:\Qualification Evidence\Session\control' -or
         $mappings[1].SandboxFolder -cne 'C:\A4S\Control' -or
         $mappings[2].ReadOnly -cne 'false' -or
-        $mappings[2].SandboxFolder -cne 'C:\A4S\Evidence') {
+        [string]$mappings[2].HostFolder -cne
+            'D:\Qualification Evidence\Session\results' -or
+        $mappings[2].SandboxFolder -cne 'C:\A4S\Evidence' -or
+        $mappedHostFolders -contains 'D:\Qualification Evidence\Session\host' -or
+        $mappedHostFolders -contains 'D:\Qualification Evidence\Session') {
         throw 'The in-memory Sandbox mapping contract is incomplete.'
     }
+    $contractHostResult =
+        'D:\Qualification Evidence\Session\host\host-result.json'
+    if (-not (Test-PathWithin -Candidate $contractHostResult `
+            -Parent 'D:\Qualification Evidence\Session\host') -or
+        (Test-PathWithin -Candidate $contractHostResult `
+            -Parent 'D:\Qualification Evidence\Session\control') -or
+        (Test-PathWithin -Candidate $contractHostResult `
+            -Parent 'D:\Qualification Evidence\Session\results')) {
+        throw 'The in-memory host-result path is not confined to the unmapped host directory.'
+    }
+    Write-Host 'A4S legacy Sandbox host PS5 unmapped host-result layout contract passed.'
     if ($xml.Configuration.LogonCommand.Command -notmatch
         'Invoke-A4SLegacySandboxBootstrap\.ps1.*Invoke-A4SLegacySandboxGuest\.ps1.*C:\\A4S\\Control\\request\.json') {
         throw 'The guest entry point is missing from the Sandbox configuration.'
@@ -892,12 +911,21 @@ $sessionDirectory = Join-Path $evidenceRootFull $sessionId
 if (Test-Path -LiteralPath $sessionDirectory) { throw "Evidence session collision: $sessionDirectory" }
 [IO.Directory]::CreateDirectory($sessionDirectory) | Out-Null
 Assert-NoReparsePointInExistingChain $sessionDirectory
+$hostDirectory = Join-Path $sessionDirectory 'host'
 $controlDirectory = Join-Path $sessionDirectory 'control'
 $resultDirectory = Join-Path $sessionDirectory 'results'
+[IO.Directory]::CreateDirectory($hostDirectory) | Out-Null
 [IO.Directory]::CreateDirectory($controlDirectory) | Out-Null
 [IO.Directory]::CreateDirectory($resultDirectory) | Out-Null
+Assert-NoReparsePointInExistingChain $hostDirectory
 Assert-NoReparsePointInExistingChain $controlDirectory
 Assert-NoReparsePointInExistingChain $resultDirectory
+if ((Test-PathWithin -Candidate $hostDirectory -Parent $controlDirectory) -or
+    (Test-PathWithin -Candidate $controlDirectory -Parent $hostDirectory) -or
+    (Test-PathWithin -Candidate $hostDirectory -Parent $resultDirectory) -or
+    (Test-PathWithin -Candidate $resultDirectory -Parent $hostDirectory)) {
+    throw 'The mutable host-result directory must be disjoint from every Sandbox mapping.'
+}
 
 $request = [ordered]@{
     SchemaVersion = 1
@@ -966,7 +994,7 @@ $launchRecord = [ordered]@{
     Succeeded = $false
     Failure = $null
 }
-$hostResultPath = Join-Path $controlDirectory 'host-result.json'
+$hostResultPath = Join-Path $hostDirectory 'host-result.json'
 Write-Utf8NoBomAtomic -Path $hostResultPath `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
 

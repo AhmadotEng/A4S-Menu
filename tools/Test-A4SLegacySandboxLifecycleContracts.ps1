@@ -142,10 +142,21 @@ Assert-OrderedMarkers $hostSource @(
     "if (-not `$AllowSandboxLaunch)",
     '$hostBefore = Get-HostProductSnapshot',
     '[IO.Directory]::CreateDirectory($sessionDirectory)',
+    '[IO.Directory]::CreateDirectory($hostDirectory)',
     '[IO.Directory]::CreateDirectory($controlDirectory)',
     '[IO.Directory]::CreateDirectory($resultDirectory)',
     'Start-Process -FilePath $sandboxCommand.Source',
     '$hostAfter = Get-HostProductSnapshot') 'host opt-in and before/after boundary'
+Assert-ContainsOrdinal $hostSource `
+    "Join-Path `$hostDirectory 'host-result.json'" `
+    'unmapped mutable host-result path'
+Assert-ContainsOrdinal $hostSource `
+    'The mutable host-result directory must be disjoint from every Sandbox mapping.' `
+    'host-result mapping separation guard'
+Assert-Contract ($hostSource.IndexOf(
+        "Join-Path `$controlDirectory 'host-result.json'",
+        [StringComparison]::Ordinal) -lt 0) `
+    'mutable host-result regressed into the read-only control mapping'
 Assert-OrderedMarkers $hostSource @(
     '$hostFailure = $null',
     'try {',
@@ -202,6 +213,12 @@ foreach ($marker in @(
         '<ReadOnly>false</ReadOnly>')) {
     Assert-ContainsOrdinal $hostSource $marker 'Sandbox isolation configuration'
 }
+foreach ($hostFolder in @('C:\Qualification\Repo',
+        'D:\Qualification Evidence\Session\control',
+        'D:\Qualification Evidence\Session\results')) {
+    Assert-ContainsOrdinal $hostSource $hostFolder `
+        'exact three-folder Sandbox host mapping contract'
+}
 Assert-ContainsOrdinal $hostSource `
     "throw 'The writable evidence root must be disjoint from the read-only repository mapping.'" `
     'mapping overlap rejection'
@@ -239,6 +256,12 @@ foreach ($marker in @(
         'Write-GuestStage -Ordinal 17',
         'Write-GuestStage -Ordinal 23',
         '@(Get-A4SProcessInventory).Count',
+        'Resolve-GuestSetupSources',
+        'Join-Path $repoRoot',
+        '([string]$request.V1SetupRelativePath)',
+        '([string]$request.V2SetupRelativePath)',
+        'C:\A4S\Repo\build\fixtures\A4SMenuSetup-v1.exe',
+        'C:\A4S\Repo\build\reviewed product\A4SMenuSetup-v2.exe',
         'Read-Utf8JsonSnapshot -Path $requestFullPath',
         'Assert-SandboxConfiguration',
         'Assert-NetworkDisabled',
@@ -257,6 +280,16 @@ foreach ($marker in @(
         'completion.json')) {
     Assert-ContainsOrdinal $guestSource $marker 'guest isolation/evidence safety'
 }
+$setupSourceResolvers = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Resolve-GuestSetupSources'
+}, $true))
+Assert-Contract ($setupSourceResolvers.Count -eq 1) `
+    'guest must define exactly one shared executable setup-source resolver'
+Assert-Contract (-not [regex]::IsMatch($guestSource,
+        'Join-Path\s+\$\w+\s+\[string\]\$\w+\.(?:V1|V2)SetupRelativePath')) `
+    'guest regressed to the Windows PowerShell unparenthesized cast/Join-Path parse bug'
 Assert-Contract (-not [regex]::IsMatch($guestSource,
         '(?<!@)\(Get-A4SProcessInventory\)\.Count')) `
     'guest clean-state inventory regressed to StrictMode-unsafe null .Count access'
@@ -306,6 +339,10 @@ foreach ($marker in @(
         'guest-console.log',
         'guest-exit.json',
         'ConsoleSha256',
+        'New-FailClosedScriptCommand',
+        "`$ErrorActionPreference = 'Stop'",
+        "'-EncodedCommand'",
+        'Guest PowerShell returned zero but emitted stderr; bootstrap failed closed.',
         'Start-Process -FilePath $windowsPowerShell',
         '$guestProcess.WaitForExit()',
         '-RedirectStandardOutput $stdoutPath',
@@ -318,7 +355,11 @@ Assert-OrderedMarkers $bootstrapSource @(
     '$actualGuestSha256 -cne $GuestScriptSha256',
     "-Stage 'scripts-authenticated'",
     "-Stage 'guest-process-starting'",
+    '$guestCommand = New-FailClosedScriptCommand',
+    "'-EncodedCommand'",
     'Start-Process -FilePath $windowsPowerShell',
+    '$guestProcess.WaitForExit()',
+    "`$exitCode = 1",
     "-Stage 'guest-process-exited'",
     "Join-Path `$fixedEvidence 'guest-console.log'",
     "Join-Path `$fixedEvidence 'guest-exit.json'") `
@@ -349,6 +390,9 @@ Assert-Contract ($guestContractExitCode -eq 0) `
 Assert-Contract (($guestContractOutput -join ' ') -match
         'guest in-memory contract passed') `
     'guest atomic evidence writer was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 setup-source path contract passed') `
+    'shared V1/V2 setup-source resolution was not dynamically exercised by explicit Windows PowerShell 5.1'
 $bootstrapContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
     -ExecutionPolicy Bypass -File $bootstrapPath -ContractSelfTest 2>&1)
 $bootstrapContractExitCode = $LASTEXITCODE
@@ -357,6 +401,9 @@ Assert-Contract ($bootstrapContractExitCode -eq 0) `
 Assert-Contract (($bootstrapContractOutput -join ' ') -match
         'bootstrap contract passed under Windows PowerShell 5\.1\.') `
     'bootstrap UTF-8 publication was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($bootstrapContractOutput -join ' ') -match
+        'bootstrap PS5 fail-closed child exit contract passed') `
+    'bootstrap terminating/non-terminating child failures were not dynamically exercised by explicit Windows PowerShell 5.1'
 $hostContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
     -ExecutionPolicy Bypass -File $hostPath -ContractSelfTest 2>&1)
 $hostContractExitCode = $LASTEXITCODE
@@ -365,6 +412,9 @@ Assert-Contract ($hostContractExitCode -eq 0) `
 Assert-Contract (($hostContractOutput -join ' ') -match
         'replacement contract passed under Windows PowerShell 5\.1\.') `
     'host existing-file replacement was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($hostContractOutput -join ' ') -match
+        'host PS5 unmapped host-result layout contract passed') `
+    'host-result confinement outside all Sandbox mappings was not dynamically exercised by explicit Windows PowerShell 5.1'
 
 # Default invocation must fail before it can create evidence or launch anything.
 $defaultRejected = $false
