@@ -424,7 +424,9 @@ function Initialize-ExplorerProbe {
 using System;
 using System.ComponentModel;
 using System.Collections.Generic;
+using System.IO;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 
 public sealed class A4SSandboxModuleSnapshot
@@ -444,42 +446,34 @@ public sealed class A4SSandboxModuleSnapshot
 
 public static class A4SSandboxWindowProbe
 {
-    private const uint TH32CS_SNAPMODULE = 0x00000008;
-    private const uint TH32CS_SNAPMODULE32 = 0x00000010;
-    private const int ERROR_BAD_LENGTH = 24;
-    private const int ERROR_NO_MORE_FILES = 18;
+    private const uint PROCESS_VM_READ = 0x0010;
+    private const uint PROCESS_QUERY_INFORMATION = 0x0400;
+    private const uint LIST_MODULES_ALL = 0x03;
+    private const int ERROR_PARTIAL_COPY = 299;
     private const int ERROR_INVALID_DATA = 13;
-    private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
-
-    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-    private struct MODULEENTRY32
-    {
-        public uint dwSize;
-        public uint th32ModuleID;
-        public uint th32ProcessID;
-        public uint GlblcntUsage;
-        public uint ProccntUsage;
-        public IntPtr modBaseAddr;
-        public uint modBaseSize;
-        public IntPtr hModule;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
-        public string szModule;
-        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-        public string szExePath;
-    }
+    private const int SnapshotAttemptLimit = 8;
+    private const int InitialModuleCapacity = 256;
+    private const int MaximumModuleCount = 4096;
+    private const int MaximumPathCharacters = 32768;
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindWindowW(string className, string windowName);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("kernel32.dll", SetLastError = true)]
-    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+    private static extern IntPtr OpenProcess(uint desiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool inheritHandle, uint processId);
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool EnumProcessModulesEx(IntPtr process, [Out] IntPtr[] modules,
+        uint moduleBytes, out uint bytesNeeded, uint filterFlag);
+    [DllImport("psapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    private static extern uint GetModuleFileNameExW(IntPtr process, IntPtr module,
+        StringBuilder fileName, uint size);
     [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool Module32FirstW(IntPtr snapshot, ref MODULEENTRY32 entry);
-    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
-    [return: MarshalAs(UnmanagedType.Bool)]
-    private static extern bool Module32NextW(IntPtr snapshot, ref MODULEENTRY32 entry);
+    private static extern bool QueryFullProcessImageNameW(IntPtr process, uint flags,
+        StringBuilder fileName, ref uint size);
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     private static extern bool CloseHandle(IntPtr handle);
@@ -497,85 +491,128 @@ public static class A4SSandboxWindowProbe
     public static A4SSandboxModuleSnapshot ModuleSnapshotForProcess(int processId)
     {
         if (processId <= 0) throw new ArgumentOutOfRangeException("processId");
-        for (int attempt = 0; attempt < 8; ++attempt)
+        if (!Environment.Is64BitProcess)
+            throw new PlatformNotSupportedException(
+                "Explorer module enumeration requires an x64 probe process");
+
+        IntPtr process = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+            false, checked((uint)processId));
+        if (process == IntPtr.Zero)
+            throw new Win32Exception(Marshal.GetLastWin32Error(),
+                "Explorer could not be opened for bounded module enumeration");
+        try
         {
-            IntPtr snapshot = CreateToolhelp32Snapshot(
-                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, checked((uint)processId));
-            if (snapshot == InvalidHandleValue)
+            int capacity = InitialModuleCapacity;
+            for (int attempt = 0; attempt < SnapshotAttemptLimit; ++attempt)
             {
-                int createError = Marshal.GetLastWin32Error();
-                if (createError == ERROR_BAD_LENGTH)
+                StringBuilder imageBuilder = new StringBuilder(MaximumPathCharacters);
+                uint imageCharacters = checked((uint)imageBuilder.Capacity);
+                if (!QueryFullProcessImageNameW(process, 0, imageBuilder,
+                        ref imageCharacters))
+                {
+                    int imageError = Marshal.GetLastWin32Error();
+                    if (imageError == ERROR_PARTIAL_COPY)
+                    {
+                        Thread.Sleep(10);
+                        continue;
+                    }
+                    throw new Win32Exception(imageError,
+                        "Explorer canonical image query failed");
+                }
+                if (imageCharacters == 0 || imageCharacters >= MaximumPathCharacters ||
+                    String.IsNullOrWhiteSpace(imageBuilder.ToString()))
+                    throw new Win32Exception(ERROR_INVALID_DATA,
+                        "Explorer canonical image path was empty or truncated");
+                string mainModulePath = imageBuilder.ToString();
+
+                IntPtr[] moduleHandles = new IntPtr[capacity];
+                uint moduleBytes = checked((uint)(moduleHandles.Length * IntPtr.Size));
+                uint bytesNeeded;
+                if (!EnumProcessModulesEx(process, moduleHandles, moduleBytes,
+                        out bytesNeeded, LIST_MODULES_ALL))
+                {
+                    int enumError = Marshal.GetLastWin32Error();
+                    if (enumError == ERROR_PARTIAL_COPY)
+                    {
+                        Thread.Sleep(10);
+                        continue;
+                    }
+                    throw new Win32Exception(enumError,
+                        "Explorer PSAPI module enumeration failed");
+                }
+                if (bytesNeeded == 0 || bytesNeeded % checked((uint)IntPtr.Size) != 0)
+                    throw new Win32Exception(ERROR_INVALID_DATA,
+                        "Explorer PSAPI module byte count was invalid");
+                ulong requiredCount64 = bytesNeeded / checked((uint)IntPtr.Size);
+                if (requiredCount64 == 0 || requiredCount64 > MaximumModuleCount)
+                    throw new Win32Exception(ERROR_INVALID_DATA,
+                        "Explorer PSAPI module count exceeded its hard bound");
+                int requiredCount = checked((int)requiredCount64);
+                if (bytesNeeded > moduleBytes)
+                {
+                    int slackCapacity = requiredCount > MaximumModuleCount - 64
+                        ? MaximumModuleCount : requiredCount + 64;
+                    capacity = Math.Max(requiredCount, slackCapacity);
+                    Thread.Sleep(10);
+                    continue;
+                }
+
+                HashSet<IntPtr> uniqueHandles = new HashSet<IntPtr>();
+                HashSet<string> uniquePaths = new HashSet<string>(
+                    StringComparer.OrdinalIgnoreCase);
+                List<string> a4SMenuPaths = new List<string>();
+                bool retrySnapshot = false;
+                for (int moduleIndex = 0; moduleIndex < requiredCount; ++moduleIndex)
+                {
+                    IntPtr module = moduleHandles[moduleIndex];
+                    if (module == IntPtr.Zero || !uniqueHandles.Add(module))
+                        throw new Win32Exception(ERROR_INVALID_DATA,
+                            "Explorer PSAPI module handles were empty, duplicated, or cyclic");
+                    StringBuilder pathBuilder = new StringBuilder(MaximumPathCharacters);
+                    uint pathCharacters = GetModuleFileNameExW(process, module,
+                        pathBuilder, checked((uint)pathBuilder.Capacity));
+                    if (pathCharacters == 0)
+                    {
+                        int pathError = Marshal.GetLastWin32Error();
+                        if (pathError == ERROR_PARTIAL_COPY)
+                        {
+                            retrySnapshot = true;
+                            break;
+                        }
+                        throw new Win32Exception(pathError,
+                            "Explorer module path query failed");
+                    }
+                    if (pathCharacters >= MaximumPathCharacters - 1 ||
+                        String.IsNullOrWhiteSpace(pathBuilder.ToString()))
+                        throw new Win32Exception(ERROR_INVALID_DATA,
+                            "Explorer module path was empty or exceeded its hard bound");
+                    string modulePath = pathBuilder.ToString();
+                    if (!uniquePaths.Add(modulePath))
+                        throw new Win32Exception(ERROR_INVALID_DATA,
+                            "Explorer PSAPI module paths were duplicated or cyclic");
+                    if (String.Equals(Path.GetFileName(modulePath), "A4SMenu.dll",
+                            StringComparison.OrdinalIgnoreCase))
+                        a4SMenuPaths.Add(modulePath);
+                }
+                if (retrySnapshot)
                 {
                     Thread.Sleep(10);
                     continue;
                 }
-                throw new Win32Exception(createError, "Explorer module snapshot creation failed");
+                if (uniqueHandles.Count != requiredCount ||
+                    uniquePaths.Count != requiredCount)
+                    throw new Win32Exception(ERROR_INVALID_DATA,
+                        "Explorer PSAPI module snapshot completeness was not proved");
+                return new A4SSandboxModuleSnapshot(requiredCount,
+                    mainModulePath, a4SMenuPaths.ToArray());
             }
-
-            bool retry = false;
-            try
-            {
-                List<string> a4SMenuPaths = new List<string>();
-                int totalModuleCount = 0;
-                string mainModulePath = null;
-                MODULEENTRY32 entry = new MODULEENTRY32();
-                entry.dwSize = checked((uint)Marshal.SizeOf(typeof(MODULEENTRY32)));
-                if (!Module32FirstW(snapshot, ref entry))
-                {
-                    int firstError = Marshal.GetLastWin32Error();
-                    if (firstError == ERROR_NO_MORE_FILES)
-                        throw new Win32Exception(firstError,
-                            "Explorer module snapshot was unexpectedly empty");
-                    if (firstError == ERROR_BAD_LENGTH) retry = true;
-                    else throw new Win32Exception(firstError, "Explorer module enumeration failed to start");
-                }
-                else
-                {
-                    while (true)
-                    {
-                        if (entry.th32ProcessID != checked((uint)processId) ||
-                            String.IsNullOrWhiteSpace(entry.szExePath))
-                            throw new Win32Exception(ERROR_INVALID_DATA,
-                                "Explorer returned an invalid module snapshot entry");
-                        ++totalModuleCount;
-                        if (mainModulePath == null) mainModulePath = entry.szExePath;
-                        if (String.Equals(entry.szModule, "A4SMenu.dll",
-                                StringComparison.OrdinalIgnoreCase))
-                        {
-                            a4SMenuPaths.Add(entry.szExePath);
-                        }
-                        entry.dwSize = checked((uint)Marshal.SizeOf(typeof(MODULEENTRY32)));
-                        if (Module32NextW(snapshot, ref entry)) continue;
-                        int nextError = Marshal.GetLastWin32Error();
-                        if (nextError == ERROR_NO_MORE_FILES)
-                        {
-                            if (totalModuleCount <= 0 || String.IsNullOrWhiteSpace(mainModulePath))
-                                throw new Win32Exception(ERROR_NO_MORE_FILES,
-                                    "Explorer module snapshot did not prove a main module");
-                            return new A4SSandboxModuleSnapshot(totalModuleCount,
-                                mainModulePath, a4SMenuPaths.ToArray());
-                        }
-                        if (nextError == ERROR_BAD_LENGTH)
-                        {
-                            retry = true;
-                            break;
-                        }
-                        throw new Win32Exception(nextError, "Explorer module enumeration failed");
-                    }
-                }
-            }
-            finally
-            {
-                CloseHandle(snapshot);
-            }
-            if (retry)
-            {
-                Thread.Sleep(10);
-                continue;
-            }
+            throw new Win32Exception(ERROR_PARTIAL_COPY,
+                "Explorer PSAPI module snapshot remained unstable after eight attempts");
         }
-        throw new Win32Exception(ERROR_BAD_LENGTH,
-            "Explorer module snapshot remained unstable after eight attempts");
+        finally
+        {
+            CloseHandle(process);
+        }
     }
 }
 '@
@@ -899,7 +936,8 @@ function Invoke-ExactProcess {
         [ValidateRange(0, 89)][int] $StartedStageOrdinal = 0,
         [string] $StartedStage,
         [ValidateRange(0, 89)][int] $TimeoutStageOrdinal = 0,
-        [string] $TimeoutStage
+        [string] $TimeoutStage,
+        [ValidateNotNullOrEmpty()][int[]] $AcceptedExitCodes = @(0)
     )
     if (@($Arguments | Where-Object { $_ -ieq '--restart-explorer' }).Count -ne 0) {
         throw '--restart-explorer is forbidden in the Sandbox lifecycle matrix.'
@@ -911,6 +949,15 @@ function Invoke-ExactProcess {
         ($TimeoutStageOrdinal -ne 0 -and ($TimeoutStageOrdinal -lt 10 -or
             $TimeoutStage -notmatch '^[a-z0-9-]+$'))) {
         throw 'Exact-process diagnostic stage parameters are incomplete or malformed.'
+    }
+    if ($AcceptedExitCodes.Count -lt 1 -or $AcceptedExitCodes.Count -gt 16) {
+        throw 'Exact-process accepted exit codes must contain between one and sixteen values.'
+    }
+    $acceptedExitCodeSet = [Collections.Generic.HashSet[int]]::new()
+    foreach ($acceptedExitCode in $AcceptedExitCodes) {
+        if (-not $acceptedExitCodeSet.Add([int]$acceptedExitCode)) {
+            throw 'Exact-process accepted exit codes may not contain duplicates.'
+        }
     }
     $stdoutPath = Join-Path $script:workRoot "$Label.stdout.txt"
     $stderrPath = Join-Path $script:workRoot "$Label.stderr.txt"
@@ -954,8 +1001,8 @@ function Invoke-ExactProcess {
             Stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -Raw -LiteralPath $stdoutPath } else { '' }
             Stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -Raw -LiteralPath $stderrPath } else { '' }
         }
-        if ($record.ExitCode -ne 0) {
-            throw "$Label failed with exit code $($record.ExitCode)."
+        if (-not $acceptedExitCodeSet.Contains([int]$record.ExitCode)) {
+            throw "$Label returned unaccepted exit code $($record.ExitCode)."
         }
     }
     catch {
@@ -1061,21 +1108,123 @@ function Get-SlotPayloadLikeExtraction {
     }
 }
 
+function Resolve-V1HostStatus {
+    param([Parameter(Mandatory)] $Execution)
+    $exitCode = [int]$Execution.ExitCode
+    $stdout = [string]$Execution.Stdout
+    if (-not [string]::IsNullOrEmpty([string]$Execution.Stderr)) {
+        throw "V1 host status $exitCode wrote unexpected stderr."
+    }
+    $model = switch ($exitCode) {
+        0 { [ordered]@{ State = 'ready'; Disposition = 'ready'; Texts = @("A4SMenuHost: ready`r`n") }; break }
+        1 { [ordered]@{ State = 'starting'; Disposition = 'retry'; Texts = @("A4SMenuHost: starting`r`n") }; break }
+        2 { [ordered]@{ State = 'injecting'; Disposition = 'retry'; Texts = @("A4SMenuHost: injecting`r`n") }; break }
+        4 { [ordered]@{ State = 'failed'; Disposition = 'terminal'; Texts = @("A4SMenuHost: failed (native Start available)`r`n") }; break }
+        5 { [ordered]@{ State = 'stopping'; Disposition = 'terminal'; Texts = @("A4SMenuHost: stopping`r`n") }; break }
+        6 { [ordered]@{ State = 'safety-disabled'; Disposition = 'terminal'; Texts = @("A4SMenuHost: disabled after Explorer crash loop (native Start available)`r`n") }; break }
+        1062 { [ordered]@{ State = 'service-not-active'; Disposition = 'retry'; Texts = @('', "A4SMenuHost: stopped`r`n") }; break }
+        default { throw "V1 host status returned unsupported exit code $exitCode." }
+    }
+    if (@($model.Texts | Where-Object { [string]$_ -ceq $stdout }).Count -ne 1) {
+        throw "V1 host status $exitCode returned unexpected stdout '$stdout'."
+    }
+    return [ordered]@{
+        ExitCode = $exitCode
+        State = [string]$model.State
+        Disposition = [string]$model.Disposition
+        Text = $stdout
+    }
+}
+
+function Wait-ForV1HostReadiness {
+    param(
+        [Parameter(Mandatory)][string] $HostPath,
+        [Parameter(Mandatory)][Collections.IDictionary] $Evidence,
+        [ValidateRange(5, 60)][int] $TimeoutSeconds = 20,
+        [ValidateRange(3, 10)][int] $ProbeTimeoutSeconds = 5,
+        [ValidateRange(1, 64)][int] $MaximumAttempts = 64,
+        [ValidateRange(10, 1000)][int] $RetryDelayMilliseconds = 250
+    )
+    $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
+    $Evidence.StartedUtc = [DateTime]::UtcNow.ToString('o')
+    $Evidence.TimeoutSeconds = $TimeoutSeconds
+    $Evidence.ProbeTimeoutSeconds = $ProbeTimeoutSeconds
+    $Evidence.MaximumAttempts = $MaximumAttempts
+    $Evidence.RetryDelayMilliseconds = $RetryDelayMilliseconds
+    for ($attempt = 1; $attempt -le $MaximumAttempts; ++$attempt) {
+        if ([DateTime]::UtcNow -ge $deadline) { break }
+        $execution = $null
+        $status = $null
+        try {
+            $execution = Invoke-ExactProcess -Path $HostPath `
+                -Arguments @('--status') `
+                -Label ('v1-host-status-attempt-{0:D2}' -f $attempt) `
+                -TimeoutSeconds $ProbeTimeoutSeconds `
+                -AcceptedExitCodes @(0, 1, 2, 4, 5, 6, 1062)
+            $status = Resolve-V1HostStatus -Execution $execution
+        }
+        catch {
+            $failedAttempt = [ordered]@{
+                Attempt = $attempt
+                CapturedUtc = [DateTime]::UtcNow.ToString('o')
+                Execution = $execution
+                Failure = $_.Exception.Message
+            }
+            [void]$Evidence.Attempts.Add($failedAttempt)
+            $Evidence.AttemptCount = $Evidence.Attempts.Count
+            $Evidence.FinalStatus = $failedAttempt
+            $Evidence.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            throw
+        }
+        $attemptRecord = [ordered]@{
+            Attempt = $attempt
+            CapturedUtc = [DateTime]::UtcNow.ToString('o')
+            State = [string]$status.State
+            Disposition = [string]$status.Disposition
+            Execution = $execution
+        }
+        [void]$Evidence.Attempts.Add($attemptRecord)
+        $Evidence.AttemptCount = $Evidence.Attempts.Count
+        $Evidence.FinalStatus = $attemptRecord
+        if ($status.Disposition -ceq 'ready') {
+            $Evidence.Ready = $true
+            $Evidence.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            return $Evidence
+        }
+        if ($status.Disposition -ceq 'terminal') {
+            $Evidence.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            throw "V1 host reached terminal state '$($status.State)' during readiness polling."
+        }
+        Start-Sleep -Milliseconds $RetryDelayMilliseconds
+    }
+    $Evidence.CompletedUtc = [DateTime]::UtcNow.ToString('o')
+    $lastState = if ($null -eq $Evidence.FinalStatus) {
+        'no-status'
+    } else { [string]$Evidence.FinalStatus.State }
+    throw "V1 host did not reach exact ready status within $TimeoutSeconds seconds and $MaximumAttempts attempts (last state: $lastState)."
+}
+
 function Wait-ForExplorerMenuModule {
     param(
         [Parameter(Mandatory)][int] $ExplorerPid,
+        [Parameter(Mandatory)][string] $ExpectedPath,
         [Parameter(Mandatory)][string] $ExpectedSha256,
-        [ValidateRange(5, 60)][int] $TimeoutSeconds = 20
+        [ValidateRange(5, 60)][int] $TimeoutSeconds = 20,
+        [ValidateRange(1, 512)][int] $MaximumAttempts = 100
     )
+    $expectedFullPath = [IO.Path]::GetFullPath($ExpectedPath)
     $deadline = [DateTime]::UtcNow.AddSeconds($TimeoutSeconds)
-    do {
+    for ($attempt = 1; $attempt -le $MaximumAttempts; ++$attempt) {
+        if ([DateTime]::UtcNow -ge $deadline) { break }
         $inventory = Get-ExplorerModuleInventory $ExplorerPid
-        if ($inventory.Complete -and @($inventory.Modules |
-                Where-Object { $_.Sha256 -ceq $ExpectedSha256 }).Count -eq 1) {
+        if ($inventory.Complete -and @($inventory.Modules).Count -eq 1 -and
+            [string]$inventory.Modules[0].Sha256 -ceq $ExpectedSha256 -and
+            ([IO.Path]::GetFullPath([string]$inventory.Modules[0].Path)).Equals(
+                $expectedFullPath, [StringComparison]::OrdinalIgnoreCase)) {
             return $inventory
         }
         Start-Sleep -Milliseconds 200
-    } while ([DateTime]::UtcNow -lt $deadline)
+    }
     throw 'The reviewed V1 DLL was not observed in the unchanged taskbar Explorer process.'
 }
 
@@ -1236,15 +1385,56 @@ function Assert-ContractModel {
     Initialize-ExplorerProbe
     $windowsPowerShell = Join-Path $env:SystemRoot `
         'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $snapshotStopwatch = [Diagnostics.Stopwatch]::StartNew()
     $nativeSnapshot = [A4SSandboxWindowProbe]::ModuleSnapshotForProcess($PID)
+    $snapshotStopwatch.Stop()
     if ([int]$nativeSnapshot.TotalModuleCount -le 0 -or
+        [int]$nativeSnapshot.TotalModuleCount -gt 4096 -or
         [string]::IsNullOrWhiteSpace([string]$nativeSnapshot.MainModulePath) -or
+        @($nativeSnapshot.A4SMenuModulePaths).Count -ne 0 -or
+        $snapshotStopwatch.Elapsed.TotalSeconds -gt 5 -or
         -not ([IO.Path]::GetFullPath([string]$nativeSnapshot.MainModulePath)).Equals(
             [IO.Path]::GetFullPath($windowsPowerShell),
             [StringComparison]::OrdinalIgnoreCase)) {
-        throw 'Native Toolhelp contract did not prove this x64 Windows PowerShell main module.'
+        throw 'Bounded native PSAPI contract did not prove this x64 Windows PowerShell module snapshot.'
     }
-    Write-Host 'A4S legacy Sandbox guest PS5 x64 native Toolhelp module snapshot contract passed.'
+    Write-Host 'A4S legacy Sandbox guest PS5 x64 bounded native PSAPI module snapshot contract passed.'
+
+    $statusModels = @(
+        [ordered]@{ ExitCode = 0; Stdout = "A4SMenuHost: ready`r`n"; State = 'ready'; Disposition = 'ready' },
+        [ordered]@{ ExitCode = 1; Stdout = "A4SMenuHost: starting`r`n"; State = 'starting'; Disposition = 'retry' },
+        [ordered]@{ ExitCode = 2; Stdout = "A4SMenuHost: injecting`r`n"; State = 'injecting'; Disposition = 'retry' },
+        [ordered]@{ ExitCode = 4; Stdout = "A4SMenuHost: failed (native Start available)`r`n"; State = 'failed'; Disposition = 'terminal' },
+        [ordered]@{ ExitCode = 5; Stdout = "A4SMenuHost: stopping`r`n"; State = 'stopping'; Disposition = 'terminal' },
+        [ordered]@{ ExitCode = 6; Stdout = "A4SMenuHost: disabled after Explorer crash loop (native Start available)`r`n"; State = 'safety-disabled'; Disposition = 'terminal' },
+        [ordered]@{ ExitCode = 1062; Stdout = ''; State = 'service-not-active'; Disposition = 'retry' },
+        [ordered]@{ ExitCode = 1062; Stdout = "A4SMenuHost: stopped`r`n"; State = 'service-not-active'; Disposition = 'retry' }
+    )
+    foreach ($statusModel in $statusModels) {
+        $resolvedStatus = Resolve-V1HostStatus -Execution ([ordered]@{
+            ExitCode = [int]$statusModel.ExitCode
+            Stdout = [string]$statusModel.Stdout
+            Stderr = ''
+        })
+        if ([string]$resolvedStatus.State -cne [string]$statusModel.State -or
+            [string]$resolvedStatus.Disposition -cne [string]$statusModel.Disposition) {
+            throw 'V1 host readiness status model classification drifted.'
+        }
+    }
+    foreach ($invalidStatus in @(
+            [ordered]@{ ExitCode = 0; Stdout = "A4SMenuHost: injecting`r`n"; Stderr = '' },
+            [ordered]@{ ExitCode = 0; Stdout = 'A4SMenuHost: ready'; Stderr = '' },
+            [ordered]@{ ExitCode = 1062; Stdout = "A4SMenuHost: starting`r`n"; Stderr = '' },
+            [ordered]@{ ExitCode = 7; Stdout = ''; Stderr = '' },
+            [ordered]@{ ExitCode = 0; Stdout = "A4SMenuHost: ready`r`n"; Stderr = 'unexpected' })) {
+        $invalidRejected = $false
+        try { Resolve-V1HostStatus -Execution $invalidStatus | Out-Null }
+        catch { $invalidRejected = $true }
+        if (-not $invalidRejected) {
+            throw 'V1 host readiness status model accepted an invalid terminal observation.'
+        }
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 bounded V1 host readiness model contract passed.'
     $processContractRoot = Join-Path ([IO.Path]::GetTempPath()) `
         ('A4SGuestProcessTimeoutContract-' + [Guid]::NewGuid().ToString('N'))
     [IO.Directory]::CreateDirectory($processContractRoot) | Out-Null
@@ -1459,10 +1649,13 @@ $script:evidence = [ordered]@{
     Environment = $null
     Inputs = [ordered]@{ V1 = $null; V2 = $null }
     Seed = $null
+    V1Readiness = $null
     Steps = [Collections.Generic.List[object]]::new()
     FinalDisposition = $null
     Succeeded = $false
     Failure = $null
+    FailureCheckpoint = $null
+    FailureCheckpointError = $null
 }
 $failure = $null
 Write-GuestStage -Ordinal 19 -Stage 'evidence-initialized'
@@ -1523,14 +1716,54 @@ try {
     $v1ActivePath = Get-RegistryString 'Software\A4SMenu' 'ActiveSlot'
     $v1Payload = Get-SlotPayload $v1ActivePath
     Assert-PayloadMatches $v1Payload $request.V1 'install-v1 active'
+    Write-GuestStage -Ordinal 30 -Stage 'v1-mapping-wait-starting'
     $v1Mapping = Wait-ForExplorerMenuModule -ExplorerPid $initialExplorerPid `
+        -ExpectedPath ([string]$v1Payload.Menu.Path) `
         -ExpectedSha256 ([string]$request.V1.MenuSha256)
+    Write-GuestStage -Ordinal 31 -Stage 'v1-mapping-observed' -Details @{
+        ExplorerPid = $initialExplorerPid
+        MenuPath = [string]$v1Mapping.Modules[0].Path
+        MenuSha256 = [string]$v1Mapping.Modules[0].Sha256
+        TotalModuleCount = [int]$v1Mapping.TotalModuleCount
+    }
     $v1HostPath = Join-Path $v1ActivePath 'A4SMenuHost.exe'
-    $v1Status = Invoke-ExactProcess -Path $v1HostPath `
-        -Arguments @('--status') -Label 'v1-host-status'
+    $v1ReadinessEvidence = [ordered]@{
+        Ready = $false
+        StartedUtc = $null
+        CompletedUtc = $null
+        TimeoutSeconds = 0
+        ProbeTimeoutSeconds = 0
+        MaximumAttempts = 0
+        RetryDelayMilliseconds = 0
+        AttemptCount = 0
+        FinalStatus = $null
+        Attempts = [Collections.Generic.List[object]]::new()
+    }
+    $script:evidence.V1Readiness = $v1ReadinessEvidence
+    Write-GuestStage -Ordinal 32 -Stage 'v1-host-status-poll-starting'
+    $v1Readiness = Wait-ForV1HostReadiness -HostPath $v1HostPath `
+        -Evidence $v1ReadinessEvidence
+    $v1Status = $v1Readiness.FinalStatus.Execution
+    Write-GuestStage -Ordinal 33 -Stage 'v1-host-status-ready' -Details @{
+        AttemptCount = [int]$v1Readiness.AttemptCount
+        FinalExitCode = [int]$v1Status.ExitCode
+        FinalState = [string]$v1Readiness.FinalStatus.State
+    }
+    Write-GuestStage -Ordinal 34 -Stage 'v1-ready-mapping-recheck-starting'
+    $v1ReadyMapping = Wait-ForExplorerMenuModule -ExplorerPid $initialExplorerPid `
+        -ExpectedPath ([string]$v1Payload.Menu.Path) `
+        -ExpectedSha256 ([string]$request.V1.MenuSha256) -TimeoutSeconds 5
+    Write-GuestStage -Ordinal 35 -Stage 'v1-ready-mapping-recheck-completed' -Details @{
+        ExplorerPid = $initialExplorerPid
+        MenuPath = [string]$v1ReadyMapping.Modules[0].Path
+        MenuSha256 = [string]$v1ReadyMapping.Modules[0].Sha256
+        TotalModuleCount = [int]$v1ReadyMapping.TotalModuleCount
+    }
+    Write-GuestStage -Ordinal 36 -Stage 'v1-host-exit-starting'
     $v1Exit = Invoke-ExactProcess -Path $v1HostPath -Arguments @('--exit') `
         -Label 'v1-host-exit'
     Wait-ForHostExit $v1HostPath
+    Write-GuestStage -Ordinal 37 -Stage 'v1-host-exit-completed'
     # The legacy injected DLL cannot be unloaded without replacing Explorer.
     # Give its one-shot preload worker time to settle before establishing the
     # cache bytes whose installer preservation is measured below.
@@ -1554,8 +1787,10 @@ try {
         Name = 'install-v1'
         Execution = $installV1Execution
         HostStatus = $v1Status
+        HostReadiness = $v1Readiness
         HostExit = $v1Exit
-        ExplorerMapping = $v1Mapping
+        ExplorerMappingBeforeReadiness = $v1Mapping
+        ExplorerMappingAfterReadiness = $v1ReadyMapping
         Checkpoint = $installV1Checkpoint
     })
     Write-ProgressEvidence
@@ -1707,7 +1942,14 @@ catch {
         ScriptStackTrace = $_.ScriptStackTrace
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
     }
-    try { $script:evidence.FailureCheckpoint = Get-Checkpoint 'failure' } catch {}
+    try {
+        Write-GuestStage -Ordinal 38 -Stage 'failure-checkpoint-starting'
+        $script:evidence.FailureCheckpoint = Get-Checkpoint 'failure'
+        Write-GuestStage -Ordinal 39 -Stage 'failure-checkpoint-captured'
+    }
+    catch {
+        $script:evidence.FailureCheckpointError = $_.Exception.Message
+    }
 }
 finally {
     $script:evidence.CompletedUtc = [DateTime]::UtcNow.ToString('o')

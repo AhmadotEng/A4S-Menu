@@ -79,6 +79,10 @@ $exactProcessText = $exactProcessDefinitions[0].Extent.Text
 foreach ($marker in @(
         '[ValidateRange(1, 300)][int] $TimeoutSeconds = 120',
         '[ValidateRange(100, 10000)][int] $KillWaitMilliseconds = 5000',
+        '[ValidateNotNullOrEmpty()][int[]] $AcceptedExitCodes = @(0)',
+        '$AcceptedExitCodes.Count -lt 1 -or $AcceptedExitCodes.Count -gt 16',
+        '$acceptedExitCodeSet = [Collections.Generic.HashSet[int]]::new()',
+        '$acceptedExitCodeSet.Contains([int]$record.ExitCode)',
         '$process.WaitForExit($TimeoutSeconds * 1000)',
         '$failureKind = ''timeout''',
         'throw [TimeoutException]::new(',
@@ -151,14 +155,31 @@ $explorerProbeDefinitions = @($guestAst.FindAll({
 Assert-Contract ($explorerProbeDefinitions.Count -eq 1) `
     'guest must define exactly one executable native Explorer probe initializer'
 $explorerProbeText = $explorerProbeDefinitions[0].Extent.Text
-foreach ($marker in @('CreateToolhelp32Snapshot', 'Module32FirstW',
-        'Module32NextW', 'for (int attempt = 0; attempt < 8; ++attempt)',
+foreach ($marker in @('OpenProcess', 'EnumProcessModulesEx',
+        'GetModuleFileNameExW', 'QueryFullProcessImageNameW',
+        'private const int SnapshotAttemptLimit = 8;',
+        'private const int MaximumModuleCount = 4096;',
+        'private const int MaximumPathCharacters = 32768;',
+        'for (int attempt = 0; attempt < SnapshotAttemptLimit; ++attempt)',
+        'for (int moduleIndex = 0; moduleIndex < requiredCount; ++moduleIndex)',
+        'requiredCount64 > MaximumModuleCount',
+        'HashSet<IntPtr> uniqueHandles', 'HashSet<string> uniquePaths',
+        '!uniqueHandles.Add(module)', '!uniquePaths.Add(modulePath)',
+        'uniqueHandles.Count != requiredCount',
+        'uniquePaths.Count != requiredCount',
         'using System.Collections.Generic;', 'using System.Threading;',
-        'if (createError == ERROR_BAD_LENGTH)', 'finally',
-        'CloseHandle(snapshot)',
-        'Explorer module snapshot was unexpectedly empty')) {
+        'finally', 'CloseHandle(process)',
+        'Explorer PSAPI module snapshot remained unstable after eight attempts')) {
     Assert-ContainsOrdinal $explorerProbeText $marker 'guest native Explorer module snapshot'
 }
+foreach ($forbiddenProbeMarker in @('CreateToolhelp32Snapshot',
+        'Module32First', 'Module32Next', 'TH32CS_SNAPMODULE')) {
+    Assert-Contract ($explorerProbeText.IndexOf($forbiddenProbeMarker,
+            [StringComparison]::OrdinalIgnoreCase) -lt 0) `
+        "guest native Explorer module snapshot retained forbidden Toolhelp marker '$forbiddenProbeMarker'"
+}
+Assert-Contract (-not [regex]::IsMatch($explorerProbeText, '\bwhile\s*\(')) `
+    'guest native Explorer module snapshot contains a data-dependent while loop'
 $moduleInventoryDefinitions = @($guestAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -180,6 +201,78 @@ foreach ($marker in @('$snapshot.TotalModuleCount', '$snapshot.MainModulePath',
 Assert-Contract (-not [regex]::IsMatch($moduleInventoryText,
         '(?i)\.Modules\b')) `
     'guest Explorer inventory regressed to an unbounded Process.Modules enumeration'
+Assert-Contract (-not [regex]::IsMatch($guestSource,
+        '(?i)\$process\.Modules\b')) `
+    'guest contains a forbidden Process.Modules enumeration'
+
+$mappingWaitDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Wait-ForExplorerMenuModule'
+}, $true))
+Assert-Contract ($mappingWaitDefinitions.Count -eq 1) `
+    'guest must define exactly one bounded Explorer menu mapping wait'
+$mappingWaitText = $mappingWaitDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[Parameter(Mandatory)][string] $ExpectedPath',
+        '[ValidateRange(1, 512)][int] $MaximumAttempts = 100',
+        'for ($attempt = 1; $attempt -le $MaximumAttempts; ++$attempt)',
+        'if ([DateTime]::UtcNow -ge $deadline) { break }',
+        '@($inventory.Modules).Count -eq 1',
+        '[string]$inventory.Modules[0].Sha256 -ceq $ExpectedSha256',
+        '[IO.Path]::GetFullPath([string]$inventory.Modules[0].Path)',
+        '$expectedFullPath, [StringComparison]::OrdinalIgnoreCase')) {
+    Assert-ContainsOrdinal $mappingWaitText $marker `
+        'guest exact bounded Explorer menu mapping wait'
+}
+
+$statusModelDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Resolve-V1HostStatus'
+}, $true))
+Assert-Contract ($statusModelDefinitions.Count -eq 1) `
+    'guest must define exactly one strict V1 host status model'
+$statusModelText = $statusModelDefinitions[0].Extent.Text
+foreach ($marker in @(
+        "0 { [ordered]@{ State = 'ready'; Disposition = 'ready'",
+        "1 { [ordered]@{ State = 'starting'; Disposition = 'retry'",
+        "2 { [ordered]@{ State = 'injecting'; Disposition = 'retry'",
+        "4 { [ordered]@{ State = 'failed'; Disposition = 'terminal'",
+        "5 { [ordered]@{ State = 'stopping'; Disposition = 'terminal'",
+        "6 { [ordered]@{ State = 'safety-disabled'; Disposition = 'terminal'",
+        "1062 { [ordered]@{ State = 'service-not-active'; Disposition = 'retry'",
+        'A4SMenuHost: ready', 'A4SMenuHost: stopped',
+        '$stdout = [string]$Execution.Stdout',
+        'if (-not [string]::IsNullOrEmpty([string]$Execution.Stderr))',
+        'Where-Object { [string]$_ -ceq $stdout }')) {
+    Assert-ContainsOrdinal $statusModelText $marker 'guest strict V1 host status model'
+}
+Assert-Contract ($statusModelText.IndexOf('TrimEnd',
+        [StringComparison]::Ordinal) -lt 0) `
+    'guest V1 host status model normalizes rather than exactly validates stdout'
+
+$readinessWaitDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Wait-ForV1HostReadiness'
+}, $true))
+Assert-Contract ($readinessWaitDefinitions.Count -eq 1) `
+    'guest must define exactly one bounded V1 host readiness poll'
+$readinessWaitText = $readinessWaitDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[ValidateRange(1, 64)][int] $MaximumAttempts = 64',
+        '[ValidateRange(10, 1000)][int] $RetryDelayMilliseconds = 250',
+        'for ($attempt = 1; $attempt -le $MaximumAttempts; ++$attempt)',
+        'if ([DateTime]::UtcNow -ge $deadline) { break }',
+        '-AcceptedExitCodes @(0, 1, 2, 4, 5, 6, 1062)',
+        'if ($status.Disposition -ceq ''ready'')',
+        'if ($status.Disposition -ceq ''terminal'')',
+        '$Evidence.Attempts.Add($attemptRecord)',
+        '$Evidence.FinalStatus = $attemptRecord')) {
+    Assert-ContainsOrdinal $readinessWaitText $marker `
+        'guest bounded V1 host readiness poll'
+}
 
 $hostReplacementDefinitions = @($hostAst.FindAll({
     param($node)
@@ -419,6 +512,19 @@ Assert-OrderedMarkers $guestSource @(
     "Write-GuestStage -Ordinal 28 -Stage 'install-v1-checkpoint-starting'",
     "`$installV1Checkpoint = Get-Checkpoint 'install-v1'",
     "Write-GuestStage -Ordinal 29 -Stage 'install-v1-checkpoint-captured'",
+    "Write-GuestStage -Ordinal 30 -Stage 'v1-mapping-wait-starting'",
+    '$v1Mapping = Wait-ForExplorerMenuModule',
+    '-ExpectedPath ([string]$v1Payload.Menu.Path)',
+    "Write-GuestStage -Ordinal 31 -Stage 'v1-mapping-observed'",
+    "Write-GuestStage -Ordinal 32 -Stage 'v1-host-status-poll-starting'",
+    '$v1Readiness = Wait-ForV1HostReadiness',
+    "Write-GuestStage -Ordinal 33 -Stage 'v1-host-status-ready'",
+    "Write-GuestStage -Ordinal 34 -Stage 'v1-ready-mapping-recheck-starting'",
+    '$v1ReadyMapping = Wait-ForExplorerMenuModule',
+    "Write-GuestStage -Ordinal 35 -Stage 'v1-ready-mapping-recheck-completed'",
+    "Write-GuestStage -Ordinal 36 -Stage 'v1-host-exit-starting'",
+    '$v1Exit = Invoke-ExactProcess',
+    "Write-GuestStage -Ordinal 37 -Stage 'v1-host-exit-completed'",
     "Name = 'install-v1'",
     "Name = 'update-v1-to-v2'",
     "Name = 'rollback-v2-to-v1'",
@@ -428,6 +534,16 @@ Assert-OrderedMarkers $guestSource @(
     "State = 'LogicallyUninstalledPhysicalCleanupPendingExplorerExit'",
     "Join-Path `$script:evidenceRoot 'completion.json'") `
     'guest guard, fixed matrix, and completion publication'
+Assert-Contract ([regex]::Matches($guestSource,
+        'MenuPath\s*=\s*\[string\]\$v1(?:Ready)?Mapping\.Modules\[0\]\.Path').Count -eq 2) `
+    'guest mapping stages must publish both exact pre-ready and post-ready DLL paths'
+
+Assert-OrderedMarkers $guestSource @(
+    '$failure = $_',
+    "Write-GuestStage -Ordinal 38 -Stage 'failure-checkpoint-starting'",
+    "`$script:evidence.FailureCheckpoint = Get-Checkpoint 'failure'",
+    "Write-GuestStage -Ordinal 39 -Stage 'failure-checkpoint-captured'") `
+    'guest authenticated failure-checkpoint boundary'
 
 foreach ($hash in @(
         'DF282F8DC18B382B7AC28599294E2A371EF97D01F85AE6F66E9DF6A02ACBC7C2',
@@ -517,8 +633,11 @@ Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 setup-source path contract passed') `
     'shared V1/V2 setup-source resolution was not dynamically exercised by explicit Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
-        'guest PS5 x64 native Toolhelp module snapshot contract passed') `
-    'guest Toolhelp module enumeration and main-module proof were not dynamically exercised by x64 Windows PowerShell 5.1'
+        'guest PS5 x64 bounded native PSAPI module snapshot contract passed') `
+    'guest bounded PSAPI module enumeration and main-module proof were not dynamically exercised by x64 Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 bounded V1 host readiness model contract passed') `
+    'guest strict bounded V1 host readiness model was not dynamically exercised by Windows PowerShell 5.1'
 Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 bounded process timeout contract passed') `
     'guest direct-child timeout/kill/final-wait bound was not dynamically exercised by explicit Windows PowerShell 5.1'
