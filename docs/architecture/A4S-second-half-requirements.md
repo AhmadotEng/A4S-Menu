@@ -26,7 +26,6 @@ Implementation and test procedures are documented in the
 [one-file installer contract](A4S-product-installer.md),
 [performance/stability plan](../testing/A4S-second-half-performance-and-stability.md),
 [current-profile installer plan](../testing/A4S-current-profile-installer-lifecycle.md),
-[legacy Sandbox plan](../testing/A4S-legacy-sandbox-lifecycle.md), and
 [failure-recovery plan](../testing/A4S-failure-recovery.md). These links show
 that the implementation and harnesses exist; the rows below remain pending
 until their required evidence is actually recorded.

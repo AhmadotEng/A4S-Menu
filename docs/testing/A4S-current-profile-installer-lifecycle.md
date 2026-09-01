@@ -7,8 +7,8 @@ the product build, and this document does not claim that it has been executed.
 
 Frozen-V1 install/update/rollback is intentionally excluded here. V1 predates
 the lifecycle sequence/token ownership protocol, so it is only verified
-read-only in the current profile. Its mutation matrix belongs in the disposable
-[Windows Sandbox procedure](A4S-legacy-sandbox-lifecycle.md).
+read-only in the current profile. Its mutation matrix remains pending and is
+not assigned to another execution environment by this procedure.
 
 ## Safe starting state
 

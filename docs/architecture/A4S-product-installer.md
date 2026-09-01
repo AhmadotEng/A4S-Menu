@@ -207,5 +207,6 @@ run.
 
 The guarded live current-profile procedure is documented in
 [A4S-current-profile-installer-lifecycle.md](../testing/A4S-current-profile-installer-lifecycle.md).
-Frozen-V1 mutation and V1-to-V2 rollback are confined to the disposable
-[Windows Sandbox matrix](../testing/A4S-legacy-sandbox-lifecycle.md).
+Frozen-V1 mutation and V1-to-V2 rollback remain unqualified. They are outside
+the current-profile procedure, and this plan does not authorize an alternate
+execution environment for them.

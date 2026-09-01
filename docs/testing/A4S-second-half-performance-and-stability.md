@@ -456,7 +456,6 @@ stabilizes:
 - installation, update, repair, rollback, uninstall, and crash-loop guard.
 
 Installer and recovery execution are specified separately in the
-[current-profile lifecycle](A4S-current-profile-installer-lifecycle.md),
-[legacy Sandbox lifecycle](A4S-legacy-sandbox-lifecycle.md), and
+[current-profile lifecycle](A4S-current-profile-installer-lifecycle.md) and
 [failure-recovery plan](A4S-failure-recovery.md). The presence of those tools
 does not change any pending status above.

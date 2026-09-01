@@ -155,15 +155,17 @@ binaries; they do not qualify the current second-half build.
 The second-half source and qualification harnesses are implemented. The build
 gate covers product/package boundaries, ABI4 native lifecycle, cache
 publication, lazy search, asynchronous Programs enumeration, trace conversion,
-performance-tool safety, installer transactions, legacy-Sandbox contracts, and
-failure-recovery contracts. Live performance, current-profile installation,
-legacy upgrade/rollback, Windows input/session transitions, DPI/monitor rows,
-and controlled Explorer-failure tests remain pending until their exact reviewed
-build and evidence are recorded. See:
+performance-tool safety, installer transactions, and failure-recovery
+contracts. Live performance, current-profile installation, legacy
+upgrade/rollback, Windows input/session transitions, DPI/monitor rows, and
+controlled Explorer-failure tests remain pending until their exact reviewed
+build and evidence are recorded. The authoritative execution boundary and
+step-by-step audit are recorded in
+[docs/architecture/A4S-plan-2-execution-boundary.md](docs/architecture/A4S-plan-2-execution-boundary.md).
+See also:
 
 - [docs/testing/A4S-second-half-performance-and-stability.md](docs/testing/A4S-second-half-performance-and-stability.md)
 - [docs/testing/A4S-current-profile-installer-lifecycle.md](docs/testing/A4S-current-profile-installer-lifecycle.md)
-- [docs/testing/A4S-legacy-sandbox-lifecycle.md](docs/testing/A4S-legacy-sandbox-lifecycle.md)
 - [docs/testing/A4S-failure-recovery.md](docs/testing/A4S-failure-recovery.md)
 
 The measured visual and interaction contract is in

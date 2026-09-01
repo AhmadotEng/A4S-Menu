@@ -442,9 +442,9 @@ foreach ($currentMutation in @("-Label 'install-v2-silent'",
     Assert-Contract ($following.IndexOf('-StateChanging', [StringComparison]::Ordinal) -ge 0) `
         "current V2 mutation is not token-qualified: $currentMutation"
 }
-foreach ($marker in @('DeferredToDisposableProfile',
-        'Frozen V1 cannot participate in lifecycle token/sequence ownership')) {
-    Assert-ContainsOrdinal $mainSource $marker "legacy disposable-profile deferral omits '$marker'"
+foreach ($marker in @('NotRunInCurrentProfile',
+        'Frozen V1 cannot participate in lifecycle token/sequence ownership; no alternate execution environment is authorized.')) {
+    Assert-ContainsOrdinal $mainSource $marker "legacy current-profile exclusion omits '$marker'"
 }
 
 # Recovery re-reads and hashes the immutable manifest before taking a stable

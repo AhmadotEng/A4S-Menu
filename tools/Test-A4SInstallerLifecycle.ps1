@@ -6,8 +6,9 @@ Runs the destructive, live per-user installer lifecycle matrix and writes JSON e
 This tool requires a clean installer-owned starting state, verifies frozen 1.0
 read-only, exercises current 1.1 install/repair/uninstall, and intentionally
 leaves 1.1 installed but quiescent. Frozen-V1 mutation and V1-to-V2
-upgrade/rollback are deferred to a disposable profile because V1 predates the
-cooperative sequence/token protocol. It never passes --restart-explorer. Every pre-existing user-owned
+upgrade/rollback are outside this current-profile procedure because V1
+predates the cooperative sequence/token protocol. They remain unqualified. It
+never passes --restart-explorer. Every pre-existing user-owned
 value below HKCU\Software\A4SMenu is restored byte-for-byte after the final V2
 registration commits, including Config, Menu, InstallPath, and Enabled. The
 original DataCache.db bytes (or absence) are also restored.
@@ -3288,10 +3289,10 @@ try {
 
     # Frozen V1 predates the cooperative lifecycle-token protocol and is
     # deliberately read-only on a real user profile. Upgrade and rollback
-    # qualification is deferred to a disposable Sandbox/VM profile.
+    # qualification has not been run and has no alternate authorized path.
     $script:evidence.LegacyUpgradeRollback = [ordered]@{
-        Status = 'DeferredToDisposableProfile'
-        Reason = 'Frozen V1 cannot participate in lifecycle token/sequence ownership.'
+        Status = 'NotRunInCurrentProfile'
+        Reason = 'Frozen V1 cannot participate in lifecycle token/sequence ownership; no alternate execution environment is authorized.'
         FrozenV1VerifiedReadOnly = $true
     }
     $knownMenuHashes = @($v2Payload.Menu.Sha256)
