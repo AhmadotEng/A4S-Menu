@@ -361,6 +361,87 @@ function Write-Utf8NoBomAtomic {
     [IO.File]::Move($temporary, $Path)
 }
 
+function Publish-HostResultReplacement {
+    param(
+        [Parameter(Mandatory)][string] $StagedPath,
+        [Parameter(Mandatory)][string] $DestinationPath,
+        [scriptblock] $PostPublishValidation
+    )
+
+    $stagedFull = [IO.Path]::GetFullPath($StagedPath)
+    $destinationFull = [IO.Path]::GetFullPath($DestinationPath)
+    $stagedDirectory = [IO.Path]::GetDirectoryName($stagedFull)
+    $destinationDirectory = [IO.Path]::GetDirectoryName($destinationFull)
+    if (-not $stagedDirectory.Equals($destinationDirectory,
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Host-result replacement requires a same-directory staged file.'
+    }
+    if (-not [IO.File]::Exists($stagedFull) -or
+        -not [IO.File]::Exists($destinationFull)) {
+        throw 'Host-result replacement requires existing staged and destination files.'
+    }
+
+    $stagedItem = Get-Item -LiteralPath $stagedFull -Force
+    $expectedLength = [long]$stagedItem.Length
+    $expectedSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $stagedFull).Hash.ToUpperInvariant()
+    $backupPath = Join-Path $destinationDirectory `
+        (([IO.Path]::GetFileName($destinationFull)) + ".backup-$PID-$([Guid]::NewGuid().ToString('N'))")
+    $rollbackDiscardPath = Join-Path $destinationDirectory `
+        (([IO.Path]::GetFileName($destinationFull)) + ".rollback-discard-$PID-$([Guid]::NewGuid().ToString('N'))")
+    $replaced = $false
+    $committed = $false
+    $rollbackCompleted = $false
+    try {
+        # .NET Framework's three-argument Replace overload rejects a null
+        # backup path. Keep a real same-directory backup until the published
+        # bytes have been checked, so every supported Windows PowerShell host
+        # has an explicit rollback source.
+        [IO.File]::Replace($stagedFull, $destinationFull, $backupPath, $true)
+        $replaced = $true
+        $publishedItem = Get-Item -LiteralPath $destinationFull -Force
+        $publishedSha256 = (Get-FileHash -Algorithm SHA256 `
+            -LiteralPath $destinationFull).Hash.ToUpperInvariant()
+        if ([long]$publishedItem.Length -ne $expectedLength -or
+            $publishedSha256 -cne $expectedSha256) {
+            throw 'Published host-result bytes do not match the staged record.'
+        }
+        if ($PostPublishValidation) { & $PostPublishValidation }
+        $committed = $true
+    }
+    catch {
+        $publishFailure = $_
+        if ($replaced) {
+            try {
+                if ([IO.File]::Exists($destinationFull)) {
+                    [IO.File]::Replace($backupPath, $destinationFull,
+                        $rollbackDiscardPath, $true)
+                }
+                else {
+                    [IO.File]::Move($backupPath, $destinationFull)
+                }
+                $rollbackCompleted = $true
+                if ([IO.File]::Exists($rollbackDiscardPath)) {
+                    [IO.File]::Delete($rollbackDiscardPath)
+                }
+            }
+            catch {
+                throw "Host-result publication failed: $($publishFailure.Exception.Message) Rollback also failed: $($_.Exception.Message)"
+            }
+        }
+        throw $publishFailure
+    }
+    finally {
+        if ($committed -and [IO.File]::Exists($backupPath)) {
+            [IO.File]::Delete($backupPath)
+        }
+        if ([IO.File]::Exists($stagedFull)) { [IO.File]::Delete($stagedFull) }
+        if (($committed -or $rollbackCompleted) -and
+            [IO.File]::Exists($rollbackDiscardPath)) {
+            [IO.File]::Delete($rollbackDiscardPath)
+        }
+    }
+}
+
 function Read-Utf8JsonSnapshot {
     param(
         [Parameter(Mandatory)][string] $Path,
@@ -432,7 +513,53 @@ function Assert-ContractModel {
             -Parent 'C:\Qualification\Repo')) {
         throw 'Equal paths must be treated as overlapping mappings.'
     }
-    Write-Host 'A4S legacy Sandbox host in-memory contract passed.'
+    $replacementRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ('A4SHostResultReplacement-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($replacementRoot) | Out-Null
+    try {
+        $destination = Join-Path $replacementRoot 'host-result.json'
+        $staged = Join-Path $replacementRoot 'host-result.json.started'
+        [IO.File]::WriteAllText($destination, '{"state":"before"}',
+            [Text.UTF8Encoding]::new($false))
+        [IO.File]::WriteAllText($staged, '{"state":"after"}',
+            [Text.UTF8Encoding]::new($false))
+        Publish-HostResultReplacement -StagedPath $staged `
+            -DestinationPath $destination
+        if ([IO.File]::ReadAllText($destination) -cne '{"state":"after"}' -or
+            [IO.File]::Exists($staged) -or
+            @(Get-ChildItem -LiteralPath $replacementRoot -Force | Where-Object {
+                $_.Name -match '\.(?:backup-|rollback-discard-)'
+            }).Count -ne 0) {
+            throw 'The existing-file host-result replacement contract failed.'
+        }
+        [IO.File]::WriteAllText($staged, '{"state":"must-rollback"}',
+            [Text.UTF8Encoding]::new($false))
+        $rollbackObserved = $false
+        try {
+            Publish-HostResultReplacement -StagedPath $staged `
+                -DestinationPath $destination -PostPublishValidation {
+                    throw 'synthetic post-publication validation failure'
+                }
+        }
+        catch {
+            $rollbackObserved = $_.Exception.Message -match
+                'synthetic post-publication validation failure'
+        }
+        if (-not $rollbackObserved -or
+            [IO.File]::ReadAllText($destination) -cne '{"state":"after"}' -or
+            [IO.File]::Exists($staged) -or
+            @(Get-ChildItem -LiteralPath $replacementRoot -Force | Where-Object {
+                $_.Name -match '\.(?:backup-|rollback-discard-)'
+            }).Count -ne 0) {
+            throw 'The failed host-result replacement did not restore and clean the prior record.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($replacementRoot)) {
+            [IO.Directory]::Delete($replacementRoot, $true)
+        }
+    }
+    Write-Host "A4S legacy Sandbox host in-memory replacement contract passed under Windows PowerShell $($PSVersionTable.PSVersion)."
 }
 
 if ($ContractSelfTest) {
@@ -616,13 +743,6 @@ $hostResultPath = Join-Path $controlDirectory 'host-result.json'
 Write-Utf8NoBomAtomic -Path $hostResultPath `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
 
-$sandboxProcess = Start-Process -FilePath $sandboxCommand.Source `
-    -ArgumentList ('"' + $configurationPath + '"') -PassThru
-$launchRecord.SandboxProcessId = $sandboxProcess.Id
-$startedHostResult = "$hostResultPath.started"
-Write-Utf8NoBomAtomic -Path $startedHostResult `
-    -Text ($launchRecord | ConvertTo-Json -Depth 100)
-[IO.File]::Replace($startedHostResult, $hostResultPath, $null)
 $completionPath = Join-Path $resultDirectory 'completion.json'
 $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
 $processExitObservedUtc = $null
@@ -631,6 +751,15 @@ $completionSnapshot = $null
 $guestEvidencePath = Join-Path $resultDirectory 'evidence.json'
 $hostFailure = $null
 try {
+    $sandboxProcess = Start-Process -FilePath $sandboxCommand.Source `
+        -ArgumentList ('"' + $configurationPath + '"') -PassThru
+    $launchRecord.SandboxProcessId = $sandboxProcess.Id
+    $startedHostResult = "$hostResultPath.started"
+    Write-Utf8NoBomAtomic -Path $startedHostResult `
+        -Text ($launchRecord | ConvertTo-Json -Depth 100)
+    Publish-HostResultReplacement -StagedPath $startedHostResult `
+        -DestinationPath $hostResultPath
+
     while ([DateTime]::UtcNow -lt $deadline) {
         if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
             try {
@@ -779,7 +908,8 @@ $launchRecord.Succeeded = $null -eq $hostFailure -and
 $updatedHostResult = "$hostResultPath.updated"
 Write-Utf8NoBomAtomic -Path $updatedHostResult `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
-[IO.File]::Replace($updatedHostResult, $hostResultPath, $null)
+Publish-HostResultReplacement -StagedPath $updatedHostResult `
+    -DestinationPath $hostResultPath
 
 if ($null -ne $hostFailure) {
     throw "Sandbox qualification host validation failed: $($hostFailure.Exception.Message) Evidence: $hostResultPath"

@@ -57,6 +57,24 @@ $guestSource = [IO.File]::ReadAllText($guestPath)
 $hostAst = Parse-Script $hostPath
 $guestAst = Parse-Script $guestPath
 
+$hostReplacementDefinitions = @($hostAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Publish-HostResultReplacement'
+}, $true))
+Assert-Contract ($hostReplacementDefinitions.Count -eq 1) `
+    'host must define exactly one Publish-HostResultReplacement helper'
+$hostReplacementText = $hostReplacementDefinitions[0].Extent.Text
+foreach ($replacementMarker in @('$backupPath', '$rollbackDiscardPath',
+        '[IO.File]::Replace($stagedFull, $destinationFull, $backupPath, $true)',
+        '[IO.File]::Replace($backupPath, $destinationFull,')) {
+    Assert-ContainsOrdinal $hostReplacementText $replacementMarker `
+        'host-result transactional replacement'
+}
+Assert-Contract (-not [regex]::IsMatch($hostSource,
+        '(?s)\[IO\.File\]::Replace\([^\)]{0,500}\$null')) `
+    'host runner regressed to a null File.Replace backup path'
+
 foreach ($entry in @(
         [ordered]@{ Ast = $hostAst; Name = 'Read-Utf8JsonSnapshot'; Label = 'host' },
         [ordered]@{ Ast = $guestAst; Name = 'Read-Utf8JsonSnapshot'; Label = 'guest' },
@@ -110,6 +128,13 @@ Assert-OrderedMarkers $hostSource @(
     '[IO.Directory]::CreateDirectory($resultDirectory)',
     'Start-Process -FilePath $sandboxCommand.Source',
     '$hostAfter = Get-HostProductSnapshot') 'host opt-in and before/after boundary'
+Assert-OrderedMarkers $hostSource @(
+    '$hostFailure = $null',
+    'try {',
+    '$sandboxProcess = Start-Process',
+    'Publish-HostResultReplacement -StagedPath $startedHostResult',
+    'catch {',
+    '$hostFailure = $_') 'post-launch failure capture boundary'
 
 foreach ($marker in @(
         '<vGPU>Disable</vGPU>',
@@ -216,8 +241,19 @@ Assert-Contract ($guestSource.IndexOf('NetworkInterfaceType]::Tunnel',
         [StringComparison]::Ordinal) -lt 0) `
     'guest network guard excludes tunnel interfaces from the fail-closed check'
 
-& $hostPath -ContractSelfTest
 & $guestPath -ContractSelfTest
+$windowsPowerShell = Join-Path $env:SystemRoot `
+    'System32\WindowsPowerShell\v1.0\powershell.exe'
+Assert-Contract (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf) `
+    'canonical Windows PowerShell 5.1 executable is missing'
+$hostContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
+    -ExecutionPolicy Bypass -File $hostPath -ContractSelfTest 2>&1)
+$hostContractExitCode = $LASTEXITCODE
+Assert-Contract ($hostContractExitCode -eq 0) `
+    "host in-memory replacement contract failed under Windows PowerShell 5.1: $($hostContractOutput -join ' ')"
+Assert-Contract (($hostContractOutput -join ' ') -match
+        'replacement contract passed under Windows PowerShell 5\.1\.') `
+    'host existing-file replacement was not dynamically exercised by explicit Windows PowerShell 5.1'
 
 # Default invocation must fail before it can create evidence or launch anything.
 $defaultRejected = $false
