@@ -23,69 +23,58 @@ function Assert-Match {
     }
 }
 
-$threadMatch = [Regex]::Match(
-    $dllSource,
-    '(?s)static DWORD WINAPI A4SKeyboardThreadProc\s*\(.*?\n\}\s*\n\s*static void ReleaseFinishedA4SKeyboardThread')
-if (-not $threadMatch.Success) {
-    throw 'The dedicated A4S keyboard-owner thread could not be isolated.'
+if ($dllSource -match '\b(?:WH_KEYBOARD_LL|KBDLLHOOKSTRUCT|HookA4SKeyboard)\b') {
+    throw 'A4S must not intercept or suppress physical keyboard events.'
 }
-Assert-Match $threadMatch.Value 'SetWindowsHookEx\s*\(\s*WH_KEYBOARD_LL' `
-    'WH_KEYBOARD_LL is not installed by the dedicated owner thread.'
-Assert-Match $threadMatch.Value 'while\s*\(\s*GetMessage\(' `
-    'The keyboard-owner thread is not a blocked message loop.'
-foreach ($command in @('A4S_KEYBOARD_SUSPEND', 'A4S_KEYBOARD_REFRESH', 'A4S_KEYBOARD_STOP')) {
-    Assert-Match $threadMatch.Value ([Regex]::Escape($command)) `
-        "The keyboard-owner thread does not handle $command."
+
+$installMatch = [Regex]::Match(
+    $dllSource,
+    '(?s)static bool InstallA4SNativeHotkeyHook\s*\(.*?\n\}\s*\n\s*static bool RefreshA4SNativeHotkeyHook')
+if (-not $installMatch.Success) {
+    throw 'The A4S native shell-hotkey installation transaction could not be isolated.'
+}
+foreach ($pattern in @(
+    'FindWindow\(L"ApplicationManager_ImmersiveShellWindow",NULL\)',
+    'GetWindowThreadProcessId\(shellWindow,&shellProcessId\)',
+    'shellProcessId!=GetCurrentProcessId\(\)',
+    'SetWindowsHookEx\(WH_GETMESSAGE,HookA4SNativeHotkey'
+)) {
+    Assert-Match $installMatch.Value $pattern `
+        'The native shell-hotkey hook is not bound to the validated Explorer shell thread.'
 }
 
 $callbackMatch = [Regex]::Match(
     $dllSource,
-    '(?s)static LRESULT CALLBACK HookA4SKeyboard\s*\([^;]+?\)\s*\r?\n\{.*?\r?\n\}\s*\r?\n#endif')
+    '(?s)static LRESULT CALLBACK HookA4SNativeHotkey\s*\([^;]+?\)\s*\r?\n\{.*?\r?\n\}\s*\r?\n#endif')
 if (-not $callbackMatch.Success) {
-    throw 'The A4S low-level keyboard callback could not be isolated.'
+    throw 'The A4S native shell-hotkey callback could not be isolated.'
 }
 $callback = $callbackMatch.Value
-$chainIndex = $callback.LastIndexOf('CallNextHookEx', [StringComparison]::Ordinal)
-$postIndex = $callback.LastIndexOf('PostMessage', [StringComparison]::Ordinal)
-if ($chainIndex -lt 0 -or $postIndex -lt 0 -or $chainIndex -gt $postIndex) {
-    throw 'The keyboard callback must chain the release before deciding to post/claim it.'
+$queueIndex = $callback.IndexOf('QueueA4SToggle', [StringComparison]::Ordinal)
+$nullIndex = $callback.IndexOf('message->message=WM_NULL', [StringComparison]::Ordinal)
+if ($queueIndex -lt 0 -or $nullIndex -lt 0 -or $queueIndex -gt $nullIndex) {
+    throw 'The shell hotkey must remain native unless the A4S toggle was queued first.'
 }
-if ($callback -match '(?i)\b(?:new|malloc|calloc|realloc|RegOpen|CreateFile|ShellExecute|SendMessage)\b') {
-    throw 'The keyboard callback contains an allocation, registry, file, shell, or synchronous-send operation.'
+if ($callback -match '(?i)\b(?:new|malloc|calloc|realloc|RegOpen|CreateFile|ShellExecute|SendMessage|SendInput|keybd_event)\b') {
+    throw 'The shell-hotkey callback contains allocation, I/O, shell, synchronous-send, or input-injection work.'
 }
-Assert-Match $callback 'ReconcileMissingA4SWinKeyUps' `
-    'The callback no longer self-heals a missed Windows-key release.'
-Assert-Match $callback 'route\.claimLoneRelease\s*&&\s*downstream==0' `
-    'A downstream hook claim no longer suppresses the A4S lone-key toggle.'
-Assert-Match $dllSource 'InitializeA4SPhysicalKeyState[\s\S]*GetAsyncKeyState' `
-    'The fixed physical-key state is not seeded for pre-held keys.'
-Assert-Match $dllSource 'A4S_TEST_PREHELD_WIN_UP[\s\S]*must remain native on release' `
-    'The compile-time contract no longer covers a pre-held Windows key.'
-Assert-Match $dllSource 'A4S_TEST_MODIFIED_UP[\s\S]*any pre-held key must keep the gesture native' `
-    'The compile-time contract no longer covers a pre-held nonmodifier key.'
-Assert-Match $dllSource 'A4S_TEST_RECOVERED_WIN_STATE[\s\S]*lost Windows-key-up must be self-healed' `
-    'The compile-time contract no longer covers lost Windows-key-up recovery.'
-
-$startMatch = [Regex]::Match(
-    $dllSource,
-    '(?s)static bool StartA4SKeyboardThread\s*\(.*?\r?\n\}\s*\r?\n\s*static bool RefreshA4SKeyboardHook')
-if (-not $startMatch.Success) {
-    throw 'The keyboard-owner startup handshake could not be isolated.'
+if ($callback -match '\breturn\s+1\s*;') {
+    throw 'The shell-hotkey hook must never suppress a physical keyboard event.'
 }
-foreach ($pattern in @(
-    'WaitForSingleObject\(g_A4SKeyboardOperationEvent,A4S_KEYBOARD_HANDSHAKE_TIMEOUT\)',
-    'InterlockedExchange\(&g_A4SKeyboardAcceptInput,0\)',
-    'PostThreadMessage\(g_A4SKeyboardThreadId,A4S_KEYBOARD_STOP',
-    'ReleaseFinishedA4SKeyboardThread\(\)',
-    'SetLastError\(failure\)'
-)) {
-    Assert-Match $startMatch.Value $pattern `
-        'Owner-thread install timeout/failure no longer gates input and attempts bounded cleanup.'
-}
-Assert-Match $dllSource 'static bool RefreshA4SKeyboardHook[\s\S]*A4S_KEYBOARD_HANDSHAKE_TIMEOUT' `
-    'Keyboard refresh no longer has a bounded completion handshake.'
-Assert-Match $dllSource 'static bool StopA4SKeyboardThread[\s\S]*deadline=GetTickCount64\(\)\+A4S_KEYBOARD_HANDSHAKE_TIMEOUT' `
-    'Keyboard stop no longer shares one bounded cleanup deadline.'
+Assert-Match $callback 'code==HC_ACTION\s*&&\s*wParam==PM_REMOVE\s*&&\s*IsA4SInputActive\(\)' `
+    'The callback can consume a peeked, suspended, or inactive shell message.'
+Assert-Match $callback 'IsA4SNativeWindowsHotkey\(message->message,message->wParam,[\s\S]*message->lParam\)\s*&&\s*QueueA4SToggle\(g_TaskBar,A4S_KEYBOARD_TOGGLE\)' `
+    'The callback does not narrowly match and queue the existing lone-Windows-key shell hotkey.'
+Assert-Match $callback 'CallNextHookEx\(g_A4SNativeHotkeyHook,code,wParam,lParam\)' `
+    'The shell-hotkey hook no longer chains every message.'
+Assert-Match $dllSource 'static_assert\(IsA4SNativeWindowsHotkey[\s\S]*shell lone-Windows-key hotkey must toggle A4S' `
+    'The compile-time contract no longer accepts the shell lone-Windows-key message.'
+Assert-Match $dllSource 'Ctrl\+Esc must remain native' `
+    'The compile-time contract no longer rejects Ctrl+Esc.'
+Assert-Match $dllSource 'Win\+R must remain native' `
+    'The compile-time contract no longer rejects Win+R.'
+Assert-Match $dllSource 'static bool RefreshA4SNativeHotkeyHook[\s\S]*RemoveA4SNativeHotkeyHook\(\)[\s\S]*InstallA4SNativeHotkeyHook\(\)' `
+    'Shell-hotkey recovery no longer replaces the targeted message hook.'
 Assert-Match $dllSource 'A4S_MENU_COMMAND_SUSPEND_INPUT[\s\S]*InterlockedExchange\(&g_A4SInputSuspended,1\)' `
     'Suspend no longer latches the taskbar-side stale-toggle gate.'
 Assert-Match $dllSource 'command==A4S_COMMAND_TOGGLE\s*&&\s*activationEnabled' `
@@ -223,4 +212,4 @@ if (Test-AbnormalExitCounted $true 1 $true $false) {
     throw 'An OS session-ending Explorer exit was counted.'
 }
 
-Write-Host 'Validated dedicated keyboard-hook ownership, downstream release ordering, pre-held/self-healing key state, transient force-close, independent session/power generation reconciliation, and rolling crash-guard boundaries.'
+Write-Host 'Validated targeted shell-hotkey routing without physical-key suppression, native fallback ordering, transient force-close, independent session/power generation reconciliation, and rolling crash-guard boundaries.'

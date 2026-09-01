@@ -9,35 +9,26 @@ those rows still require a fresh Explorer and the release test matrix.
 The native taskbar Start button, a lone left or right Windows-key gesture, and
 the host `--toggle` command all queue `A4S_MENU_COMMAND_TOGGLE` to the validated
 taskbar thread. That thread is the only place that calls `ToggleStartMenu`.
-An input event is suppressed only after its toggle command has been queued.
-If initialization is incomplete, the taskbar is invalid, or queuing fails, the
-event passes through and Windows' native Start path remains available.
+No physical keyboard event is intercepted or suppressed. If initialization is
+incomplete, the taskbar is invalid, or queuing fails, Windows' native Start path
+remains available.
 
-The DLL creates a dedicated blocked message-loop thread and installs
-`WH_KEYBOARD_LL` on that thread only as the final part of the product activation
-transaction. Install, suspend, refresh, and stop requests use explicit events
-and a two-second bounded handshake; the Explorer taskbar thread never owns or
-pumps the low-level hook. A timeout immediately gates the callback, fails or
-disarms activation, and leaves native Start as the fallback. The pinned DLL is
-not hot-unloaded if a timed-out owner thread cannot be proven stopped.
+Explorer's existing TwinUI registration classifies a bare left or right
+Windows-key gesture and posts thread hotkey ID 1 on the thread that owns
+`ApplicationManager_ImmersiveShellWindow`. The DLL installs a thread-specific
+`WH_GETMESSAGE` hook on that validated Explorer thread without unregistering or
+replacing TwinUI's hotkeys. It handles only a removed `WM_HOTKEY` whose ID is 1,
+modifier field is exactly `MOD_WIN`, and virtual-key field is zero. The hook
+first queues `A4S_MENU_COMMAND_TOGGLE`; only after that succeeds does it replace
+the shell message with `WM_NULL`. A queue failure leaves the original message
+untouched, so native Start handles it.
 
-Windows-key down is observed but passed through. Any other key-down while
-either Windows key is held marks the gesture as a chord. The corresponding
-Windows-key release is passed through for a chord and considered for A4S only
-for an unmatched lone gesture. For that lone release, A4S first calls the next
-hook; it queues and claims the release only if downstream returned zero and the
-taskbar post succeeded. Downstream hooks therefore always see a matching
-Windows-key release and cannot be left with a stuck Windows-key-down state.
-Therefore Win+R, Win+E, Win+L, Win+X, Win+Tab, modified gestures, and future
-chords do not use the A4S toggle path.
-
-The owner thread seeds and maintains a fixed 256-key bitmap without allocation.
-A Windows key already held when the hook starts is ineligible for a lone-key
-toggle. Before each event, asynchronous state reconciles a tracked Windows key
-whose release was lost; a later key or Windows-key-down therefore self-heals
-instead of inheriting a stale chord. The callback only reads/updates this fixed
-state, chains, and posts at most one message. It performs no registry, file,
-COM, shell discovery, allocation, or synchronous taskbar call.
+Because Windows retains ownership of classification and every real key down/up,
+left/right Windows keys, autorepeat, pre-held keys, Win+R, Win+E, Win+L, Win+X,
+Win+Tab, accessibility shortcuts, and future chords keep native input semantics.
+The A4S callback does not allocate, access the registry or filesystem, invoke
+the shell, synchronously message the taskbar, inject input, or return a
+nonzero keyboard-hook result.
 
 ## Focus and session behavior
 
@@ -61,17 +52,17 @@ sends a refresh only when both independent latches are interactive.
 Lock, logoff, remote disconnect, and suspend queue `SUSPEND_INPUT`. The product
 UI thread synchronously hides root, search, submenu, context, and power popups,
 cancels context results, and queues their non-reentrant close path without
-activating the taskbar or restoring another foreground window;
-the keyboard owner then cancels partial state and stops accepting input. A
-taskbar-side suspended latch rejects a toggle already queued by a racing
-keyboard or Start-button callback, and the host rejects explicit toggles while
+activating the taskbar or restoring another foreground window. The suspended
+latch makes the shell-hotkey callback pass through natively. A taskbar-side
+suspended latch rejects a toggle already queued by a racing shell-hotkey or
+Start-button callback, and the host rejects explicit toggles while
 the interactive desktop is suspended.
 Unlock, logon, remote connect, and resume recompute the combined state and queue
 `REFRESH_INPUT` only after both latches are interactive. Refresh repeats the
-transient cancellation and replaces the low-level hook on its owner thread.
-If any bounded handshake fails, the DLL logically disarms all activation
-callbacks and reports the inert state to the host. Explorer process exit
-remains the authoritative reconnect boundary; no polling timer is added.
+transient cancellation and revalidates/replaces the targeted shell-message
+hook. If rebinding fails, the DLL logically disarms all activation callbacks
+and reports the inert state to the host. Explorer process exit remains the
+authoritative reconnect boundary; no polling timer is added.
 
 ## Crash-loop fail-safe
 
@@ -121,9 +112,10 @@ latch and begins a fresh validated connection. Installer `--update`, automatic
 repair, install, and rollback preserve the latch. Reset is fail-closed: a mutex,
 registry-open, or registry-deletion failure does not clear the in-memory latch.
 
-The key classifier, pre-held modifier rule, and rolling crash-window transitions
-have compile-time tests. Direct A4S product builds compile the dedicated owner
-thread and host generation reconciliation with warning-as-error. The
+The exact shell-hotkey predicate, native shortcut exclusions, and rolling
+crash-window transitions have compile-time/source-gate tests. Direct A4S
+product builds compile shell-message routing and host generation reconciliation
+with warning-as-error. The
 non-injecting product gate additionally proves that ABI3 is rejected and ABI4
 is accepted. Live verification must still cover lone-key open/close,
 every named Windows shortcut, focus dismissal, lock/unlock, suspend/resume,

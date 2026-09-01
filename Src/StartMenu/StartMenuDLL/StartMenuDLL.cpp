@@ -77,126 +77,33 @@ static bool g_bA4SQueuedStartLeftCapture;
 static const LPARAM A4S_MOUSE_TOGGLE=0x4134534D; // "A4SM"
 static const LPARAM A4S_KEYBOARD_TOGGLE=0x4134534B; // "A4SK"
 #ifdef A4S_PRODUCT
-static HHOOK g_A4SKeyboardHook;
-static HANDLE g_A4SKeyboardThread;
-static HANDLE g_A4SKeyboardOperationEvent;
-static DWORD g_A4SKeyboardThreadId;
-static volatile LONG g_A4SKeyboardOperationResult=ERROR_IO_PENDING;
-static volatile LONG g_A4SKeyboardAcceptInput;
-static const UINT A4S_KEYBOARD_SUSPEND=WM_APP+0x4A1;
-static const UINT A4S_KEYBOARD_REFRESH=WM_APP+0x4A2;
-static const UINT A4S_KEYBOARD_STOP=WM_APP+0x4A3;
-static const DWORD A4S_KEYBOARD_HANDSHAKE_TIMEOUT=2000;
+static HHOOK g_A4SNativeHotkeyHook;
+static const int A4S_NATIVE_WINDOWS_HOTKEY_ID=1;
 
-struct A4SPhysicalKeyState
+constexpr UINT A4SHotkeyModifiers(LPARAM data)
 {
-	DWORD bits[8];
-	UINT downCount;
-};
-
-struct A4SWinKeyState
-{
-	bool leftDown;
-	bool rightDown;
-	bool leftChorded;
-	bool rightChorded;
-};
-
-struct A4SWinKeyRoute
-{
-	A4SWinKeyState state;
-	bool claimLoneRelease;
-};
-
-// This state machine is deliberately independent of shell implementation
-// details. A Windows-key down is observed but never swallowed. Any other key
-// pressed while it is held permanently marks that gesture as a chord. Only an
-// unmatched Windows-key release can be claimed by A4S; therefore Win+R/E/L/X,
-// Win+Tab, accessibility chords, and future Windows shortcuts remain native.
-constexpr A4SWinKeyRoute RouteA4SWinKey(A4SWinKeyState state, UINT virtualKey,
-	bool keyDown, bool anotherKeyAlreadyDown)
-{
-	A4SWinKeyRoute result={state,false};
-	const bool left=virtualKey==VK_LWIN;
-	const bool right=virtualKey==VK_RWIN;
-	if (left || right)
-	{
-		bool &down=left?result.state.leftDown:result.state.rightDown;
-		bool &chorded=left?result.state.leftChorded:result.state.rightChorded;
-		bool &otherDown=left?result.state.rightDown:result.state.leftDown;
-		bool &otherChorded=left?result.state.rightChorded:result.state.leftChorded;
-		if (keyDown)
-		{
-			if (!down)
-			{
-				down=true;
-				chorded=anotherKeyAlreadyDown || otherDown;
-				if (otherDown)
-					otherChorded=true;
-			}
-		}
-		else
-		{
-			result.claimLoneRelease=down && !chorded && !otherDown;
-			down=false;
-			chorded=false;
-		}
-	}
-	else if (keyDown)
-	{
-		if (result.state.leftDown)
-			result.state.leftChorded=true;
-		if (result.state.rightDown)
-			result.state.rightChorded=true;
-	}
-	return result;
+	return static_cast<UINT>(static_cast<ULONG_PTR>(data)&0xFFFFu);
 }
 
-constexpr A4SWinKeyState A4S_EMPTY_WIN_KEY_STATE={false,false,false,false};
-constexpr A4SWinKeyRoute A4S_TEST_LONE_DOWN=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_LWIN,true,false);
-constexpr A4SWinKeyRoute A4S_TEST_LONE_UP=RouteA4SWinKey(A4S_TEST_LONE_DOWN.state,VK_LWIN,false,false);
-static_assert(A4S_TEST_LONE_UP.claimLoneRelease,"a lone Windows key must toggle A4S");
-constexpr bool PreservesA4SWinChord(UINT virtualKey)
+constexpr UINT A4SHotkeyVirtualKey(LPARAM data)
 {
-	const A4SWinKeyRoute winDown=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_LWIN,true,false);
-	const A4SWinKeyRoute chordDown=RouteA4SWinKey(winDown.state,virtualKey,true,false);
-	return !RouteA4SWinKey(chordDown.state,VK_LWIN,false,false).claimLoneRelease;
+	return static_cast<UINT>((static_cast<ULONG_PTR>(data)>>16)&0xFFFFu);
 }
-static_assert(PreservesA4SWinChord('R'),"Win+R must remain native");
-static_assert(PreservesA4SWinChord('E'),"Win+E must remain native");
-static_assert(PreservesA4SWinChord('L'),"Win+L must remain native");
-static_assert(PreservesA4SWinChord('X'),"Win+X must remain native");
-static_assert(PreservesA4SWinChord(VK_TAB),"Win+Tab must remain native");
-constexpr A4SWinKeyRoute A4S_TEST_MODIFIED_DOWN=RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_RWIN,true,true);
-constexpr A4SWinKeyRoute A4S_TEST_MODIFIED_UP=RouteA4SWinKey(A4S_TEST_MODIFIED_DOWN.state,VK_RWIN,false,false);
-static_assert(!A4S_TEST_MODIFIED_UP.claimLoneRelease,"any pre-held key must keep the gesture native");
-constexpr A4SWinKeyRoute A4S_TEST_PREHELD_WIN_UP=
-	RouteA4SWinKey(A4S_EMPTY_WIN_KEY_STATE,VK_LWIN,false,false);
-static_assert(!A4S_TEST_PREHELD_WIN_UP.claimLoneRelease,
-	"a Windows key held before hook installation must remain native on release");
 
-constexpr A4SWinKeyState CancelA4SWinKeyState(A4SWinKeyState state, UINT virtualKey)
+constexpr bool IsA4SNativeWindowsHotkey(UINT message, WPARAM id, LPARAM data)
 {
-	if (virtualKey==VK_LWIN)
-	{
-		state.leftDown=false;
-		state.leftChorded=false;
-	}
-	else if (virtualKey==VK_RWIN)
-	{
-		state.rightDown=false;
-		state.rightChorded=false;
-	}
-	return state;
+	return message==WM_HOTKEY && id==A4S_NATIVE_WINDOWS_HOTKEY_ID &&
+		A4SHotkeyModifiers(data)==MOD_WIN && A4SHotkeyVirtualKey(data)==0;
 }
-constexpr A4SWinKeyState A4S_TEST_RECOVERED_WIN_STATE=
-	CancelA4SWinKeyState(A4S_TEST_LONE_DOWN.state,VK_LWIN);
-static_assert(!A4S_TEST_RECOVERED_WIN_STATE.leftDown &&
-	!A4S_TEST_RECOVERED_WIN_STATE.leftChorded,
-	"a lost Windows-key-up must be self-healed before the next gesture");
 
-static A4SWinKeyState g_A4SWinKeyState=A4S_EMPTY_WIN_KEY_STATE;
-static A4SPhysicalKeyState g_A4SPhysicalKeyState={};
+static_assert(IsA4SNativeWindowsHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
+	static_cast<LPARAM>(MOD_WIN)),"the shell lone-Windows-key hotkey must toggle A4S");
+static_assert(!IsA4SNativeWindowsHotkey(WM_HOTKEY,2,
+	static_cast<LPARAM>(MOD_CONTROL)|(static_cast<LPARAM>(VK_ESCAPE)<<16)),
+	"Ctrl+Esc must remain native");
+static_assert(!IsA4SNativeWindowsHotkey(WM_HOTKEY,A4S_NATIVE_WINDOWS_HOTKEY_ID,
+	static_cast<LPARAM>(MOD_WIN)|(static_cast<LPARAM>('R')<<16)),
+	"Win+R must remain native");
 static const WPARAM A4S_COMMAND_TOGGLE=A4S_MENU_COMMAND_TOGGLE;
 static const WPARAM A4S_COMMAND_EXIT=A4S_MENU_COMMAND_EXIT;
 #else
@@ -662,7 +569,7 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lParam );
 static LRESULT CALLBACK HookDesktopThreadMouse(int code, WPARAM wParam, LPARAM lParam);
 #ifdef A4S_PRODUCT
-static LRESULT CALLBACK HookA4SKeyboard(int code, WPARAM wParam, LPARAM lParam);
+static LRESULT CALLBACK HookA4SNativeHotkey(int code, WPARAM wParam, LPARAM lParam);
 #endif
 
 static BOOL CALLBACK FindTooltipEnum( HWND hwnd, LPARAM lParam )
@@ -3230,298 +3137,70 @@ HMODULE GetModuleHandleByPrefix(const WCHAR* prefix)
 	return result;
 }
 
-static void ResetA4SWinKeyState( void )
-{
 #ifdef A4S_PRODUCT
-	g_A4SWinKeyState=A4S_EMPTY_WIN_KEY_STATE;
-	ZeroMemory(&g_A4SPhysicalKeyState,sizeof(g_A4SPhysicalKeyState));
-#endif
-}
-
-#ifdef A4S_PRODUCT
-static bool IsA4SPhysicalKeyDown( UINT virtualKey )
+static DWORD RemoveA4SNativeHotkeyHook( void )
 {
-	return virtualKey<256 &&
-		(g_A4SPhysicalKeyState.bits[virtualKey/32]&(1u<<(virtualKey%32)))!=0;
-}
-
-static void SetA4SPhysicalKeyDown( UINT virtualKey, bool down )
-{
-	if (virtualKey>=256)
-		return;
-	DWORD &word=g_A4SPhysicalKeyState.bits[virtualKey/32];
-	const DWORD mask=1u<<(virtualKey%32);
-	const bool wasDown=(word&mask)!=0;
-	if (wasDown==down)
-		return;
-	if (down)
-	{
-		word|=mask;
-		g_A4SPhysicalKeyState.downCount++;
-	}
-	else
-	{
-		word&=~mask;
-		if (g_A4SPhysicalKeyState.downCount)
-			g_A4SPhysicalKeyState.downCount--;
-	}
-}
-
-static void InitializeA4SPhysicalKeyState( void )
-{
-	ResetA4SWinKeyState();
-	// The hook may be installed while a shortcut is already in progress. Seed a
-	// fixed, allocation-free bitmap before accepting input so releasing a
-	// pre-held Windows key can never be mistaken for a new lone-key gesture.
-	for (UINT virtualKey=1;virtualKey<256;virtualKey++)
-		if ((GetAsyncKeyState((int)virtualKey)&0x8000)!=0)
-			SetA4SPhysicalKeyDown(virtualKey,true);
-}
-
-static void CancelA4SWinKeyGesture( UINT virtualKey )
-{
-	SetA4SPhysicalKeyDown(virtualKey,false);
-	g_A4SWinKeyState=CancelA4SWinKeyState(g_A4SWinKeyState,virtualKey);
-}
-
-static void ReconcileMissingA4SWinKeyUps( UINT eventKey, bool eventKeyUp )
-{
-	const UINT windowsKeys[2]={VK_LWIN,VK_RWIN};
-	for (UINT windowsKey:windowsKeys)
-	{
-		if (!IsA4SPhysicalKeyDown(windowsKey))
-			continue;
-		// LowLevelKeyboardProc runs before asynchronous state changes. Do not
-		// interpret the current release as missing; its normal route clears it.
-		if (eventKey==windowsKey && eventKeyUp)
-			continue;
-		if ((GetAsyncKeyState((int)windowsKey)&0x8000)==0)
-			CancelA4SWinKeyGesture(windowsKey);
-	}
-}
-
-static DWORD RemoveA4SKeyboardHookOnOwnerThread( void )
-{
-	if (!g_A4SKeyboardHook)
+	if (!g_A4SNativeHotkeyHook)
 		return ERROR_SUCCESS;
 	SetLastError(ERROR_SUCCESS);
-	if (UnhookWindowsHookEx(g_A4SKeyboardHook))
+	if (UnhookWindowsHookEx(g_A4SNativeHotkeyHook))
 	{
-		g_A4SKeyboardHook=NULL;
+		g_A4SNativeHotkeyHook=NULL;
 		return ERROR_SUCCESS;
 	}
 	const DWORD error=GetLastError();
-	// Windows can silently remove a low-level hook after LowLevelHooksTimeout.
 	if (error==ERROR_INVALID_HOOK_HANDLE)
 	{
-		g_A4SKeyboardHook=NULL;
+		g_A4SNativeHotkeyHook=NULL;
 		return ERROR_SUCCESS;
 	}
 	return error?error:ERROR_GEN_FAILURE;
 }
 
-static void CompleteA4SKeyboardOperation( DWORD result )
+static bool InstallA4SNativeHotkeyHook( void )
 {
-	InterlockedExchange(&g_A4SKeyboardOperationResult,(LONG)result);
-	if (g_A4SKeyboardOperationEvent)
-		SetEvent(g_A4SKeyboardOperationEvent);
-}
-
-static DWORD ReadA4SKeyboardOperationResult( void )
-{
-	return (DWORD)InterlockedCompareExchange(&g_A4SKeyboardOperationResult,
-		ERROR_IO_PENDING,ERROR_IO_PENDING);
-}
-
-static DWORD WINAPI A4SKeyboardThreadProc( void * )
-{
-	MSG queueProbe;
-	PeekMessage(&queueProbe,NULL,WM_USER,WM_USER,PM_NOREMOVE);
-	InitializeA4SPhysicalKeyState();
-	g_A4SKeyboardHook=SetWindowsHookEx(WH_KEYBOARD_LL,HookA4SKeyboard,g_Instance,0);
-	DWORD installResult=ERROR_SUCCESS;
-	if (!g_A4SKeyboardHook)
+	HWND shellWindow=FindWindow(L"ApplicationManager_ImmersiveShellWindow",NULL);
+	DWORD shellProcessId=0;
+	const DWORD shellThreadId=shellWindow?
+		GetWindowThreadProcessId(shellWindow,&shellProcessId):0;
+	if (!shellWindow || !shellThreadId || shellProcessId!=GetCurrentProcessId())
 	{
-		installResult=GetLastError();
-		if (!installResult)
-			installResult=ERROR_GEN_FAILURE;
-	}
-	InterlockedExchange(&g_A4SKeyboardAcceptInput,g_A4SKeyboardHook?1:0);
-	CompleteA4SKeyboardOperation(installResult);
-	if (!g_A4SKeyboardHook)
-		return installResult;
-
-	MSG message;
-	while (GetMessage(&message,NULL,0,0)>0)
-	{
-		if (message.message==A4S_KEYBOARD_SUSPEND)
-		{
-			InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-			ResetA4SWinKeyState();
-			CompleteA4SKeyboardOperation(ERROR_SUCCESS);
-			continue;
-		}
-		if (message.message==A4S_KEYBOARD_REFRESH)
-		{
-			InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-			DWORD result=RemoveA4SKeyboardHookOnOwnerThread();
-			if (result==ERROR_SUCCESS)
-			{
-				InitializeA4SPhysicalKeyState();
-				g_A4SKeyboardHook=SetWindowsHookEx(WH_KEYBOARD_LL,HookA4SKeyboard,g_Instance,0);
-				if (!g_A4SKeyboardHook)
-				{
-					result=GetLastError();
-					if (!result)
-						result=ERROR_GEN_FAILURE;
-				}
-			}
-			InterlockedExchange(&g_A4SKeyboardAcceptInput,
-				result==ERROR_SUCCESS && g_A4SKeyboardHook?1:0);
-			CompleteA4SKeyboardOperation(result);
-			continue;
-		}
-		if (message.message==A4S_KEYBOARD_STOP)
-		{
-			InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-			const DWORD result=RemoveA4SKeyboardHookOnOwnerThread();
-			ResetA4SWinKeyState();
-			CompleteA4SKeyboardOperation(result);
-			break;
-		}
-		TranslateMessage(&message);
-		DispatchMessage(&message);
-	}
-	InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-	RemoveA4SKeyboardHookOnOwnerThread();
-	ResetA4SWinKeyState();
-	return 0;
-}
-
-static void ReleaseFinishedA4SKeyboardThread( void )
-{
-	if (g_A4SKeyboardThread && WaitForSingleObject(g_A4SKeyboardThread,0)==WAIT_OBJECT_0)
-	{
-		CloseHandle(g_A4SKeyboardThread);
-		g_A4SKeyboardThread=NULL;
-		g_A4SKeyboardThreadId=0;
-		if (g_A4SKeyboardOperationEvent)
-		{
-			CloseHandle(g_A4SKeyboardOperationEvent);
-			g_A4SKeyboardOperationEvent=NULL;
-		}
-	}
-}
-
-static bool StartA4SKeyboardThread( void )
-{
-	ReleaseFinishedA4SKeyboardThread();
-	if (g_A4SKeyboardThread)
-		return false;
-	g_A4SKeyboardOperationEvent=CreateEvent(NULL,TRUE,FALSE,NULL);
-	if (!g_A4SKeyboardOperationEvent)
-		return false;
-	InterlockedExchange(&g_A4SKeyboardOperationResult,ERROR_IO_PENDING);
-	g_A4SKeyboardThread=CreateThread(NULL,0,A4SKeyboardThreadProc,NULL,0,&g_A4SKeyboardThreadId);
-	if (!g_A4SKeyboardThread)
-	{
-		CloseHandle(g_A4SKeyboardOperationEvent);
-		g_A4SKeyboardOperationEvent=NULL;
+		SetLastError(ERROR_INVALID_WINDOW_HANDLE);
 		return false;
 	}
-	const DWORD wait=WaitForSingleObject(g_A4SKeyboardOperationEvent,A4S_KEYBOARD_HANDSHAKE_TIMEOUT);
-	const DWORD operationResult=ReadA4SKeyboardOperationResult();
-	const bool installed=wait==WAIT_OBJECT_0 && operationResult==ERROR_SUCCESS;
-	if (!installed)
+	g_A4SNativeHotkeyHook=SetWindowsHookEx(WH_GETMESSAGE,HookA4SNativeHotkey,
+		g_Instance,shellThreadId);
+	if (!g_A4SNativeHotkeyHook)
+		return false;
+	return true;
+}
+
+static bool RefreshA4SNativeHotkeyHook( void )
+{
+	const DWORD removeResult=RemoveA4SNativeHotkeyHook();
+	if (removeResult!=ERROR_SUCCESS)
 	{
-		const DWORD failure=wait==WAIT_TIMEOUT?ERROR_TIMEOUT:
-			(operationResult==ERROR_IO_PENDING?ERROR_GEN_FAILURE:operationResult);
-		InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-		PostThreadMessage(g_A4SKeyboardThreadId,A4S_KEYBOARD_STOP,0,0);
-		WaitForSingleObject(g_A4SKeyboardThread,A4S_KEYBOARD_HANDSHAKE_TIMEOUT);
-		ReleaseFinishedA4SKeyboardThread();
-		SetLastError(failure);
-	}
-	return installed;
-}
-
-static bool RefreshA4SKeyboardHook( void )
-{
-	ReleaseFinishedA4SKeyboardThread();
-	if (!g_A4SKeyboardThread || !g_A4SKeyboardOperationEvent)
-		return false;
-	InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-	ResetEvent(g_A4SKeyboardOperationEvent);
-	InterlockedExchange(&g_A4SKeyboardOperationResult,ERROR_IO_PENDING);
-	if (!PostThreadMessage(g_A4SKeyboardThreadId,A4S_KEYBOARD_REFRESH,0,0))
-		return false;
-	const DWORD wait=WaitForSingleObject(g_A4SKeyboardOperationEvent,A4S_KEYBOARD_HANDSHAKE_TIMEOUT);
-	const DWORD result=ReadA4SKeyboardOperationResult();
-	if (wait==WAIT_OBJECT_0 && result==ERROR_SUCCESS)
-		return true;
-	SetLastError(wait==WAIT_TIMEOUT?ERROR_TIMEOUT:
-		(result==ERROR_IO_PENDING?ERROR_GEN_FAILURE:result));
-	return false;
-}
-
-static bool SuspendA4SKeyboardHook( void )
-{
-	ReleaseFinishedA4SKeyboardThread();
-	if (!g_A4SKeyboardThread || !g_A4SKeyboardOperationEvent)
-		return false;
-	InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-	ResetEvent(g_A4SKeyboardOperationEvent);
-	InterlockedExchange(&g_A4SKeyboardOperationResult,ERROR_IO_PENDING);
-	if (!PostThreadMessage(g_A4SKeyboardThreadId,A4S_KEYBOARD_SUSPEND,0,0))
-		return false;
-	const DWORD wait=WaitForSingleObject(g_A4SKeyboardOperationEvent,A4S_KEYBOARD_HANDSHAKE_TIMEOUT);
-	const DWORD result=ReadA4SKeyboardOperationResult();
-	if (wait==WAIT_OBJECT_0 && result==ERROR_SUCCESS)
-		return true;
-	SetLastError(wait==WAIT_TIMEOUT?ERROR_TIMEOUT:
-		(result==ERROR_IO_PENDING?ERROR_GEN_FAILURE:result));
-	return false;
-}
-
-static bool StopA4SKeyboardThread( void )
-{
-	InterlockedExchange(&g_A4SKeyboardAcceptInput,0);
-	ReleaseFinishedA4SKeyboardThread();
-	if (!g_A4SKeyboardThread)
-		return true;
-	const ULONGLONG deadline=GetTickCount64()+A4S_KEYBOARD_HANDSHAKE_TIMEOUT;
-	ResetEvent(g_A4SKeyboardOperationEvent);
-	InterlockedExchange(&g_A4SKeyboardOperationResult,ERROR_IO_PENDING);
-	if (!PostThreadMessage(g_A4SKeyboardThreadId,A4S_KEYBOARD_STOP,0,0) &&
-		WaitForSingleObject(g_A4SKeyboardThread,0)!=WAIT_OBJECT_0)
-	{
-		SetLastError(ERROR_INVALID_THREAD_ID);
+		SetLastError(removeResult);
 		return false;
 	}
-	DWORD remaining=(DWORD)(deadline>GetTickCount64()?deadline-GetTickCount64():0);
-	WaitForSingleObject(g_A4SKeyboardOperationEvent,remaining);
-	remaining=(DWORD)(deadline>GetTickCount64()?deadline-GetTickCount64():0);
-	const bool stopped=WaitForSingleObject(g_A4SKeyboardThread,remaining)==WAIT_OBJECT_0;
-	if (stopped)
-		ReleaseFinishedA4SKeyboardThread();
-	else
-		SetLastError(ERROR_TIMEOUT);
-	return stopped;
+	return InstallA4SNativeHotkeyHook();
 }
+
 #endif
 
 // The A4S product owns only popup activation. Keep the hook set deliberately
-// small and reversible: one taskbar-thread message hook, one low-level
-// keyboard decision hook on its dedicated message-loop thread, and (on
-// Windows 11) one native Start mouse hook.
+// small and reversible: one taskbar-thread message hook, one shell-hotkey
+// message hook, and (on Windows 11) one native Start mouse hook. Physical
+// keyboard events are never intercepted or suppressed.
 static bool ClearA4SActivationHooks( void )
 {
 	bool cleared=true;
 #ifdef A4S_PRODUCT
-	if (!StopA4SKeyboardThread())
+	const DWORD hotkeyResult=RemoveA4SNativeHotkeyHook();
+	if (hotkeyResult!=ERROR_SUCCESS)
 	{
 		cleared=false;
-		LogToFile(STARTUP_LOG,L"A4S keyboard hook owner did not stop inside the bounded handshake");
+		LogToFile(STARTUP_LOG,L"A4S native hotkey hook removal failed: %u",hotkeyResult);
 	}
 #endif
 	if (g_StartMouseHook)
@@ -3575,7 +3254,7 @@ static bool InstallA4SActivationHooks( void )
 			goto failed;
 	}
 #ifdef A4S_PRODUCT
-	if (!StartA4SKeyboardThread())
+	if (!InstallA4SNativeHotkeyHook())
 		goto failed;
 #endif
 	return true;
@@ -3825,9 +3504,9 @@ static void InitStartMenuDLL( void )
 			return;
 		}
 
-		// Do not unregister TwinUI's Win or Ctrl+Esc hotkeys. The product routes a
-		// classified lone Windows-key release through its dedicated low-level hook
-		// without mutating Explorer's native hotkey registrations.
+		// Do not unregister or replace TwinUI's Win or Ctrl+Esc hotkeys. The
+		// product observes only the existing lone-Windows-key shell message and
+		// leaves every physical key event and Explorer registration untouched.
 #ifdef A4S_PRODUCT
 		InterlockedExchange(&g_A4SInputSuspended,0);
 		InterlockedExchange(&g_A4SInitializationState,A4S_INIT_READY);
@@ -4440,57 +4119,38 @@ static LRESULT CALLBACK HookProgManThread( int code, WPARAM wParam, LPARAM lPara
 	return CallNextHookEx(NULL,code,wParam,lParam);
 }
 
-static bool QueueA4SToggle( TaskbarInfo *taskBar, LPARAM activationData )
+static bool QueueA4SToggle( HWND taskBar, LPARAM activationData )
 {
-	return taskBar && PostMessage(taskBar->taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,
+	return taskBar && PostMessage(taskBar,g_StartMenuMsg,A4S_COMMAND_TOGGLE,
 		activationData)!=FALSE;
 }
 
-#ifdef A4S_PRODUCT
-// Global low-level hooks execute on the dedicated installing message-loop
-// thread. Keep this callback allocation-free and bounded: reconcile two Win
-// bits, update the fixed key bitmap/classifier, chain, optionally post one
-// taskbar message, and return. Native Start is the automatic fallback whenever
-// this callback is absent, downstream already claimed the release, or posting
-// the A4S transaction fails.
-static LRESULT CALLBACK HookA4SKeyboard(int code, WPARAM wParam, LPARAM lParam)
+static bool QueueA4SToggle( TaskbarInfo *taskBar, LPARAM activationData )
 {
-	if (code!=HC_ACTION || !IsA4SInputActive() ||
-		InterlockedCompareExchange(&g_A4SKeyboardAcceptInput,0,0)==0)
-		return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
+	return taskBar && QueueA4SToggle(taskBar->taskBar,activationData);
+}
 
-	const KBDLLHOOKSTRUCT *input=reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
-	const bool keyDown=wParam==WM_KEYDOWN || wParam==WM_SYSKEYDOWN;
-	const bool keyUp=wParam==WM_KEYUP || wParam==WM_SYSKEYUP;
-	if (!input || (!keyDown && !keyUp))
-		return CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
-
-	ReconcileMissingA4SWinKeyUps(input->vkCode,keyUp);
-	const bool wasDown=IsA4SPhysicalKeyDown(input->vkCode);
-	const bool windowsKey=input->vkCode==VK_LWIN || input->vkCode==VK_RWIN;
-	const bool anotherKeyAlreadyDown=windowsKey && keyDown && !wasDown &&
-		g_A4SPhysicalKeyState.downCount!=0;
-	const A4SWinKeyRoute route=RouteA4SWinKey(g_A4SWinKeyState,input->vkCode,
-		keyDown,anotherKeyAlreadyDown);
-	g_A4SWinKeyState=route.state;
-	if (keyDown)
-		SetA4SPhysicalKeyDown(input->vkCode,true);
-	else
-		SetA4SPhysicalKeyDown(input->vkCode,false);
-
-	// Every observer below A4S first sees the matching release, even when A4S
-	// later suppresses delivery to the shell input target. This avoids leaving a
-	// downstream hook with an unmatched Windows-key-down state.
-	const LRESULT downstream=CallNextHookEx(g_A4SKeyboardHook,code,wParam,lParam);
-	if (route.claimLoneRelease && downstream==0)
+#ifdef A4S_PRODUCT
+// TwinUI already classifies a bare left/right Windows-key gesture and posts
+// thread hotkey ID 1 to ApplicationManager_ImmersiveShellWindow's thread. Hook
+// only that shell message; every physical key event reaches Windows unchanged.
+// If the A4S toggle cannot be queued, leave the message intact so native Start
+// remains the automatic fallback.
+static LRESULT CALLBACK HookA4SNativeHotkey(int code, WPARAM wParam, LPARAM lParam)
+{
+	if (code==HC_ACTION && wParam==PM_REMOVE && IsA4SInputActive())
 	{
-		const HWND taskbar=g_TaskBar;
-		const UINT message=g_StartMenuMsg;
-		if (taskbar && message && PostMessage(taskbar,message,A4S_COMMAND_TOGGLE,
-			A4S_KEYBOARD_TOGGLE))
-			return 1; // Claim only after A4S owns a queued toggle transaction.
+		MSG *message=reinterpret_cast<MSG*>(lParam);
+		if (message && IsA4SNativeWindowsHotkey(message->message,message->wParam,
+			message->lParam) && QueueA4SToggle(g_TaskBar,A4S_KEYBOARD_TOGGLE))
+		{
+			message->hwnd=NULL;
+			message->message=WM_NULL;
+			message->wParam=0;
+			message->lParam=0;
+		}
 	}
-	return downstream;
+	return CallNextHookEx(g_A4SNativeHotkeyHook,code,wParam,lParam);
 }
 #endif
 
@@ -4624,21 +4284,15 @@ static LRESULT CALLBACK HookDesktopThread( int code, WPARAM wParam, LPARAM lPara
 					InterlockedExchange(&g_A4SInputSuspended,1);
 					CMenuContainer::InvalidateA4SRootCache(true);
 					CMenuContainer::ForceCloseA4STransients();
-					if (!SuspendA4SKeyboardHook())
-					{
-						LRESULT res=CallNextHookEx(NULL,code,wParam,lParam);
-						CleanStartMenuDLL();
-						return res;
-					}
 				}
 				else if (command==A4S_MENU_COMMAND_REFRESH_INPUT)
 				{
 					CMenuContainer::InvalidateA4SRootCache(true);
 					CMenuContainer::ForceCloseA4STransients();
-					if (!RefreshA4SKeyboardHook())
+					if (!RefreshA4SNativeHotkeyHook())
 					{
 						// Do not leave a partially operational product intercepting the
-						// Start button when native keyboard routing cannot be restored.
+						// Start button when shell-hotkey routing cannot be restored.
 						LRESULT res=CallNextHookEx(NULL,code,wParam,lParam);
 						CleanStartMenuDLL();
 						return res;
