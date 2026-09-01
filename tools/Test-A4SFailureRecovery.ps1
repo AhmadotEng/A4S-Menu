@@ -2596,7 +2596,7 @@ function Invoke-A4SRegistrySnapshotTransaction {
         $effectiveBoundaryValidator = {
             param([string] $Label)
             Assert-A4SProductMutationBoundary -Boundary $ProductBoundary -Label $Label
-        }.GetNewClosure()
+        }
     }
     else {
         if ($null -ne $ProductBoundary -or $null -eq $ValidateBoundary) {
@@ -2803,7 +2803,7 @@ function Invoke-A4SRegistryTransactionRecovery {
         $effectiveBoundaryValidator = {
             param([string] $Label)
             Assert-A4SProductMutationBoundary -Boundary $ProductBoundary -Label $Label
-        }.GetNewClosure()
+        }
     }
     else {
         if ($null -ne $ProductBoundary -or $null -eq $ValidateBoundary) {

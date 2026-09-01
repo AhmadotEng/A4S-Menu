@@ -62,6 +62,17 @@ Assert-Contract ($automaticHostReferences.Count -eq 0) `
 Assert-Contract (-not [regex]::IsMatch($harness,
         '(?im)^\s*return\s+if\b')) `
     'harness uses an if statement as a return argument, which invokes a nonexistent command in Windows PowerShell 5.1'
+foreach ($functionName in @('Invoke-A4SRegistrySnapshotTransaction',
+        'Invoke-A4SRegistryTransactionRecovery')) {
+    $functionAst = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+            $node.Name -ceq $functionName
+    }, $true)
+    Assert-Contract ($null -ne $functionAst) "missing function $functionName"
+    Assert-Contract ($functionAst.Extent.Text -notmatch '\.GetNewClosure\s*\(') `
+        "$functionName isolates its product-boundary validator in a dynamic module that cannot resolve the harness assertion dependency"
+}
 
 function Get-FunctionText {
     param([Parameter(Mandatory)][string] $Name)
