@@ -75,12 +75,20 @@ A4S reaches `READY`, native Start must remain disabled for the installed
 product. Clean servicing/uninstall may restore the exact registrations before
 Explorer replacement.
 
-Status: implemented and source/offline tested, but not live qualified. Principal
-commits are `af76b87`, `04b2d6f`, `3d1a1e4`, `9abcd2e`, and source/binary binding
-checkpoint `ea8e35c`. Physical left/right Windows-key, Start-click, shortcut,
-key-repeat, modifier, focus-loss, and native-suppression rows remain pending.
-Rollback to the state before this work: `81924b7`; rollback to all of Plan 1:
-`42d61a4`.
+Status: **complete at the Step 1 boundary on the current qualification
+machine**. The owner physically passed lone-left-Windows open/close, held-key
+release, centered and left-aligned Start clicks, the agreed Win-shortcut
+matrix, Ctrl+Esc, lock/unlock health, focus loss, and native-Start suppression.
+The keyboard has no right Windows key, so that physical row is recorded as not
+applicable rather than silently passed. Exact evidence and staged hashes are in
+[the 2026-09-01 Step 1 record](../testing/A4S-plan2-step1-live-2026-09-01.md).
+Principal commits now include `f1dca8c`, `a85af78`, and `34b0939`. Rollback
+before native-Start ownership is `f1dca8c`; rollback to all of Plan 1 is
+`42d61a4`. Release-wide DPI/monitor qualification remains in its later numbered
+step and does not reopen Step 1.
+
+The approximately 11-pixel exact-screen-centering refinement is documented in
+[A4S deferred refinements](A4S-deferred-refinements.md) and was not implemented.
 
 ### 2. Add lifecycle recovery
 
@@ -202,9 +210,9 @@ not declared released:
 
 | Binary | Bytes | SHA-256 |
 | --- | ---: | --- |
-| `build\stage\A4SProduct\A4SMenuHost.exe` | 207872 | `8115F85209E937DFE88C377284C30275F3562334E040B19DEF072B78B13DED73` |
-| `build\stage\A4SProduct\A4SMenu.dll` | 1355776 | `8A9ACE1D4AA30DDCA522FF22814F84D96DAF766E8453C58BC3099B1F66FAA905` |
-| `build\stage\A4SSetup\A4SMenuSetup.exe` | 1901056 | `4A8A7109BF77F73F71723BB2ED1192F15FB7E873381BDBE0F0EE315224478704` |
+| `build\stage\A4SProduct\A4SMenuHost.exe` | 207872 | `8DD438DB3FF591CA14388431BD82F08854E87075E6C4E960654DA48FF9B97876` |
+| `build\stage\A4SProduct\A4SMenu.dll` | 1356800 | `FF66AA070F158D3C1C0732EE195CC88C06BA6034AD691BB969D4B30BEA37ED0A` |
+| `build\stage\A4SSetup\A4SMenuSetup.exe` | 1902080 | `11A8B530F34E3CA4010A069AF06C44C4687C124D3FBA80BB67F9B3CFBC1B7E76` |
 
 ## Rollback rules
 

@@ -17,8 +17,11 @@ failure-path check where one is practical.
   resident component.
 - StartAllBack is disabled for qualification. Its still-mapped loader/runtime
   modules are recorded separately from the A4S result.
-- A failed or crash-loop-disabled A4S initialization must leave Windows' native
-  Start path available.
+- The owner superseded the earlier native-fallback requirement on 2026-09-01.
+  While the installed A4S product owns Start activation, native Start must not
+  appear. Failure and crash-loop recovery must preserve that policy and expose
+  diagnostics/manual repair instead of silently falling through to native
+  Start.
 
 Implementation and test procedures are documented in the
 [native input/recovery contract](A4S-native-input-recovery.md),
@@ -34,15 +37,15 @@ until their required evidence is actually recorded.
 
 | ID | Requirement | Required evidence | Status |
 | --- | --- | --- | --- |
-| N1 | A lone left or right Windows-key press toggles A4S Menu. | Manual physical-key action on a fresh Explorer, activation-source trace, and visible-window assertion; do not synthesize Windows-key input. | Pending |
-| N2 | A second lone Windows-key press closes the open menu. | Manual physical-key action, activation-source trace, and visible-window assertion. | Pending |
-| N3 | Clicking the primary taskbar Start button uses the same toggle path. | Manual physical Start-button clicks plus activation-source trace for centered and left-aligned taskbars. | Pending |
-| N4 | Win+R, Win+E, Win+L, Win+X, Win+Tab, and other modified Windows-key chords remain native and do not flash A4S Menu. | Shortcut matrix; disruptive lock test run separately. | Pending |
-| N5 | Clicking or activating another application dismisses the menu normally; the menu is not permanently topmost. | Focus-transition window assertion and visual check. | Pending |
+| N1 | A lone left or right Windows-key press toggles A4S Menu. | Manual physical-key action on a fresh Explorer, activation-source trace, and visible-window assertion; do not synthesize Windows-key input. | [PASS for the available left key; right key absent](../testing/A4S-plan2-step1-live-2026-09-01.md) |
+| N2 | A second lone Windows-key press closes the open menu. | Manual physical-key action, activation-source trace, and visible-window assertion. | [PASS](../testing/A4S-plan2-step1-live-2026-09-01.md) |
+| N3 | Clicking the primary taskbar Start button uses the same toggle path. | Manual physical Start-button clicks plus activation-source trace for centered and left-aligned taskbars. | [PASS](../testing/A4S-plan2-step1-live-2026-09-01.md) |
+| N4 | Win+R, Win+E, Win+L, Win+X, Win+Tab, and other modified Windows-key chords remain native and do not flash A4S Menu. | Shortcut matrix; disruptive lock test run separately. | [PASS](../testing/A4S-plan2-step1-live-2026-09-01.md) |
+| N5 | Clicking or activating another application dismisses the menu normally; the menu is not permanently topmost. | Focus-transition window assertion and visual check. | [PASS](../testing/A4S-plan2-step1-live-2026-09-01.md) |
 | N6 | Explorer restart/crash reconnects without polling or duplicate hooks. | Explorer PID transition, host status, exact DLL mapping, and one-menu assertion. | Pending |
 | N7 | Lock/unlock and sleep/resume preserve or restore a usable connection. | Session/power transition test record. | Pending |
-| N8 | Initialization failure passes native Start through. | Missing/corrupt/incompatible DLL tests and native-Start observation. | Pending |
-| N9 | Repeated Explorer failures trip a bounded crash-loop guard, disable injection, and keep native Start available. | Deterministic guard-state test plus controlled live failure test. | Pending |
+| N8 | Initialization failure preserves the installed product's native-Start suppression policy and exposes a diagnostic/manual-repair path. | Missing/corrupt/incompatible DLL tests plus Start-route and diagnostic observation. | Pending |
+| N9 | Repeated Explorer failures trip a bounded crash-loop guard without silently restoring native Start, and expose a diagnostic/manual-repair path. | Deterministic guard-state test plus controlled live failure and Start-route tests. | Pending |
 | N10 | Normal logical exit disarms callbacks before the host exits. | Lifecycle regression gate and inert-mapping assertion. | Pending |
 
 ## Performance and rendering
@@ -82,7 +85,7 @@ until their required evidence is actually recorded.
 | --- | --- | --- | --- |
 | Q1 | 100%, 125%, 150%, and 200% DPI/scaling | Fixed-state captures and geometry assertions at each scale. | Pending |
 | Q2 | Multiple monitors, including non-primary taskbar invocation | Monitor-specific placement and dismissal captures. | Pending |
-| Q3 | Centered and left-aligned Windows 11 taskbars | Start-button and keyboard toggle checks for both alignments. | Pending |
+| Q3 | Centered and left-aligned Windows 11 taskbars | Start-button and keyboard toggle checks for both alignments. | [PASS on the current display/DPI](../testing/A4S-plan2-step1-live-2026-09-01.md) |
 | Q4 | Fullscreen application foreground behavior | Open/dismiss/no-steal-focus checks. | Pending |
 | Q5 | Normal, Programs, search, context popup, power popup, and pinned-item states | Same-size captures compared with accepted references. | Pending |
 | Q6 | Pin, unpin, run as administrator, and open-file-location commands | Functional checks for pinned and Programs entries. | Pending |
