@@ -40,6 +40,12 @@ param(
     [ValidateRange(5, 90)]
     [int] $TimeoutMinutes = 30,
 
+    [ValidateRange(10, 300)]
+    [int] $BootstrapTimeoutSeconds = 60,
+
+    [ValidateRange(5, 120)]
+    [int] $GuestExitTimeoutSeconds = 15,
+
     [switch] $AllowSandboxLaunch,
 
     [switch] $ContractSelfTest
@@ -49,6 +55,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
+$bootstrapScriptRelativePath = 'tools\Invoke-A4SLegacySandboxBootstrap.ps1'
 $guestScriptRelativePath = 'tools\Invoke-A4SLegacySandboxGuest.ps1'
 $v1SetupRelativePath = 'build\test-fixtures\A4SMenu-1.0.0.0\A4SMenuSetup.exe'
 $frozenV1 = [ordered]@{
@@ -309,13 +316,25 @@ function New-SandboxConfigurationText {
     param(
         [Parameter(Mandatory)][string] $HostRepo,
         [Parameter(Mandatory)][string] $HostControl,
-        [Parameter(Mandatory)][string] $HostEvidence
+        [Parameter(Mandatory)][string] $HostEvidence,
+        [Parameter(Mandatory)][string] $SessionId,
+        [Parameter(Mandatory)][string] $Nonce,
+        [Parameter(Mandatory)][string] $RequestSha256,
+        [Parameter(Mandatory)][string] $BootstrapScriptSha256,
+        [Parameter(Mandatory)][string] $GuestScriptSha256
     )
     $repo = [Security.SecurityElement]::Escape($HostRepo)
     $control = [Security.SecurityElement]::Escape($HostControl)
     $evidence = [Security.SecurityElement]::Escape($HostEvidence)
     $command = [Security.SecurityElement]::Escape(
-        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Control\request.json"')
+        ('C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxBootstrap.ps1"' +
+        ' -GuestScriptPath "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1"' +
+        ' -RequestPath "C:\A4S\Control\request.json" -EvidenceRoot "C:\A4S\Evidence"' +
+        ' -SessionId "' + $SessionId + '"' +
+        ' -Nonce "' + $Nonce + '"' +
+        ' -RequestSha256 "' + $RequestSha256 + '"' +
+        ' -BootstrapScriptSha256 "' + $BootstrapScriptSha256 + '"' +
+        ' -GuestScriptSha256 "' + $GuestScriptSha256 + '"'))
     return @"
 <Configuration>
   <vGPU>Disable</vGPU>
@@ -482,10 +501,133 @@ function Read-Utf8JsonSnapshot {
     }
 }
 
+function Read-Utf8TextSnapshot {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [ValidateRange(1, 1048576)][int] $MaximumBytes = 262144
+    )
+    $full = [IO.Path]::GetFullPath($Path)
+    if (-not (Test-Path -LiteralPath $full -PathType Leaf)) {
+        throw "Missing UTF-8 diagnostic file: $full"
+    }
+    $item = Get-Item -LiteralPath $full -Force
+    if (($item.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0 -or
+        $item.Length -gt $MaximumBytes) {
+        throw "UTF-8 diagnostic file is unsafe or exceeds $MaximumBytes bytes: $full"
+    }
+    $bytes = [IO.File]::ReadAllBytes($full)
+    if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        throw "UTF-8 diagnostic files must not contain a BOM: $full"
+    }
+    $encoding = [Text.UTF8Encoding]::new($false, $true)
+    $algorithm = [Security.Cryptography.SHA256]::Create()
+    try {
+        return [ordered]@{
+            Path = $full
+            Length = [long]$bytes.Length
+            Sha256 = ([BitConverter]::ToString(
+                $algorithm.ComputeHash($bytes))).Replace('-', '')
+            Text = $encoding.GetString($bytes)
+        }
+    }
+    finally { $algorithm.Dispose() }
+}
+
+function Read-AuthenticatedBootstrapStage {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $SessionId,
+        [Parameter(Mandatory)][string] $Nonce,
+        [Parameter(Mandatory)][string] $RequestSha256,
+        [Parameter(Mandatory)][string] $BootstrapScriptSha256,
+        [Parameter(Mandatory)][string] $GuestScriptSha256
+    )
+    $snapshot = Read-Utf8JsonSnapshot -Path $Path -MaximumBytes 65536
+    $record = $snapshot.Value
+    $properties = @($record.PSObject.Properties.Name | Sort-Object)
+    $expected = @('BootstrapScriptSha256', 'CapturedUtc', 'Details',
+        'GuestScriptSha256', 'Nonce', 'Ordinal', 'ProcessId', 'RequestSha256',
+        'SchemaVersion', 'SessionId', 'Stage') | Sort-Object
+    if (($properties -join '|') -cne ($expected -join '|') -or
+        [int]$record.SchemaVersion -ne 1 -or
+        [string]$record.SessionId -cne $SessionId -or
+        [string]$record.Nonce -cne $Nonce -or
+        [string]$record.RequestSha256 -cne $RequestSha256 -or
+        [string]$record.BootstrapScriptSha256 -cne $BootstrapScriptSha256 -or
+        [string]$record.GuestScriptSha256 -cne $GuestScriptSha256 -or
+        [int]$record.Ordinal -ne 2 -or
+        [string]$record.Stage -cne 'scripts-authenticated' -or
+        [int]$record.ProcessId -le 0 -or
+        [string]$record.Details.ActualBootstrapScriptSha256 -cne
+            $BootstrapScriptSha256 -or
+        [string]$record.Details.ActualGuestScriptSha256 -cne $GuestScriptSha256) {
+        throw 'The Sandbox bootstrap record does not authenticate this exact reviewed run.'
+    }
+    [DateTime]::Parse([string]$record.CapturedUtc,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind) | Out-Null
+    return $record
+}
+
+function Read-AuthenticatedGuestExit {
+    param(
+        [Parameter(Mandatory)][string] $Path,
+        [Parameter(Mandatory)][string] $ResultDirectory,
+        [Parameter(Mandatory)][string] $SessionId,
+        [Parameter(Mandatory)][string] $Nonce,
+        [Parameter(Mandatory)][string] $RequestSha256,
+        [Parameter(Mandatory)][string] $BootstrapScriptSha256,
+        [Parameter(Mandatory)][string] $GuestScriptSha256
+    )
+    $snapshot = Read-Utf8JsonSnapshot -Path $Path -MaximumBytes 65536
+    $record = $snapshot.Value
+    $properties = @($record.PSObject.Properties.Name | Sort-Object)
+    $expected = @('BootstrapScriptSha256', 'CompletedUtc', 'ConsoleFile',
+        'ConsoleLength', 'ConsoleSha256', 'ExitCode', 'GuestScriptSha256',
+        'LastStage', 'Nonce', 'RequestSha256', 'SchemaVersion', 'SessionId') |
+        Sort-Object
+    if (($properties -join '|') -cne ($expected -join '|') -or
+        [int]$record.SchemaVersion -ne 1 -or
+        [string]$record.SessionId -cne $SessionId -or
+        [string]$record.Nonce -cne $Nonce -or
+        [string]$record.RequestSha256 -cne $RequestSha256 -or
+        [string]$record.BootstrapScriptSha256 -cne $BootstrapScriptSha256 -or
+        [string]$record.GuestScriptSha256 -cne $GuestScriptSha256 -or
+        [string]$record.ConsoleFile -cne 'guest-console.log' -or
+        [string]$record.ConsoleSha256 -notmatch '^[0-9A-F]{64}$') {
+        throw 'The Sandbox guest-exit record does not authenticate this exact reviewed run.'
+    }
+    [DateTime]::Parse([string]$record.CompletedUtc,
+        [Globalization.CultureInfo]::InvariantCulture,
+        [Globalization.DateTimeStyles]::RoundtripKind) | Out-Null
+    $consolePath = Join-Path $ResultDirectory 'guest-console.log'
+    $console = Read-Utf8TextSnapshot -Path $consolePath -MaximumBytes 262144
+    if ([long]$record.ConsoleLength -ne $console.Length -or
+        [string]$record.ConsoleSha256 -cne $console.Sha256) {
+        throw 'The Sandbox guest console does not match its exit-record length and SHA-256.'
+    }
+    $diagnostic = [string]$console.Text
+    if ($diagnostic.Length -gt 4096) {
+        $diagnostic = '[earlier output omitted] ' +
+            $diagnostic.Substring($diagnostic.Length - 4096)
+    }
+    $diagnostic = [regex]::Replace($diagnostic,
+        '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '?')
+    return [ordered]@{
+        Record = $record
+        Diagnostic = $diagnostic
+        ExitRecordSha256 = $snapshot.Sha256
+    }
+}
+
 function Assert-ContractModel {
     $xmlText = New-SandboxConfigurationText -HostRepo 'C:\Qualification\Repo' `
         -HostControl 'D:\Qualification Evidence\Session\control' `
-        -HostEvidence 'D:\Qualification Evidence\Session\results'
+        -HostEvidence 'D:\Qualification Evidence\Session\results' `
+        -SessionId '11111111-2222-3333-4444-555555555555' `
+        -Nonce ('A' * 64) -RequestSha256 ('B' * 64) `
+        -BootstrapScriptSha256 ('C' * 64) -GuestScriptSha256 ('D' * 64)
     [xml]$xml = $xmlText
     if ($xml.Configuration.Networking -cne 'Disable' -or
         $xml.Configuration.ClipboardRedirection -cne 'Disable' -or
@@ -506,8 +648,19 @@ function Assert-ContractModel {
         throw 'The in-memory Sandbox mapping contract is incomplete.'
     }
     if ($xml.Configuration.LogonCommand.Command -notmatch
-        'Invoke-A4SLegacySandboxGuest\.ps1.*C:\\A4S\\Control\\request\.json') {
+        'Invoke-A4SLegacySandboxBootstrap\.ps1.*Invoke-A4SLegacySandboxGuest\.ps1.*C:\\A4S\\Control\\request\.json') {
         throw 'The guest entry point is missing from the Sandbox configuration.'
+    }
+    $expectedContractCommand =
+        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxBootstrap.ps1"' +
+        ' -GuestScriptPath "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1"' +
+        ' -RequestPath "C:\A4S\Control\request.json" -EvidenceRoot "C:\A4S\Evidence"' +
+        ' -SessionId "11111111-2222-3333-4444-555555555555"' +
+        ' -Nonce "' + ('A' * 64) + '" -RequestSha256 "' + ('B' * 64) + '"' +
+        ' -BootstrapScriptSha256 "' + ('C' * 64) + '"' +
+        ' -GuestScriptSha256 "' + ('D' * 64) + '"'
+    if ([string]$xml.Configuration.LogonCommand.Command -cne $expectedContractCommand) {
+        throw 'The in-memory Sandbox bootstrap command contract is not exact.'
     }
     if (-not (Test-PathWithin -Candidate 'C:\Qualification\Repo' `
             -Parent 'C:\Qualification\Repo')) {
@@ -559,7 +712,70 @@ function Assert-ContractModel {
             [IO.Directory]::Delete($replacementRoot, $true)
         }
     }
-    Write-Host "A4S legacy Sandbox host in-memory replacement contract passed under Windows PowerShell $($PSVersionTable.PSVersion)."
+
+    $diagnosticRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ('A4SGuestExitContract-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($diagnosticRoot) | Out-Null
+    try {
+        $contractSession = '11111111-2222-3333-4444-555555555555'
+        $contractNonce = 'A' * 64
+        $contractRequest = 'B' * 64
+        $contractBootstrap = 'C' * 64
+        $contractGuest = 'D' * 64
+        $stagePath = Join-Path $diagnosticRoot 'stage-002-scripts-authenticated.json'
+        $stageRecord = [ordered]@{
+            SchemaVersion = 1; SessionId = $contractSession
+            Nonce = $contractNonce; RequestSha256 = $contractRequest
+            BootstrapScriptSha256 = $contractBootstrap
+            GuestScriptSha256 = $contractGuest; Ordinal = 2
+            Stage = 'scripts-authenticated'; ProcessId = $PID
+            CapturedUtc = [DateTime]::UtcNow.ToString('o')
+            Details = [ordered]@{
+                ActualBootstrapScriptSha256 = $contractBootstrap
+                ActualGuestScriptSha256 = $contractGuest
+            }
+        }
+        Write-Utf8NoBomAtomic -Path $stagePath `
+            -Text ($stageRecord | ConvertTo-Json -Depth 20)
+        Read-AuthenticatedBootstrapStage -Path $stagePath `
+            -SessionId $contractSession -Nonce $contractNonce `
+            -RequestSha256 $contractRequest `
+            -BootstrapScriptSha256 $contractBootstrap `
+            -GuestScriptSha256 $contractGuest | Out-Null
+
+        $consolePath = Join-Path $diagnosticRoot 'guest-console.log'
+        Write-Utf8NoBomAtomic -Path $consolePath -Text 'synthetic PS5 diagnostic'
+        $consoleItem = Get-Item -LiteralPath $consolePath -Force
+        $exitPath = Join-Path $diagnosticRoot 'guest-exit.json'
+        $exitRecord = [ordered]@{
+            SchemaVersion = 1; SessionId = $contractSession
+            Nonce = $contractNonce; RequestSha256 = $contractRequest
+            BootstrapScriptSha256 = $contractBootstrap
+            GuestScriptSha256 = $contractGuest; ExitCode = 17
+            LastStage = 'synthetic-contract'; ConsoleFile = 'guest-console.log'
+            ConsoleLength = [long]$consoleItem.Length
+            ConsoleSha256 = (Get-FileHash -Algorithm SHA256 `
+                -LiteralPath $consolePath).Hash.ToUpperInvariant()
+            CompletedUtc = [DateTime]::UtcNow.ToString('o')
+        }
+        Write-Utf8NoBomAtomic -Path $exitPath `
+            -Text ($exitRecord | ConvertTo-Json -Depth 20)
+        $validatedExit = Read-AuthenticatedGuestExit -Path $exitPath `
+            -ResultDirectory $diagnosticRoot -SessionId $contractSession `
+            -Nonce $contractNonce -RequestSha256 $contractRequest `
+            -BootstrapScriptSha256 $contractBootstrap `
+            -GuestScriptSha256 $contractGuest
+        if ([int]$validatedExit.Record.ExitCode -ne 17 -or
+            [string]$validatedExit.Diagnostic -cne 'synthetic PS5 diagnostic') {
+            throw 'Authenticated guest-exit diagnostic contract failed.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($diagnosticRoot)) {
+            [IO.Directory]::Delete($diagnosticRoot, $true)
+        }
+    }
+    Write-Host "A4S legacy Sandbox host in-memory replacement contract passed under Windows PowerShell $($PSVersionTable.PSVersion); authenticated diagnostic contract passed."
 }
 
 if ($ContractSelfTest) {
@@ -580,6 +796,7 @@ foreach ($required in @($V2SetupPath, $ExpectedV2SetupSha256,
 
 $repoRoot = Assert-LocalFixedPath $repoRoot
 Assert-NoReparsePointInExistingChain $repoRoot
+$bootstrapScript = Assert-RegularFile (Join-Path $repoRoot $bootstrapScriptRelativePath)
 $guestScript = Assert-RegularFile (Join-Path $repoRoot $guestScriptRelativePath)
 $v1Setup = Assert-RegularFile (Join-Path $repoRoot $v1SetupRelativePath)
 $v2Setup = Assert-RegularFile $V2SetupPath
@@ -667,6 +884,10 @@ $nonceGenerator = [Security.Cryptography.RandomNumberGenerator]::Create()
 try { $nonceGenerator.GetBytes($nonceBytes) }
 finally { $nonceGenerator.Dispose() }
 $nonce = ([BitConverter]::ToString($nonceBytes)).Replace('-', '')
+$bootstrapScriptSha256 = (Get-FileHash -Algorithm SHA256 `
+    -LiteralPath $bootstrapScript).Hash.ToUpperInvariant()
+$guestScriptSha256 = (Get-FileHash -Algorithm SHA256 `
+    -LiteralPath $guestScript).Hash.ToUpperInvariant()
 $sessionDirectory = Join-Path $evidenceRootFull $sessionId
 if (Test-Path -LiteralPath $sessionDirectory) { throw "Evidence session collision: $sessionDirectory" }
 [IO.Directory]::CreateDirectory($sessionDirectory) | Out-Null
@@ -707,7 +928,8 @@ $request = [ordered]@{
         WindowsSandboxExecutable = $sandboxIdentity
         OptionalFeatureState = $featureState
         RepositoryPath = $repoRoot
-        GuestScriptSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $guestScript).Hash.ToUpperInvariant()
+        BootstrapScriptSha256 = $bootstrapScriptSha256
+        GuestScriptSha256 = $guestScriptSha256
         V1Setup = $v1Identity
         V2Setup = $v2Identity
     }
@@ -717,7 +939,10 @@ Write-Utf8NoBomAtomic -Path $requestPath `
     -Text ($request | ConvertTo-Json -Depth 100)
 $requestSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $requestPath).Hash.ToUpperInvariant()
 $configurationText = New-SandboxConfigurationText -HostRepo $repoRoot `
-    -HostControl $controlDirectory -HostEvidence $resultDirectory
+    -HostControl $controlDirectory -HostEvidence $resultDirectory `
+    -SessionId $sessionId -Nonce $nonce -RequestSha256 $requestSha256 `
+    -BootstrapScriptSha256 $bootstrapScriptSha256 `
+    -GuestScriptSha256 $guestScriptSha256
 $configurationPath = Join-Path $controlDirectory 'A4SLegacyLifecycle.wsb'
 Write-Utf8NoBomAtomic -Path $configurationPath -Text $configurationText
 $configurationSha256 = (Get-FileHash -Algorithm SHA256 -LiteralPath $configurationPath).Hash.ToUpperInvariant()
@@ -730,6 +955,8 @@ $launchRecord = [ordered]@{
     ConfigurationSha256 = $configurationSha256
     StartedUtc = [DateTime]::UtcNow.ToString('o')
     SandboxProcessId = $null
+    Bootstrap = $null
+    GuestExit = $null
     Completion = $null
     CompletionSha256 = $null
     HostBefore = $hostBefore
@@ -744,10 +971,18 @@ Write-Utf8NoBomAtomic -Path $hostResultPath `
     -Text ($launchRecord | ConvertTo-Json -Depth 100)
 
 $completionPath = Join-Path $resultDirectory 'completion.json'
+$bootstrapPath = Join-Path $resultDirectory 'stage-002-scripts-authenticated.json'
+$guestExitPath = Join-Path $resultDirectory 'guest-exit.json'
+$bootstrapPublicationFailurePath = Join-Path $resultDirectory `
+    'bootstrap-publication-failure.txt'
 $deadline = [DateTime]::UtcNow.AddMinutes($TimeoutMinutes)
+$bootstrapDeadline = [DateTime]::UtcNow.AddSeconds($BootstrapTimeoutSeconds)
 $processExitObservedUtc = $null
+$completionObservedUtc = $null
+$guestExitObservedUtc = $null
 $completion = $null
 $completionSnapshot = $null
+$guestExit = $null
 $guestEvidencePath = Join-Path $resultDirectory 'evidence.json'
 $hostFailure = $null
 try {
@@ -761,17 +996,69 @@ try {
         -DestinationPath $hostResultPath
 
     while ([DateTime]::UtcNow -lt $deadline) {
-        if (Test-Path -LiteralPath $completionPath -PathType Leaf) {
+        if ($null -eq $completion -and
+            (Test-Path -LiteralPath $completionPath -PathType Leaf)) {
             try {
                 $completionSnapshot = Read-Utf8JsonSnapshot -Path $completionPath `
                     -MaximumBytes 65536
                 $completion = $completionSnapshot.Value
-                break
+                $completionObservedUtc = [DateTime]::UtcNow
             }
             catch {
                 # The guest publishes by rename, but tolerate visibility latency
                 # in the mapped folder rather than consuming a partial file.
             }
+        }
+        if ($null -eq $launchRecord.Bootstrap -and
+            (Test-Path -LiteralPath $bootstrapPath -PathType Leaf)) {
+            $launchRecord.Bootstrap = Read-AuthenticatedBootstrapStage `
+                -Path $bootstrapPath -SessionId $sessionId -Nonce $nonce `
+                -RequestSha256 $requestSha256 `
+                -BootstrapScriptSha256 $bootstrapScriptSha256 `
+                -GuestScriptSha256 $guestScriptSha256
+        }
+        if ($null -eq $guestExit -and
+            (Test-Path -LiteralPath $guestExitPath -PathType Leaf)) {
+            $guestExit = Read-AuthenticatedGuestExit -Path $guestExitPath `
+                -ResultDirectory $resultDirectory -SessionId $sessionId `
+                -Nonce $nonce -RequestSha256 $requestSha256 `
+                -BootstrapScriptSha256 $bootstrapScriptSha256 `
+                -GuestScriptSha256 $guestScriptSha256
+            $launchRecord.GuestExit = $guestExit.Record
+            if ([int]$guestExit.Record.ExitCode -ne 0) {
+                throw "Windows Sandbox guest PowerShell exited with code $([int]$guestExit.Record.ExitCode) after '$([string]$guestExit.Record.LastStage)'. Diagnostic (bounded): `"$([string]$guestExit.Diagnostic)`""
+            }
+            $guestExitObservedUtc = [DateTime]::UtcNow
+        }
+        if (Test-Path -LiteralPath $bootstrapPublicationFailurePath -PathType Leaf) {
+            $publicationFailure = Read-Utf8TextSnapshot `
+                -Path $bootstrapPublicationFailurePath -MaximumBytes 262144
+            $diagnostic = [string]$publicationFailure.Text
+            if ($diagnostic.Length -gt 4096) {
+                $diagnostic = '[earlier publication failure detail omitted] ' +
+                    $diagnostic.Substring($diagnostic.Length - 4096)
+            }
+            $diagnostic = [regex]::Replace($diagnostic,
+                '[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]', '?')
+            throw "Windows Sandbox bootstrap could not publish its authenticated exit record. Diagnostic (bounded): `"$diagnostic`""
+        }
+        if ($null -ne $guestExit -and $null -eq $completion -and
+            ([DateTime]::UtcNow - $guestExitObservedUtc).TotalSeconds -ge
+                $GuestExitTimeoutSeconds) {
+            throw "Windows Sandbox guest PowerShell exited successfully after '$([string]$guestExit.Record.LastStage)' but did not publish completion.json within $GuestExitTimeoutSeconds seconds. Diagnostic (bounded): `"$([string]$guestExit.Diagnostic)`""
+        }
+        if ($null -ne $completion -and $null -eq $guestExit -and
+            ([DateTime]::UtcNow - $completionObservedUtc).TotalSeconds -ge
+                $GuestExitTimeoutSeconds) {
+            throw "Windows Sandbox published completion.json but its bootstrap did not publish an authenticated guest-exit record within $GuestExitTimeoutSeconds seconds."
+        }
+        if ($null -eq $launchRecord.Bootstrap -and
+            [DateTime]::UtcNow -ge $bootstrapDeadline) {
+            throw "Windows Sandbox did not publish an authenticated bootstrap record within $BootstrapTimeoutSeconds seconds. The guest LogonCommand or writable evidence mapping failed."
+        }
+        if ($null -ne $completion -and $null -ne $launchRecord.Bootstrap -and
+            $null -ne $guestExit -and [int]$guestExit.Record.ExitCode -eq 0) {
+            break
         }
         # Windows versions differ on whether the initial launcher remains the
         # long-lived UI process. Since preflight rejected an existing Sandbox,
@@ -791,7 +1078,11 @@ try {
         Start-Sleep -Milliseconds 500
     }
     if ($null -eq $completion) {
-        throw "Timed out after $TimeoutMinutes minutes waiting for the guest completion record. The runner did not terminate Windows Sandbox."
+        throw "Timed out after $TimeoutMinutes minutes waiting for the guest completion record after authenticated bootstrap. The runner did not terminate Windows Sandbox."
+    }
+    if ($null -eq $launchRecord.Bootstrap -or $null -eq $guestExit -or
+        [int]$guestExit.Record.ExitCode -ne 0) {
+        throw 'The Sandbox result boundary closed without authenticated bootstrap and successful guest-exit records.'
     }
     $completionProperties = @($completion.PSObject.Properties.Name | Sort-Object)
     $expectedCompletionProperties = @('CompletedUtc', 'EvidenceFile',
@@ -904,6 +1195,9 @@ $launchRecord.CompletionSha256 = if ($null -eq $completionSnapshot) {
 $launchRecord.CompletedUtc = [DateTime]::UtcNow.ToString('o')
 $launchRecord.Succeeded = $null -eq $hostFailure -and
     $launchRecord.HostStateUnchanged -and $launchRecord.ExplorerPidUnchanged -and
+    $null -ne $launchRecord.Bootstrap -and
+    $null -ne $launchRecord.GuestExit -and
+    [int]$launchRecord.GuestExit.ExitCode -eq 0 -and
     $null -ne $completion -and [string]$completion.Status -ceq 'Passed'
 $updatedHostResult = "$hostResultPath.updated"
 Write-Utf8NoBomAtomic -Path $updatedHostResult `

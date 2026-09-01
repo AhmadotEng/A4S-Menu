@@ -12,6 +12,10 @@ single writable evidence mapping.
 [CmdletBinding()]
 param(
     [string] $RequestPath,
+    [string] $ExpectedSessionId,
+    [string] $ExpectedNonce,
+    [string] $ExpectedRequestSha256,
+    [string] $ExpectedGuestScriptSha256,
     [switch] $ContractSelfTest
 )
 
@@ -150,6 +154,35 @@ public static class A4SSandboxAtomicFile
         try { [IO.File]::Delete($temporary) } catch {}
         throw
     }
+}
+
+function Write-GuestStage {
+    param(
+        [Parameter(Mandatory)][ValidateRange(10, 89)][int] $Ordinal,
+        [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]+$')][string] $Stage
+    )
+    $record = [ordered]@{
+        SchemaVersion = 1
+        SessionId = $script:expectedSessionId
+        Nonce = $script:expectedNonce
+        RequestSha256 = $script:expectedRequestSha256
+        GuestScriptSha256 = $script:expectedGuestScriptSha256
+        Ordinal = $Ordinal
+        Stage = $Stage
+        ProcessId = $PID
+        CapturedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    $path = Join-Path $script:evidenceRoot `
+        ('stage-{0:D3}-{1}.json' -f $Ordinal, $Stage)
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes(
+        ($record | ConvertTo-Json -Depth 20))
+    $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew,
+        [IO.FileAccess]::Write, [IO.FileShare]::Read)
+    try {
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.Flush($true)
+    }
+    finally { $stream.Dispose() }
 }
 
 function Read-Utf8JsonSnapshot {
@@ -771,7 +804,7 @@ function Assert-CleanDisposableStart {
         (Get-RegistryValueRecord 'Software\Microsoft\Windows\CurrentVersion\RunOnce' '!A4SMenuServicingRecovery').Present -or
         (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'A4SMenu')) -or
         (Test-Path -LiteralPath (Join-Path ([IO.Path]::GetTempPath()) 'A4SMenuCleanup.exe')) -or
-        (Get-A4SProcessInventory).Count -ne 0) {
+        @(Get-A4SProcessInventory).Count -ne 0) {
         throw 'Windows Sandbox did not start with a clean A4S product state.'
     }
     $explorerPid = Get-TaskbarExplorerPid
@@ -798,7 +831,14 @@ function Assert-SandboxConfiguration {
         throw 'ProtectedClient is not enabled.'
     }
     $expectedLogonCommand =
-        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1" -RequestPath "C:\A4S\Control\request.json"'
+        'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxBootstrap.ps1"' +
+        ' -GuestScriptPath "C:\A4S\Repo\tools\Invoke-A4SLegacySandboxGuest.ps1"' +
+        ' -RequestPath "C:\A4S\Control\request.json" -EvidenceRoot "C:\A4S\Evidence"' +
+        ' -SessionId "' + [string]$request.SessionId + '"' +
+        ' -Nonce "' + [string]$request.Nonce + '"' +
+        ' -RequestSha256 "' + $requestSha256 + '"' +
+        ' -BootstrapScriptSha256 "' + [string]$request.HostPreflight.BootstrapScriptSha256 + '"' +
+        ' -GuestScriptSha256 "' + [string]$request.HostPreflight.GuestScriptSha256 + '"'
     if ([string]$xml.Configuration.LogonCommand.Command -cne $expectedLogonCommand) {
         throw 'Sandbox LogonCommand does not name the exact reviewed guest entry point.'
     }
@@ -859,6 +899,21 @@ function Assert-ContractModel {
     if ((Get-ObjectSha256 $sample) -notmatch '^[0-9A-F]{64}$') {
         throw 'Deterministic evidence hashing failed.'
     }
+    $publicationRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ('A4SGuestPublicationContract-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($publicationRoot) | Out-Null
+    try {
+        $publicationPath = Join-Path $publicationRoot 'atomic.json'
+        Write-Utf8NoBomAtomic -Path $publicationPath -Text '{"contract":true}'
+        if ([IO.File]::ReadAllText($publicationPath) -cne '{"contract":true}') {
+            throw 'Guest atomic evidence publication contract failed.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($publicationRoot)) {
+            [IO.Directory]::Delete($publicationRoot, $true)
+        }
+    }
     Write-Host 'A4S legacy Sandbox guest in-memory contract passed.'
 }
 
@@ -867,9 +922,24 @@ if ($ContractSelfTest) {
     return
 }
 
+$script:evidenceRoot = 'C:\A4S\Evidence'
+$script:expectedSessionId = [string]$ExpectedSessionId
+$script:expectedNonce = [string]$ExpectedNonce
+$script:expectedRequestSha256 = [string]$ExpectedRequestSha256
+$script:expectedGuestScriptSha256 = [string]$ExpectedGuestScriptSha256
+if ($script:expectedSessionId -notmatch
+        '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
+    $script:expectedNonce -notmatch '^[0-9A-F]{64}$' -or
+    $script:expectedRequestSha256 -notmatch '^[0-9A-F]{64}$' -or
+    $script:expectedGuestScriptSha256 -notmatch '^[0-9A-F]{64}$') {
+    throw 'The bootstrap did not supply valid guest correlation parameters.'
+}
+Write-GuestStage -Ordinal 10 -Stage 'guest-entry'
+
 if ([string]::IsNullOrWhiteSpace($RequestPath)) { throw '-RequestPath is required in the Sandbox guest.' }
 $sandboxIdentity = Get-WindowsSandboxIdentity
 if (-not [Environment]::Is64BitProcess) { throw 'The Sandbox guest requires 64-bit PowerShell.' }
+Write-GuestStage -Ordinal 11 -Stage 'identity-validated'
 
 $requestFullPath = [IO.Path]::GetFullPath($RequestPath)
 if ($requestFullPath -ine 'C:\A4S\Control\request.json') {
@@ -878,6 +948,7 @@ if ($requestFullPath -ine 'C:\A4S\Control\request.json') {
 $requestSnapshot = Read-Utf8JsonSnapshot -Path $requestFullPath -MaximumBytes 1048576
 $requestSha256 = [string]$requestSnapshot.Sha256
 $request = $requestSnapshot.Value
+Write-GuestStage -Ordinal 12 -Stage 'request-read'
 $requestProperties = @($request.PSObject.Properties.Name | Sort-Object)
 $expectedRequestProperties = @('CreatedUtc', 'ExplorerRestartAuthorized',
     'GuestControlRoot', 'GuestEvidenceRoot', 'GuestRepoRoot', 'HostPreflight',
@@ -893,6 +964,9 @@ if ([int]$request.SchemaVersion -ne 1 -or
     [string]$request.SessionId -notmatch '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' -or
     [string]$request.Nonce -notmatch '^[0-9A-F]{64}$' -or
     [bool]$request.ExplorerRestartAuthorized -or
+    [string]$request.SessionId -cne $script:expectedSessionId -or
+    [string]$request.Nonce -cne $script:expectedNonce -or
+    $requestSha256 -cne $script:expectedRequestSha256 -or
     (@($request.RequiredMatrix) -join '|') -cne ($requiredMatrix -join '|')) {
     throw 'The Sandbox request schema or fixed matrix is invalid.'
 }
@@ -903,11 +977,15 @@ if ([string]$request.V1.Version -cne '1.0.0.0' -or
     [string]$request.V2.Version -cne '1.1.0.0') {
     throw 'The request does not name the frozen V1 and reviewed V2 version contract.'
 }
+Write-GuestStage -Ordinal 13 -Stage 'request-validated'
 if ([string]$request.HostPreflight.GuestScriptSha256 -notmatch '^[0-9A-F]{64}$' -or
+    [string]$request.HostPreflight.GuestScriptSha256 -cne
+        $script:expectedGuestScriptSha256 -or
     (Get-FileHash -Algorithm SHA256 -LiteralPath $MyInvocation.MyCommand.Path).Hash.ToUpperInvariant() -cne
         [string]$request.HostPreflight.GuestScriptSha256) {
     throw 'The executing guest script does not match the exact host-preflight script hash.'
 }
+Write-GuestStage -Ordinal 14 -Stage 'script-hash-validated'
 foreach ($hash in @($request.V2.SetupSha256, $request.V2.HostSha256, $request.V2.MenuSha256)) {
     Normalize-Sha256 ([string]$hash) | Out-Null
 }
@@ -922,15 +1000,19 @@ foreach ($source in @($v1Source, $v2Source)) {
         throw 'A setup path escaped the read-only repository mapping.'
     }
 }
+Write-GuestStage -Ordinal 15 -Stage 'paths-resolved'
 
 $script:workRoot = Join-Path ([IO.Path]::GetTempPath()) `
     ("A4SLegacySandbox-" + [string]$request.Nonce)
 if (Test-Path -LiteralPath $script:workRoot) { throw 'Guest work-directory collision.' }
+Write-GuestStage -Ordinal 16 -Stage 'workdir-create-start'
 [IO.Directory]::CreateDirectory($script:workRoot) | Out-Null
+Write-GuestStage -Ordinal 17 -Stage 'workdir-created'
 $localV1 = Join-Path $script:workRoot 'A4SMenuSetup-1.0.0.0.exe'
 $localV2 = Join-Path $script:workRoot 'A4SMenuSetup-1.1.0.0.exe'
 [IO.File]::Copy($v1Source, $localV1, $false)
 [IO.File]::Copy($v2Source, $localV2, $false)
+Write-GuestStage -Ordinal 18 -Stage 'setup-inputs-copied'
 
 $script:evidence = [ordered]@{
     SchemaVersion = 1
@@ -949,11 +1031,16 @@ $script:evidence = [ordered]@{
     Failure = $null
 }
 $failure = $null
+Write-GuestStage -Ordinal 19 -Stage 'evidence-initialized'
 
 try {
+    Write-GuestStage -Ordinal 20 -Stage 'preflight-started'
     $configuration = Assert-SandboxConfiguration -ControlRoot $controlRoot
+    Write-GuestStage -Ordinal 21 -Stage 'configuration-validated'
     $network = Assert-NetworkDisabled
+    Write-GuestStage -Ordinal 22 -Stage 'network-validated'
     Assert-CleanDisposableStart
+    Write-GuestStage -Ordinal 23 -Stage 'clean-state-validated'
     $initialExplorerPid = Get-TaskbarExplorerPid
     $script:evidence.Environment = [ordered]@{
         UserName = $env:USERNAME

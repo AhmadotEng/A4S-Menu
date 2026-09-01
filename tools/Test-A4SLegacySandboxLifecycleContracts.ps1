@@ -6,6 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
 $hostPath = Join-Path $PSScriptRoot 'Invoke-A4SLegacySandboxLifecycle.ps1'
+$bootstrapPath = Join-Path $PSScriptRoot 'Invoke-A4SLegacySandboxBootstrap.ps1'
 $guestPath = Join-Path $PSScriptRoot 'Invoke-A4SLegacySandboxGuest.ps1'
 
 function Assert-Contract {
@@ -49,13 +50,23 @@ function Assert-OrderedMarkers {
     }
 }
 
-foreach ($path in @($hostPath, $guestPath)) {
+foreach ($path in @($hostPath, $bootstrapPath, $guestPath)) {
     Assert-Contract (Test-Path -LiteralPath $path -PathType Leaf) "missing $path"
 }
 $hostSource = [IO.File]::ReadAllText($hostPath)
+$bootstrapSource = [IO.File]::ReadAllText($bootstrapPath)
 $guestSource = [IO.File]::ReadAllText($guestPath)
 $hostAst = Parse-Script $hostPath
+$bootstrapAst = Parse-Script $bootstrapPath
 $guestAst = Parse-Script $guestPath
+
+$guestStageDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Write-GuestStage'
+}, $true))
+Assert-Contract ($guestStageDefinitions.Count -eq 1) `
+    'guest must define exactly one executable Write-GuestStage function'
 
 $hostReplacementDefinitions = @($hostAst.FindAll({
     param($node)
@@ -114,6 +125,13 @@ foreach ($marker in @(
         'Read-Utf8JsonSnapshot -Path $guestEvidencePath',
         '$guestEvidence.Environment.WindowsIdentity.Sid',
         '$guestEvidence.Environment.Configuration.ControlReadOnly',
+        'Read-AuthenticatedBootstrapStage',
+        'Read-AuthenticatedGuestExit',
+        'guest-exit.json',
+        'bootstrap-publication-failure.txt',
+        'Diagnostic (bounded):',
+        '$BootstrapTimeoutSeconds seconds',
+        '$GuestExitTimeoutSeconds seconds',
         "[string]`$completion.Status -ceq 'Failed'",
         'The Sandbox guest reported failure:',
         'Windows Sandbox exited without publishing a completion record',
@@ -135,6 +153,37 @@ Assert-OrderedMarkers $hostSource @(
     'Publish-HostResultReplacement -StagedPath $startedHostResult',
     'catch {',
     '$hostFailure = $_') 'post-launch failure capture boundary'
+$hostResultWaits = @($hostAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.WhileStatementAst] -and
+        $node.Extent.Text.IndexOf('$completionPath',
+            [StringComparison]::Ordinal) -ge 0
+}, $true))
+Assert-Contract ($hostResultWaits.Count -eq 1) `
+    'host must define exactly one completion/bootstrap/exit wait state machine'
+$hostResultWaitText = $hostResultWaits[0].Extent.Text
+$resultWaitBreaks = @($hostResultWaits[0].FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.BreakStatementAst]
+}, $true))
+Assert-Contract ($resultWaitBreaks.Count -eq 1) `
+    'host result wait must break only after the complete authenticated result set'
+Assert-OrderedMarkers $hostResultWaitText @(
+    '$completion = $completionSnapshot.Value',
+    'Read-AuthenticatedBootstrapStage',
+    'Read-AuthenticatedGuestExit',
+    '$bootstrapPublicationFailurePath',
+    '$null -ne $completion',
+    '$null -ne $launchRecord.Bootstrap',
+    '$null -ne $guestExit',
+    'break') 'host authenticated completion/bootstrap/exit state machine'
+Assert-OrderedMarkers $hostSource @(
+    '$launchRecord.Succeeded =',
+    '$null -ne $launchRecord.Bootstrap',
+    '$null -ne $launchRecord.GuestExit',
+    '[int]$launchRecord.GuestExit.ExitCode -eq 0',
+    "[string]`$completion.Status -ceq 'Passed'") `
+    'host success requires bootstrap, zero guest exit, and passed completion'
 
 foreach ($marker in @(
         '<vGPU>Disable</vGPU>',
@@ -145,6 +194,7 @@ foreach ($marker in @(
         '<PrinterRedirection>Disable</PrinterRedirection>',
         '<ClipboardRedirection>Disable</ClipboardRedirection>',
         'C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe',
+        'Invoke-A4SLegacySandboxBootstrap.ps1',
         '<SandboxFolder>C:\A4S\Repo</SandboxFolder>',
         '<ReadOnly>true</ReadOnly>',
         '<SandboxFolder>C:\A4S\Control</SandboxFolder>',
@@ -185,6 +235,10 @@ foreach ($marker in @(
         '[Security.Principal.WindowsIdentity]::GetCurrent()',
         "`$sid -notmatch '^S-1-5-21-(?:[0-9]+-){3}504$'",
         "`$requestFullPath -ine 'C:\A4S\Control\request.json'",
+        'Write-GuestStage -Ordinal 10',
+        'Write-GuestStage -Ordinal 17',
+        'Write-GuestStage -Ordinal 23',
+        '@(Get-A4SProcessInventory).Count',
         'Read-Utf8JsonSnapshot -Path $requestFullPath',
         'Assert-SandboxConfiguration',
         'Assert-NetworkDisabled',
@@ -203,6 +257,9 @@ foreach ($marker in @(
         'completion.json')) {
     Assert-ContainsOrdinal $guestSource $marker 'guest isolation/evidence safety'
 }
+Assert-Contract (-not [regex]::IsMatch($guestSource,
+        '(?<!@)\(Get-A4SProcessInventory\)\.Count')) `
+    'guest clean-state inventory regressed to StrictMode-unsafe null .Count access'
 Assert-OrderedMarkers $guestSource @(
     '$sandboxIdentity = Get-WindowsSandboxIdentity',
     '$requestSnapshot = Read-Utf8JsonSnapshot',
@@ -241,11 +298,65 @@ Assert-Contract ($guestSource.IndexOf('NetworkInterfaceType]::Tunnel',
         [StringComparison]::Ordinal) -lt 0) `
     'guest network guard excludes tunnel interfaces from the fail-closed check'
 
-& $guestPath -ContractSelfTest
+foreach ($marker in @(
+        'stage-{0:D3}-{1}.json',
+        "-Stage 'bootstrap-entry'",
+        "-Stage 'guest-process-starting'",
+        "-Stage 'guest-process-exited'",
+        'guest-console.log',
+        'guest-exit.json',
+        'ConsoleSha256',
+        'Start-Process -FilePath $windowsPowerShell',
+        '$guestProcess.WaitForExit()',
+        '-RedirectStandardOutput $stdoutPath',
+        '-RedirectStandardError $stderrPath')) {
+    Assert-ContainsOrdinal $bootstrapSource $marker 'Sandbox bootstrap diagnostics'
+}
+Assert-OrderedMarkers $bootstrapSource @(
+    "-Stage 'bootstrap-entry'",
+    '$actualBootstrapSha256 = Get-FileSha256',
+    '$actualGuestSha256 -cne $GuestScriptSha256',
+    "-Stage 'scripts-authenticated'",
+    "-Stage 'guest-process-starting'",
+    'Start-Process -FilePath $windowsPowerShell',
+    "-Stage 'guest-process-exited'",
+    "Join-Path `$fixedEvidence 'guest-console.log'",
+    "Join-Path `$fixedEvidence 'guest-exit.json'") `
+    'bootstrap correlation, capture, and exit publication'
+$bootstrapStartProcesses = @($bootstrapAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.CommandAst] -and
+        $node.GetCommandName() -ieq 'Start-Process'
+}, $true))
+Assert-Contract ($bootstrapStartProcesses.Count -eq 1) `
+    'bootstrap must start exactly one child process'
+Assert-Contract ($bootstrapStartProcesses[0].Extent.Text.IndexOf('$windowsPowerShell',
+        [StringComparison]::Ordinal) -ge 0) `
+    'bootstrap child process is not canonical Windows PowerShell'
+Assert-Contract ($bootstrapStartProcesses[0].Extent.Text.IndexOf('-Wait',
+        [StringComparison]::OrdinalIgnoreCase) -lt 0) `
+    'bootstrap must not wait for detached guest descendants through Start-Process -Wait'
+
 $windowsPowerShell = Join-Path $env:SystemRoot `
     'System32\WindowsPowerShell\v1.0\powershell.exe'
 Assert-Contract (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf) `
     'canonical Windows PowerShell 5.1 executable is missing'
+$guestContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
+    -ExecutionPolicy Bypass -File $guestPath -ContractSelfTest 2>&1)
+$guestContractExitCode = $LASTEXITCODE
+Assert-Contract ($guestContractExitCode -eq 0) `
+    "guest contract failed under Windows PowerShell 5.1: $($guestContractOutput -join ' ')"
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest in-memory contract passed') `
+    'guest atomic evidence writer was not dynamically exercised by explicit Windows PowerShell 5.1'
+$bootstrapContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
+    -ExecutionPolicy Bypass -File $bootstrapPath -ContractSelfTest 2>&1)
+$bootstrapContractExitCode = $LASTEXITCODE
+Assert-Contract ($bootstrapContractExitCode -eq 0) `
+    "bootstrap contract failed under Windows PowerShell 5.1: $($bootstrapContractOutput -join ' ')"
+Assert-Contract (($bootstrapContractOutput -join ' ') -match
+        'bootstrap contract passed under Windows PowerShell 5\.1\.') `
+    'bootstrap UTF-8 publication was not dynamically exercised by explicit Windows PowerShell 5.1'
 $hostContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
     -ExecutionPolicy Bypass -File $hostPath -ContractSelfTest 2>&1)
 $hostContractExitCode = $LASTEXITCODE
