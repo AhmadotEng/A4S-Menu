@@ -159,7 +159,8 @@ public static class A4SSandboxAtomicFile
 function Write-GuestStage {
     param(
         [Parameter(Mandatory)][ValidateRange(10, 89)][int] $Ordinal,
-        [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]+$')][string] $Stage
+        [Parameter(Mandatory)][ValidatePattern('^[a-z0-9-]+$')][string] $Stage,
+        [hashtable] $Details
     )
     $record = [ordered]@{
         SchemaVersion = 1
@@ -171,6 +172,9 @@ function Write-GuestStage {
         Stage = $Stage
         ProcessId = $PID
         CapturedUtc = [DateTime]::UtcNow.ToString('o')
+    }
+    if ($PSBoundParameters.ContainsKey('Details')) {
+        $record.Details = $Details
     }
     $path = Join-Path $script:evidenceRoot `
         ('stage-{0:D3}-{1}.json' -f $Ordinal, $Stage)
@@ -419,14 +423,66 @@ function Initialize-ExplorerProbe {
     Add-Type -TypeDefinition @'
 using System;
 using System.ComponentModel;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Threading;
+
+public sealed class A4SSandboxModuleSnapshot
+{
+    public int TotalModuleCount { get; private set; }
+    public string MainModulePath { get; private set; }
+    public string[] A4SMenuModulePaths { get; private set; }
+
+    public A4SSandboxModuleSnapshot(int totalModuleCount, string mainModulePath,
+        string[] a4SMenuModulePaths)
+    {
+        TotalModuleCount = totalModuleCount;
+        MainModulePath = mainModulePath;
+        A4SMenuModulePaths = a4SMenuModulePaths;
+    }
+}
 
 public static class A4SSandboxWindowProbe
 {
+    private const uint TH32CS_SNAPMODULE = 0x00000008;
+    private const uint TH32CS_SNAPMODULE32 = 0x00000010;
+    private const int ERROR_BAD_LENGTH = 24;
+    private const int ERROR_NO_MORE_FILES = 18;
+    private const int ERROR_INVALID_DATA = 13;
+    private static readonly IntPtr InvalidHandleValue = new IntPtr(-1);
+
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MODULEENTRY32
+    {
+        public uint dwSize;
+        public uint th32ModuleID;
+        public uint th32ProcessID;
+        public uint GlblcntUsage;
+        public uint ProccntUsage;
+        public IntPtr modBaseAddr;
+        public uint modBaseSize;
+        public IntPtr hModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)]
+        public string szModule;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+        public string szExePath;
+    }
+
     [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     private static extern IntPtr FindWindowW(string className, string windowName);
     [DllImport("user32.dll", SetLastError = true)]
     private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint processId);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Module32FirstW(IntPtr snapshot, ref MODULEENTRY32 entry);
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool Module32NextW(IntPtr snapshot, ref MODULEENTRY32 entry);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool CloseHandle(IntPtr handle);
 
     public static int TaskbarExplorerPid()
     {
@@ -436,6 +492,90 @@ public static class A4SSandboxWindowProbe
         if (GetWindowThreadProcessId(taskbar, out processId) == 0 || processId == 0)
             throw new Win32Exception(Marshal.GetLastWin32Error(), "Taskbar Explorer PID was not resolved");
         return checked((int)processId);
+    }
+
+    public static A4SSandboxModuleSnapshot ModuleSnapshotForProcess(int processId)
+    {
+        if (processId <= 0) throw new ArgumentOutOfRangeException("processId");
+        for (int attempt = 0; attempt < 8; ++attempt)
+        {
+            IntPtr snapshot = CreateToolhelp32Snapshot(
+                TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, checked((uint)processId));
+            if (snapshot == InvalidHandleValue)
+            {
+                int createError = Marshal.GetLastWin32Error();
+                if (createError == ERROR_BAD_LENGTH)
+                {
+                    Thread.Sleep(10);
+                    continue;
+                }
+                throw new Win32Exception(createError, "Explorer module snapshot creation failed");
+            }
+
+            bool retry = false;
+            try
+            {
+                List<string> a4SMenuPaths = new List<string>();
+                int totalModuleCount = 0;
+                string mainModulePath = null;
+                MODULEENTRY32 entry = new MODULEENTRY32();
+                entry.dwSize = checked((uint)Marshal.SizeOf(typeof(MODULEENTRY32)));
+                if (!Module32FirstW(snapshot, ref entry))
+                {
+                    int firstError = Marshal.GetLastWin32Error();
+                    if (firstError == ERROR_NO_MORE_FILES)
+                        throw new Win32Exception(firstError,
+                            "Explorer module snapshot was unexpectedly empty");
+                    if (firstError == ERROR_BAD_LENGTH) retry = true;
+                    else throw new Win32Exception(firstError, "Explorer module enumeration failed to start");
+                }
+                else
+                {
+                    while (true)
+                    {
+                        if (entry.th32ProcessID != checked((uint)processId) ||
+                            String.IsNullOrWhiteSpace(entry.szExePath))
+                            throw new Win32Exception(ERROR_INVALID_DATA,
+                                "Explorer returned an invalid module snapshot entry");
+                        ++totalModuleCount;
+                        if (mainModulePath == null) mainModulePath = entry.szExePath;
+                        if (String.Equals(entry.szModule, "A4SMenu.dll",
+                                StringComparison.OrdinalIgnoreCase))
+                        {
+                            a4SMenuPaths.Add(entry.szExePath);
+                        }
+                        entry.dwSize = checked((uint)Marshal.SizeOf(typeof(MODULEENTRY32)));
+                        if (Module32NextW(snapshot, ref entry)) continue;
+                        int nextError = Marshal.GetLastWin32Error();
+                        if (nextError == ERROR_NO_MORE_FILES)
+                        {
+                            if (totalModuleCount <= 0 || String.IsNullOrWhiteSpace(mainModulePath))
+                                throw new Win32Exception(ERROR_NO_MORE_FILES,
+                                    "Explorer module snapshot did not prove a main module");
+                            return new A4SSandboxModuleSnapshot(totalModuleCount,
+                                mainModulePath, a4SMenuPaths.ToArray());
+                        }
+                        if (nextError == ERROR_BAD_LENGTH)
+                        {
+                            retry = true;
+                            break;
+                        }
+                        throw new Win32Exception(nextError, "Explorer module enumeration failed");
+                    }
+                }
+            }
+            finally
+            {
+                CloseHandle(snapshot);
+            }
+            if (retry)
+            {
+                Thread.Sleep(10);
+                continue;
+            }
+        }
+        throw new Win32Exception(ERROR_BAD_LENGTH,
+            "Explorer module snapshot remained unstable after eight attempts");
     }
 }
 '@
@@ -449,20 +589,44 @@ function Get-TaskbarExplorerPid {
 function Get-ExplorerModuleInventory {
     param([Parameter(Mandatory)][int] $ExplorerPid)
     $modules = [Collections.Generic.List[object]]::new()
-    $process = Get-Process -Id $ExplorerPid -ErrorAction Stop
     try {
-        foreach ($module in @($process.Modules)) {
-            if ($module.ModuleName -ieq 'A4SMenu.dll') {
-                $identity = Get-FileIdentity $module.FileName
-                $modules.Add($identity)
-            }
+        Initialize-ExplorerProbe
+        $snapshot = [A4SSandboxWindowProbe]::ModuleSnapshotForProcess($ExplorerPid)
+        if ([int]$snapshot.TotalModuleCount -le 0 -or
+            [string]::IsNullOrWhiteSpace([string]$snapshot.MainModulePath)) {
+            throw 'The native Explorer module snapshot did not prove a main module.'
         }
-        return [ordered]@{ Complete = $true; Error = $null; Modules = @($modules) }
+        $mainModulePath = [IO.Path]::GetFullPath([string]$snapshot.MainModulePath)
+        $canonicalExplorerPath = [IO.Path]::GetFullPath(
+            (Join-Path $env:SystemRoot 'explorer.exe'))
+        if (-not $mainModulePath.Equals($canonicalExplorerPath,
+                [StringComparison]::OrdinalIgnoreCase)) {
+            throw 'The native module snapshot main image is not canonical Explorer.'
+        }
+        foreach ($modulePath in @($snapshot.A4SMenuModulePaths)) {
+            $identity = Get-FileIdentity $modulePath
+            $modules.Add($identity)
+        }
+        if ((Get-TaskbarExplorerPid) -ne $ExplorerPid) {
+            throw 'The taskbar Explorer changed while its module snapshot was captured.'
+        }
+        return [ordered]@{
+            Complete = $true
+            Error = $null
+            TotalModuleCount = [int]$snapshot.TotalModuleCount
+            MainModulePath = $mainModulePath
+            Modules = @($modules)
+        }
     }
     catch {
-        return [ordered]@{ Complete = $false; Error = $_.Exception.Message; Modules = @($modules) }
+        return [ordered]@{
+            Complete = $false
+            Error = $_.Exception.Message
+            TotalModuleCount = 0
+            MainModulePath = $null
+            Modules = @($modules)
+        }
     }
-    finally { $process.Dispose() }
 }
 
 function Get-A4SProcessInventory {
@@ -547,8 +711,18 @@ function Assert-ExplorerUnchanged {
         [Parameter(Mandatory)] $Checkpoint,
         [Parameter(Mandatory)][int] $InitialExplorerPid
     )
-    if ([int]$Checkpoint.ExplorerPid -ne $InitialExplorerPid) {
-        throw "Explorer PID changed at $($Checkpoint.Label); --restart-explorer was not authorized."
+    $canonicalExplorerPath = [IO.Path]::GetFullPath(
+        (Join-Path $env:SystemRoot 'explorer.exe'))
+    if ([int]$Checkpoint.ExplorerPid -ne $InitialExplorerPid -or
+        -not $Checkpoint.ExplorerModules.Complete -or
+        [int]$Checkpoint.ExplorerModules.TotalModuleCount -le 0 -or
+        [string]::IsNullOrWhiteSpace(
+            [string]$Checkpoint.ExplorerModules.MainModulePath) -or
+        -not ([IO.Path]::GetFullPath(
+            [string]$Checkpoint.ExplorerModules.MainModulePath).Equals(
+                $canonicalExplorerPath,
+                [StringComparison]::OrdinalIgnoreCase))) {
+        throw "Explorer identity or complete canonical module proof changed at $($Checkpoint.Label); --restart-explorer was not authorized."
     }
 }
 
@@ -685,15 +859,58 @@ function Quote-ProcessArgument {
     return '"' + ($Value -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"'
 }
 
+function Stop-ExactProcessBounded {
+    param(
+        [Parameter(Mandatory)][Diagnostics.Process] $Process,
+        [Parameter(Mandatory)][int] $ProcessId,
+        [Parameter(Mandatory)][ValidateRange(100, 10000)][int] $WaitMilliseconds
+    )
+    $killFailure = $null
+    $killAttempted = $true
+    $killReturned = $false
+    try {
+        $Process.Kill()
+        $killReturned = $true
+    }
+    catch { $killFailure = $_.Exception.Message }
+    $exitConfirmed = $false
+    try { $exitConfirmed = $Process.WaitForExit($WaitMilliseconds) }
+    catch {
+        if ([string]::IsNullOrWhiteSpace($killFailure)) {
+            $killFailure = $_.Exception.Message
+        }
+    }
+    return [ordered]@{
+        ProcessId = $ProcessId
+        KillAttempted = $killAttempted
+        KillReturned = $killReturned
+        ExitConfirmed = $exitConfirmed
+        KillFailure = $killFailure
+    }
+}
+
 function Invoke-ExactProcess {
     param(
         [Parameter(Mandatory)][string] $Path,
         [Parameter(Mandatory)][string[]] $Arguments,
         [Parameter(Mandatory)][string] $Label,
-        [ValidateRange(10, 300)][int] $TimeoutSeconds = 120
+        [ValidateRange(1, 300)][int] $TimeoutSeconds = 120,
+        [ValidateRange(100, 10000)][int] $KillWaitMilliseconds = 5000,
+        [ValidateRange(0, 89)][int] $StartedStageOrdinal = 0,
+        [string] $StartedStage,
+        [ValidateRange(0, 89)][int] $TimeoutStageOrdinal = 0,
+        [string] $TimeoutStage
     )
     if (@($Arguments | Where-Object { $_ -ieq '--restart-explorer' }).Count -ne 0) {
         throw '--restart-explorer is forbidden in the Sandbox lifecycle matrix.'
+    }
+    if (($StartedStageOrdinal -eq 0) -ne [string]::IsNullOrWhiteSpace($StartedStage) -or
+        ($StartedStageOrdinal -ne 0 -and ($StartedStageOrdinal -lt 10 -or
+            $StartedStage -notmatch '^[a-z0-9-]+$')) -or
+        ($TimeoutStageOrdinal -eq 0) -ne [string]::IsNullOrWhiteSpace($TimeoutStage) -or
+        ($TimeoutStageOrdinal -ne 0 -and ($TimeoutStageOrdinal -lt 10 -or
+            $TimeoutStage -notmatch '^[a-z0-9-]+$'))) {
+        throw 'Exact-process diagnostic stage parameters are incomplete or malformed.'
     }
     $stdoutPath = Join-Path $script:workRoot "$Label.stdout.txt"
     $stderrPath = Join-Path $script:workRoot "$Label.stderr.txt"
@@ -702,26 +919,99 @@ function Invoke-ExactProcess {
         Quote-ProcessArgument ([string]$_)
     })
     $argumentLine = $quotedArguments -join ' '
-    $process = Start-Process -FilePath $Path -ArgumentList $argumentLine `
-        -WindowStyle Hidden -RedirectStandardOutput $stdoutPath `
-        -RedirectStandardError $stderrPath -PassThru
-    if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
-        try { $process.Kill(); $process.WaitForExit() } catch {}
-        throw "$Label exceeded the $TimeoutSeconds second guest-only timeout."
+    $process = $null
+    $record = $null
+    $childProcessId = 0
+    $failureKind = $null
+    try {
+        $process = Start-Process -FilePath $Path -ArgumentList $argumentLine `
+            -WindowStyle Hidden -RedirectStandardOutput $stdoutPath `
+            -RedirectStandardError $stderrPath -PassThru
+        $childProcessId = [int]$process.Id
+        if ($StartedStageOrdinal -ne 0) {
+            $startedDetails = @{
+                Label = $Label
+                ChildProcessId = $childProcessId
+                TimeoutSeconds = $TimeoutSeconds
+                KillWaitMilliseconds = $KillWaitMilliseconds
+            }
+            Write-GuestStage -Ordinal $StartedStageOrdinal -Stage $StartedStage `
+                -Details $startedDetails
+        }
+        if (-not $process.WaitForExit($TimeoutSeconds * 1000)) {
+            $failureKind = 'timeout'
+            throw [TimeoutException]::new(
+                "$Label exceeded the $TimeoutSeconds second guest-only timeout.")
+        }
+        $record = [ordered]@{
+            Label = $Label
+            Path = [IO.Path]::GetFullPath($Path)
+            Arguments = @($Arguments)
+            StartedUtc = $started.ToString('o')
+            CompletedUtc = [DateTime]::UtcNow.ToString('o')
+            DurationMilliseconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds, 3)
+            ExitCode = [int]$process.ExitCode
+            Stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -Raw -LiteralPath $stdoutPath } else { '' }
+            Stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -Raw -LiteralPath $stderrPath } else { '' }
+        }
+        if ($record.ExitCode -ne 0) {
+            throw "$Label failed with exit code $($record.ExitCode)."
+        }
     }
-    $record = [ordered]@{
-        Label = $Label
-        Path = [IO.Path]::GetFullPath($Path)
-        Arguments = @($Arguments)
-        StartedUtc = $started.ToString('o')
-        CompletedUtc = [DateTime]::UtcNow.ToString('o')
-        DurationMilliseconds = [Math]::Round(([DateTime]::UtcNow - $started).TotalMilliseconds, 3)
-        ExitCode = [int]$process.ExitCode
-        Stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -Raw -LiteralPath $stdoutPath } else { '' }
-        Stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -Raw -LiteralPath $stderrPath } else { '' }
+    catch {
+        $causalError = $_
+        if ($null -ne $process) {
+            $cleanup = Stop-ExactProcessBounded -Process $process `
+                -ProcessId $childProcessId -WaitMilliseconds $KillWaitMilliseconds
+            try {
+                $causalError.Exception.Data['A4SExactProcessId'] = $childProcessId
+                $causalError.Exception.Data['A4SKillAttempted'] = $cleanup.KillAttempted
+                $causalError.Exception.Data['A4SKillReturned'] = $cleanup.KillReturned
+                $causalError.Exception.Data['A4SExitConfirmed'] = $cleanup.ExitConfirmed
+                $causalError.Exception.Data['A4SKillFailure'] = $cleanup.KillFailure
+            }
+            catch {}
+            if ($failureKind -ceq 'timeout' -and $TimeoutStageOrdinal -ne 0) {
+                try {
+                    Write-GuestStage -Ordinal $TimeoutStageOrdinal -Stage $TimeoutStage `
+                        -Details @{
+                            Label = $Label
+                            ChildProcessId = $childProcessId
+                            TimeoutSeconds = $TimeoutSeconds
+                            KillWaitMilliseconds = $KillWaitMilliseconds
+                            KillAttempted = $cleanup.KillAttempted
+                            KillReturned = $cleanup.KillReturned
+                            ExitConfirmed = $cleanup.ExitConfirmed
+                            KillFailure = $cleanup.KillFailure
+                        }
+                }
+                catch {
+                    try {
+                        $causalError.Exception.Data['A4STimeoutStagePublicationFailure'] =
+                            $_.Exception.Message
+                    }
+                    catch {}
+                }
+            }
+            if (-not $cleanup.ExitConfirmed) {
+                $cleanupDetail = if ([string]::IsNullOrWhiteSpace($cleanup.KillFailure)) {
+                    'the termination request returned without a confirmed exit'
+                }
+                else { [string]$cleanup.KillFailure }
+                $cleanupException = [InvalidOperationException]::new(
+                    "$Label failed after starting exact PID $childProcessId, and its exit was not confirmed within $KillWaitMilliseconds milliseconds ($cleanupDetail). Causal error: $($causalError.Exception.Message)",
+                    $causalError.Exception)
+                throw $cleanupException
+            }
+        }
+        throw
     }
-    $process.Dispose()
-    if ($record.ExitCode -ne 0) { throw "$Label failed with exit code $($record.ExitCode)." }
+    finally {
+        if ($null -ne $process) {
+            try { $process.Dispose() }
+            catch {}
+        }
+    }
     return $record
 }
 
@@ -901,6 +1191,9 @@ function Write-ProgressEvidence {
 }
 
 function Assert-ContractModel {
+    if (-not [Environment]::Is64BitProcess) {
+        throw 'Guest contract self-test requires production-bitness x64 Windows PowerShell.'
+    }
     if (($requiredMatrix -join '|') -cne
         'install-v1|update-v1-to-v2|rollback-v2-to-v1|update-v1-to-v2-again|repair-v2-same-version|uninstall-v2') {
         throw 'Guest lifecycle matrix order drifted.'
@@ -940,6 +1233,120 @@ function Assert-ContractModel {
             [IO.Directory]::Delete($publicationRoot, $true)
         }
     }
+    Initialize-ExplorerProbe
+    $windowsPowerShell = Join-Path $env:SystemRoot `
+        'System32\WindowsPowerShell\v1.0\powershell.exe'
+    $nativeSnapshot = [A4SSandboxWindowProbe]::ModuleSnapshotForProcess($PID)
+    if ([int]$nativeSnapshot.TotalModuleCount -le 0 -or
+        [string]::IsNullOrWhiteSpace([string]$nativeSnapshot.MainModulePath) -or
+        -not ([IO.Path]::GetFullPath([string]$nativeSnapshot.MainModulePath)).Equals(
+            [IO.Path]::GetFullPath($windowsPowerShell),
+            [StringComparison]::OrdinalIgnoreCase)) {
+        throw 'Native Toolhelp contract did not prove this x64 Windows PowerShell main module.'
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 x64 native Toolhelp module snapshot contract passed.'
+    $processContractRoot = Join-Path ([IO.Path]::GetTempPath()) `
+        ('A4SGuestProcessTimeoutContract-' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::CreateDirectory($processContractRoot) | Out-Null
+    $script:workRoot = $processContractRoot
+    try {
+        $childScript = Join-Path $processContractRoot 'bounded-child.ps1'
+        $childPidPath = Join-Path $processContractRoot 'bounded-child.pid'
+        $childSource = @"
+[IO.File]::WriteAllText('$($childPidPath.Replace("'", "''"))', [string]`$PID,
+    [Text.UTF8Encoding]::new(`$false))
+Start-Sleep -Seconds 30
+"@
+        [IO.File]::WriteAllText($childScript, $childSource,
+            [Text.UTF8Encoding]::new($false))
+        $stopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $timeoutRejected = $false
+        $timeoutCleanupPid = 0
+        try {
+            Invoke-ExactProcess -Path $windowsPowerShell -Arguments @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy',
+                'Bypass', '-File', $childScript) -Label 'bounded-timeout-contract' `
+                -TimeoutSeconds 1 -KillWaitMilliseconds 5000 | Out-Null
+        }
+        catch {
+            $timeoutRejected =
+                $_.Exception -is [TimeoutException] -and
+                $_.Exception.Message -ceq
+                    'bounded-timeout-contract exceeded the 1 second guest-only timeout.' -and
+                [bool]$_.Exception.Data['A4SKillAttempted'] -and
+                [bool]$_.Exception.Data['A4SKillReturned'] -and
+                [bool]$_.Exception.Data['A4SExitConfirmed']
+            $timeoutCleanupPid = [int]$_.Exception.Data['A4SExactProcessId']
+        }
+        finally { $stopwatch.Stop() }
+        if (-not $timeoutRejected -or $stopwatch.Elapsed.TotalSeconds -gt 8 -or
+            -not [IO.File]::Exists($childPidPath)) {
+            throw 'Bounded exact-process timeout contract did not fail closed in time.'
+        }
+        $childPid = 0
+        if (-not [int]::TryParse([IO.File]::ReadAllText($childPidPath), [ref]$childPid) -or
+            $childPid -le 0 -or $childPid -ne $timeoutCleanupPid -or
+            $null -ne (Get-Process -Id $childPid -ErrorAction SilentlyContinue)) {
+            throw 'Bounded exact-process timeout contract left its direct child alive.'
+        }
+
+        $stageFailureScript = Join-Path $processContractRoot 'stage-failure-child.ps1'
+        [IO.File]::WriteAllText($stageFailureScript, 'Start-Sleep -Seconds 30',
+            [Text.UTF8Encoding]::new($false))
+        $script:evidenceRoot = $processContractRoot
+        $script:expectedSessionId = '00000000-0000-0000-0000-000000000000'
+        $script:expectedNonce = '0' * 64
+        $script:expectedRequestSha256 = '0' * 64
+        $script:expectedGuestScriptSha256 = '0' * 64
+        $stageCollisionPath = Join-Path $processContractRoot `
+            'stage-025-synthetic-stage-publication.json'
+        [IO.File]::WriteAllText($stageCollisionPath, 'collision',
+            [Text.UTF8Encoding]::new($false))
+        $stageFailureStopwatch = [Diagnostics.Stopwatch]::StartNew()
+        $stageFailurePreserved = $false
+        $stageFailurePid = 0
+        try {
+            Invoke-ExactProcess -Path $windowsPowerShell -Arguments @(
+                '-NoLogo', '-NoProfile', '-NonInteractive', '-ExecutionPolicy',
+                'Bypass', '-File', $stageFailureScript) `
+                -Label 'started-stage-failure-contract' -TimeoutSeconds 30 `
+                -KillWaitMilliseconds 5000 -StartedStageOrdinal 25 `
+                -StartedStage 'synthetic-stage-publication' | Out-Null
+        }
+        catch {
+            $stageIOException = if ($_.Exception -is [IO.IOException]) {
+                $_.Exception
+            }
+            elseif ($_.Exception.InnerException -is [IO.IOException]) {
+                $_.Exception.InnerException
+            }
+            else { $null }
+            $stageFailurePreserved =
+                $null -ne $stageIOException -and
+                ($stageIOException.HResult -band 0xFFFF) -eq 80 -and
+                [bool]$_.Exception.Data['A4SKillAttempted'] -and
+                [bool]$_.Exception.Data['A4SKillReturned'] -and
+                [bool]$_.Exception.Data['A4SExitConfirmed']
+            $stageFailurePid = [int]$_.Exception.Data['A4SExactProcessId']
+        }
+        finally { $stageFailureStopwatch.Stop() }
+        if (-not $stageFailurePreserved -or
+            $stageFailureStopwatch.Elapsed.TotalSeconds -gt 8 -or
+            $stageFailurePid -le 0 -or
+            [IO.File]::ReadAllText($stageCollisionPath) -cne 'collision') {
+            throw 'Started-stage publication failure contract was not preserved and bounded.'
+        }
+        if ($null -ne (Get-Process -Id $stageFailurePid -ErrorAction SilentlyContinue)) {
+            throw 'Started-stage publication failure contract left its direct child alive.'
+        }
+    }
+    finally {
+        if ([IO.Directory]::Exists($processContractRoot)) {
+            [IO.Directory]::Delete($processContractRoot, $true)
+        }
+    }
+    Write-Host 'A4S legacy Sandbox guest PS5 bounded process timeout contract passed.'
+    Write-Host 'A4S legacy Sandbox guest PS5 started-stage failure cleanup contract passed.'
     Write-Host 'A4S legacy Sandbox guest in-memory contract passed.'
 }
 
@@ -1100,9 +1507,15 @@ try {
         CacheSeededAfterV1HostQuiescence = $true
     }
 
+    Write-GuestStage -Ordinal 24 -Stage 'install-v1-process-starting'
     $installV1Execution = Invoke-ExactProcess -Path $localV1 `
-        -Arguments @('--install', '--silent') -Label 'install-v1'
+        -Arguments @('--install', '--silent') -Label 'install-v1' `
+        -StartedStageOrdinal 25 -StartedStage 'install-v1-process-started' `
+        -TimeoutStageOrdinal 26 -TimeoutStage 'install-v1-process-timeout'
+    Write-GuestStage -Ordinal 27 -Stage 'install-v1-process-exited'
+    Write-GuestStage -Ordinal 28 -Stage 'install-v1-checkpoint-starting'
     $installV1Checkpoint = Get-Checkpoint 'install-v1'
+    Write-GuestStage -Ordinal 29 -Stage 'install-v1-checkpoint-captured'
     Assert-ExplorerUnchanged $installV1Checkpoint $initialExplorerPid
     if ((Get-ObjectSha256 $installV1Checkpoint.UserState) -cne $seedUserStateSha256) {
         throw 'Frozen V1 install changed seeded Config/Menu/legacy user state.'

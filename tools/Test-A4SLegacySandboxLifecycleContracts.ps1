@@ -68,6 +68,119 @@ $guestStageDefinitions = @($guestAst.FindAll({
 Assert-Contract ($guestStageDefinitions.Count -eq 1) `
     'guest must define exactly one executable Write-GuestStage function'
 
+$exactProcessDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Invoke-ExactProcess'
+}, $true))
+Assert-Contract ($exactProcessDefinitions.Count -eq 1) `
+    'guest must define exactly one executable Invoke-ExactProcess function'
+$exactProcessText = $exactProcessDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[ValidateRange(1, 300)][int] $TimeoutSeconds = 120',
+        '[ValidateRange(100, 10000)][int] $KillWaitMilliseconds = 5000',
+        '$process.WaitForExit($TimeoutSeconds * 1000)',
+        '$failureKind = ''timeout''',
+        'throw [TimeoutException]::new(',
+        '$causalError = $_',
+        '$cleanup = Stop-ExactProcessBounded -Process $process',
+        '$causalError.Exception.Data[''A4SExactProcessId''] = $childProcessId',
+        '$causalError.Exception.Data[''A4SKillAttempted''] = $cleanup.KillAttempted',
+        '$causalError.Exception.Data[''A4SKillReturned''] = $cleanup.KillReturned',
+        '$causalError.Exception.Data[''A4SExitConfirmed''] = $cleanup.ExitConfirmed',
+        'if ($failureKind -ceq ''timeout'' -and $TimeoutStageOrdinal -ne 0)',
+        'Write-GuestStage -Ordinal $TimeoutStageOrdinal -Stage $TimeoutStage',
+        'if (-not $cleanup.ExitConfirmed)',
+        '$causalError.Exception)',
+        'finally {',
+        'try { $process.Dispose() }',
+        'return $record')) {
+    Assert-ContainsOrdinal $exactProcessText $marker 'guest bounded exact-process lifetime'
+}
+Assert-Contract (-not [regex]::IsMatch($exactProcessText,
+        '\.WaitForExit\(\s*\)')) `
+    'guest exact-process timeout contains a parameterless unbounded WaitForExit call'
+Assert-Contract ([regex]::Matches($exactProcessText,
+        '\.WaitForExit\(').Count -eq 1) `
+    'guest exact-process runner must contain exactly one bounded primary wait'
+Assert-Contract ([regex]::Matches($exactProcessText,
+        '\.Kill\(\)').Count -eq 0) `
+    'guest exact-process runner must centralize direct-child cleanup in its bounded helper'
+Assert-Contract ([regex]::Matches($exactProcessText,
+        'Stop-ExactProcessBounded\s+-Process\s+\$process').Count -eq 1) `
+    'guest exact-process runner must have exactly one common exceptional cleanup path'
+
+$boundedStopDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Stop-ExactProcessBounded'
+}, $true))
+Assert-Contract ($boundedStopDefinitions.Count -eq 1) `
+    'guest must define exactly one bounded exact-process cleanup helper'
+$boundedStopText = $boundedStopDefinitions[0].Extent.Text
+foreach ($marker in @(
+        '[Diagnostics.Process] $Process',
+        '[Parameter(Mandatory)][int] $ProcessId',
+        '[ValidateRange(100, 10000)][int] $WaitMilliseconds',
+        '$killAttempted = $true',
+        '$Process.Kill()',
+        '$killReturned = $true',
+        '$Process.WaitForExit($WaitMilliseconds)',
+        'ExitConfirmed = $exitConfirmed')) {
+    Assert-ContainsOrdinal $boundedStopText $marker `
+        'guest bounded exact-process cleanup helper'
+}
+Assert-OrderedMarkers $boundedStopText @(
+    '$killAttempted = $true',
+    '$Process.Kill()',
+    '$Process.WaitForExit($WaitMilliseconds)') `
+    'guest exact-process kill attempt and bounded confirmation order'
+Assert-Contract (-not [regex]::IsMatch($boundedStopText,
+        '\.WaitForExit\(\s*\)')) `
+    'guest exact-process cleanup helper contains a parameterless unbounded wait'
+Assert-Contract ([regex]::Matches($boundedStopText,
+        '\.WaitForExit\(').Count -eq 1 -and
+    [regex]::Matches($boundedStopText, '\.Kill\(\)').Count -eq 1) `
+    'guest exact-process cleanup helper must have one Kill and one bounded confirmation wait'
+
+$explorerProbeDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Initialize-ExplorerProbe'
+}, $true))
+Assert-Contract ($explorerProbeDefinitions.Count -eq 1) `
+    'guest must define exactly one executable native Explorer probe initializer'
+$explorerProbeText = $explorerProbeDefinitions[0].Extent.Text
+foreach ($marker in @('CreateToolhelp32Snapshot', 'Module32FirstW',
+        'Module32NextW', 'for (int attempt = 0; attempt < 8; ++attempt)',
+        'using System.Collections.Generic;', 'using System.Threading;',
+        'if (createError == ERROR_BAD_LENGTH)', 'finally',
+        'CloseHandle(snapshot)',
+        'Explorer module snapshot was unexpectedly empty')) {
+    Assert-ContainsOrdinal $explorerProbeText $marker 'guest native Explorer module snapshot'
+}
+$moduleInventoryDefinitions = @($guestAst.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
+        $node.Name -ieq 'Get-ExplorerModuleInventory'
+}, $true))
+Assert-Contract ($moduleInventoryDefinitions.Count -eq 1) `
+    'guest must define exactly one executable Explorer module inventory function'
+$moduleInventoryText = $moduleInventoryDefinitions[0].Extent.Text
+Assert-ContainsOrdinal $moduleInventoryText `
+    '[A4SSandboxWindowProbe]::ModuleSnapshotForProcess($ExplorerPid)' `
+    'guest native Explorer module inventory call'
+foreach ($marker in @('$snapshot.TotalModuleCount', '$snapshot.MainModulePath',
+        'Join-Path $env:SystemRoot ''explorer.exe''',
+        '$mainModulePath.Equals($canonicalExplorerPath',
+        '(Get-TaskbarExplorerPid) -ne $ExplorerPid')) {
+    Assert-ContainsOrdinal $moduleInventoryText $marker `
+        'guest native Explorer module inventory completeness proof'
+}
+Assert-Contract (-not [regex]::IsMatch($moduleInventoryText,
+        '(?i)\.Modules\b')) `
+    'guest Explorer inventory regressed to an unbounded Process.Modules enumeration'
+
 $hostReplacementDefinitions = @($hostAst.FindAll({
     param($node)
     $node -is [Management.Automation.Language.FunctionDefinitionAst] -and
@@ -268,7 +381,7 @@ foreach ($marker in @(
         'An operational non-loopback network path is present in Sandbox.',
         'Assert-CleanDisposableStart',
         'The reviewed V1 DLL was not observed in the unchanged taskbar Explorer process.',
-        'Explorer PID changed at',
+        'Explorer identity or complete canonical module proof changed at',
         '--restart-explorer is forbidden in the Sandbox lifecycle matrix.',
         'User-owned Config/Menu/legacy state changed',
         'DataCache.db changed',
@@ -298,6 +411,14 @@ Assert-OrderedMarkers $guestSource @(
     '$requestSnapshot = Read-Utf8JsonSnapshot',
     'Assert-CleanDisposableStart',
     'Set-SentinelUserState -Nonce',
+    "Write-GuestStage -Ordinal 24 -Stage 'install-v1-process-starting'",
+    '$installV1Execution = Invoke-ExactProcess',
+    "-StartedStageOrdinal 25 -StartedStage 'install-v1-process-started'",
+    "-TimeoutStageOrdinal 26 -TimeoutStage 'install-v1-process-timeout'",
+    "Write-GuestStage -Ordinal 27 -Stage 'install-v1-process-exited'",
+    "Write-GuestStage -Ordinal 28 -Stage 'install-v1-checkpoint-starting'",
+    "`$installV1Checkpoint = Get-Checkpoint 'install-v1'",
+    "Write-GuestStage -Ordinal 29 -Stage 'install-v1-checkpoint-captured'",
     "Name = 'install-v1'",
     "Name = 'update-v1-to-v2'",
     "Name = 'rollback-v2-to-v1'",
@@ -380,6 +501,8 @@ Assert-Contract ($bootstrapStartProcesses[0].Extent.Text.IndexOf('-Wait',
 
 $windowsPowerShell = Join-Path $env:SystemRoot `
     'System32\WindowsPowerShell\v1.0\powershell.exe'
+Assert-Contract ([Environment]::Is64BitProcess) `
+    'offline contracts require an x64 parent so System32 resolves to production-bitness Windows PowerShell'
 Assert-Contract (Test-Path -LiteralPath $windowsPowerShell -PathType Leaf) `
     'canonical Windows PowerShell 5.1 executable is missing'
 $guestContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
@@ -393,6 +516,15 @@ Assert-Contract (($guestContractOutput -join ' ') -match
 Assert-Contract (($guestContractOutput -join ' ') -match
         'guest PS5 setup-source path contract passed') `
     'shared V1/V2 setup-source resolution was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 x64 native Toolhelp module snapshot contract passed') `
+    'guest Toolhelp module enumeration and main-module proof were not dynamically exercised by x64 Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 bounded process timeout contract passed') `
+    'guest direct-child timeout/kill/final-wait bound was not dynamically exercised by explicit Windows PowerShell 5.1'
+Assert-Contract (($guestContractOutput -join ' ') -match
+        'guest PS5 started-stage failure cleanup contract passed') `
+    'guest started-stage publication failure cleanup was not dynamically exercised by explicit Windows PowerShell 5.1'
 $bootstrapContractOutput = @(& $windowsPowerShell -NoLogo -NoProfile -NonInteractive `
     -ExecutionPolicy Bypass -File $bootstrapPath -ContractSelfTest 2>&1)
 $bootstrapContractExitCode = $LASTEXITCODE
