@@ -427,11 +427,13 @@ if ($explorerProcess.SessionId -ne $observerSessionId -or $explorerLogonId -ne $
     throw 'The observation process and taskbar Explorer do not share one interactive logon session.'
 }
 $hostProcessRecords = @(Get-A4SHostProcessRecords -SessionId $observerSessionId -LogonId $observerLogonId)
+$cleanExplorerAgeSeconds = $null
 if ($RequireCleanProductState) {
     $explorerAgeSeconds = ([DateTime]::UtcNow - $explorerProcess.StartTime.ToUniversalTime()).TotalSeconds
     if ($explorerAgeSeconds -lt 0 -or $explorerAgeSeconds -gt $MaximumCleanExplorerAgeSeconds) {
         throw "A clean resource baseline requires a fresh taskbar Explorer (age=$([Math]::Round($explorerAgeSeconds, 3)) seconds; maximum=$MaximumCleanExplorerAgeSeconds)."
     }
+    $cleanExplorerAgeSeconds = $explorerAgeSeconds
 }
 $modulePaths = @(Get-ModulePaths -Process $explorerProcess)
 $a4sMappings = @($modulePaths | Where-Object { [IO.Path]::GetFileName($_) -ieq 'A4SMenu.dll' })
@@ -540,13 +542,21 @@ try {
 } catch { }
 
 $snapshot = [ordered]@{
-    schemaVersion = 2
+    schemaVersion = 3
     capturedUtc = [DateTime]::UtcNow.ToString('o')
     machine = $env:COMPUTERNAME
     user = [Environment]::UserName
     userSid = [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
     observerSessionId = $observerSessionId
     observerLogonId = $observerLogonId
+    qualification = [ordered]@{
+        # This explicit proof prevents an ordinary observation that merely
+        # happens to look clean from being reused as the required fresh,
+        # pre-injection qualification baseline.
+        cleanProductStateVerified = [bool]$RequireCleanProductState
+        explorerAgeSeconds = if ($RequireCleanProductState) { [Math]::Round($cleanExplorerAgeSeconds, 6) } else { $null }
+        maximumExplorerAgeSeconds = if ($RequireCleanProductState) { $MaximumCleanExplorerAgeSeconds } else { $null }
+    }
     os = [ordered]@{
         version = [Environment]::OSVersion.Version.ToString()
         logicalProcessors = [Environment]::ProcessorCount

@@ -46,6 +46,8 @@ if ($EnforceTargets -and $IdleSeconds -lt 10) {
 }
 
 Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
+$qualificationAutomationMutex = Enter-A4SQualificationAutomationLock
+try {
 
 if (-not ('A4SPerformanceNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -456,6 +458,8 @@ function Assert-A4SResidentContext {
 function Save-WindowCapture {
     param([Parameter(Mandatory)][IntPtr] $Window, [Parameter(Mandatory)][string] $Path)
     Add-Type -AssemblyName System.Drawing
+    if ([IO.File]::Exists($Path)) { throw "Pop-in evidence already exists: '$Path'." }
+    $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N')).png"
     $previousDpiContext = [A4SPerformanceNative]::EnterPhysicalCapture()
     try {
         $rect = [A4SPerformanceNative]::WindowRect($Window)
@@ -467,11 +471,15 @@ function Save-WindowCapture {
             $graphics = [Drawing.Graphics]::FromImage($bitmap)
             try { $graphics.CopyFromScreen($rect.Left, $rect.Top, 0, 0, $bitmap.Size, [Drawing.CopyPixelOperation]::SourceCopy) }
             finally { $graphics.Dispose() }
-            $bitmap.Save($Path, [Drawing.Imaging.ImageFormat]::Png)
+            $bitmap.Save($temporary, [Drawing.Imaging.ImageFormat]::Png)
         }
         finally { $bitmap.Dispose() }
+        [IO.File]::Move($temporary, $Path)
     }
-    finally { [A4SPerformanceNative]::LeavePhysicalCapture($previousDpiContext) }
+    finally {
+        try { [A4SPerformanceNative]::LeavePhysicalCapture($previousDpiContext) }
+        finally { if ([IO.File]::Exists($temporary)) { [IO.File]::Delete($temporary) } }
+    }
 }
 
 $repoRoot = [IO.Path]::GetFullPath((Join-Path $PSScriptRoot '..'))
@@ -557,9 +565,22 @@ $baselineComparison = $null
 if ($BaselinePath) {
     $resolvedBaseline = [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($BaselinePath))
     $baseline = Get-Content -LiteralPath $resolvedBaseline -Raw | ConvertFrom-Json
-    if ($baseline.schemaVersion -ne 2) { throw "Unsupported clean-baseline schema in '$resolvedBaseline'." }
+    if ($baseline.schemaVersion -ne 3) { throw "Unsupported clean-baseline schema in '$resolvedBaseline'. Capture a new explicit clean baseline with this toolset." }
     if (-not $baseline.product.directory -or -not $baseline.product.registration) {
         throw 'The clean baseline predates exact product-directory/registration binding; capture a new baseline with this toolset.'
+    }
+    $baselineExplorerAgeSeconds = [double]$baseline.qualification.explorerAgeSeconds
+    $baselineMaximumExplorerAgeSeconds = [double]$baseline.qualification.maximumExplorerAgeSeconds
+    if (-not $baseline.qualification -or $baseline.qualification.cleanProductStateVerified -ne $true -or
+        $null -eq $baseline.qualification.explorerAgeSeconds -or
+        $null -eq $baseline.qualification.maximumExplorerAgeSeconds -or
+        [double]::IsNaN($baselineExplorerAgeSeconds) -or [double]::IsInfinity($baselineExplorerAgeSeconds) -or
+        [double]::IsNaN($baselineMaximumExplorerAgeSeconds) -or [double]::IsInfinity($baselineMaximumExplorerAgeSeconds) -or
+        $baselineExplorerAgeSeconds -lt 0 -or
+        $baselineMaximumExplorerAgeSeconds -le 0 -or
+        $baselineMaximumExplorerAgeSeconds -gt 120 -or
+        $baselineExplorerAgeSeconds -gt $baselineMaximumExplorerAgeSeconds) {
+        throw 'The baseline was not captured with the explicit fresh pre-injection clean-state contract (maximum Explorer age 120 seconds).'
     }
     if (-not [StringComparer]::OrdinalIgnoreCase.Equals([string]$baseline.machine, [Environment]::MachineName) -or
         -not [StringComparer]::OrdinalIgnoreCase.Equals([string]$baseline.user, [Environment]::UserName)) {
@@ -614,6 +635,8 @@ $firstCapturePath = $null
 $settledCapturePath = $null
 $firstCaptureHash = $null
 $settledCaptureHash = $null
+$automationMenuExpectedVisible = $false
+$automationMenuWindow = [IntPtr]::Zero
 
 try {
     # A run that does not claim a cold first sample gets an explicit, unmeasured
@@ -626,9 +649,12 @@ try {
         [A4SPerformanceNative]::Toggle($hostWindow, 2500)
         $preconditioned = Wait-MenuVisibility -Visible $true -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId
         if ($preconditioned.windows.Count -ne 1) { throw "Warm-up found $($preconditioned.windows.Count) visible A4S menu windows; expected one." }
+        $automationMenuWindow = [IntPtr]$preconditioned.windows[0]
+        $automationMenuExpectedVisible = $true
         [A4SPerformanceNative]::FlushDwmChecked()
         [A4SPerformanceNative]::Toggle($hostWindow, 2500)
         [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
+        $automationMenuExpectedVisible = $false
         [A4SPerformanceNative]::FlushDwmChecked()
     }
 
@@ -648,12 +674,21 @@ try {
         $visibilityMilliseconds = $openTimer.Elapsed.TotalMilliseconds
         if ($visible.windows.Count -ne 1) { throw "Sample $($index + 1) found $($visible.windows.Count) visible A4S menu windows; expected one." }
         $menuWindow = [IntPtr]$visible.windows[0]
+        $automationMenuWindow = $menuWindow
+        $automationMenuExpectedVisible = $true
         [A4SPerformanceNative]::FlushDwmChecked()
         $afterDwmFlushMilliseconds = $openTimer.Elapsed.TotalMilliseconds
         if ([A4SPerformanceNative]::GetForegroundWindow() -ne $menuWindow) {
             throw "Sample $($index + 1) is invalid because the opened A4S menu was not the foreground top-level window."
         }
-        if (-not $refreshRate) { $refreshRate = [A4SPerformanceNative]::NominalRefreshRate($menuWindow) }
+        $sampleRefreshRate = [A4SPerformanceNative]::NominalRefreshRate($menuWindow)
+        if ($sampleRefreshRate -eq 0) {
+            throw "Sample $($index + 1) could not resolve the actual menu monitor's nominal refresh rate."
+        }
+        if ($refreshRate -ne 0 -and $sampleRefreshRate -ne $refreshRate) {
+            throw "Performance samples crossed menu monitors with different nominal refresh rates ($refreshRate and $sampleRefreshRate Hz). Run each monitor/rate separately."
+        }
+        $refreshRate = $sampleRefreshRate
         $ioAfter = [A4SPerformanceNative]::ProcessIo($explorerProcessId)
 
         if ($CapturePopInEvidence -and $index -eq 0) {
@@ -674,6 +709,7 @@ try {
         $closeTimer = [Diagnostics.Stopwatch]::StartNew()
         [A4SPerformanceNative]::Toggle($hostWindow, 2500)
         [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
+        $automationMenuExpectedVisible = $false
         $closeVisibilityMilliseconds = $closeTimer.Elapsed.TotalMilliseconds
         [A4SPerformanceNative]::FlushDwmChecked()
         $closeAfterDwmFlushMilliseconds = $closeTimer.Elapsed.TotalMilliseconds
@@ -840,23 +876,27 @@ try {
 }
 finally {
     try {
-        $leftVisible = @([A4SPerformanceNative]::VisibleMenuWindows($explorerProcessId))
-        if ($leftVisible.Count -eq 1) {
-            # Cleanup uses the same normal toggle path and only runs after an
-            # Explorer-owned A4S window is still observed. An expected-state
-            # flag alone is deliberately insufficient because toggling an
-            # already-dismissed menu would reopen it.
+        if ($automationMenuExpectedVisible) {
+            $leftVisible = @([A4SPerformanceNative]::VisibleMenuWindows($explorerProcessId))
+            if ($leftVisible.Count -eq 1 -and [IntPtr]$leftVisible[0] -eq $automationMenuWindow) {
             [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
                 -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
                 -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
             [A4SPerformanceNative]::Toggle($hostWindow, 2500)
             [void](Wait-MenuVisibility -Visible $false -TimeoutMilliseconds $TransitionTimeoutMilliseconds -OwnerProcessId $explorerProcessId)
-        } elseif ($leftVisible.Count -gt 1) {
-            throw "Cleanup found $($leftVisible.Count) visible menu windows and refused an ambiguous toggle."
+                $automationMenuExpectedVisible = $false
+            } elseif ($leftVisible.Count -eq 1) {
+                throw 'Cleanup found one visible menu, but it was not the exact window opened by this probe; refusing a stale toggle.'
+            } elseif ($leftVisible.Count -gt 1) {
+                throw "Cleanup found $($leftVisible.Count) visible menu windows and refused an ambiguous toggle."
+            }
         }
     } catch {
         Write-Warning "Could not confirm menu cleanup after the probe: $($_.Exception.Message)"
     }
     $residentHostProcess.Dispose()
     $explorerProcess.Dispose()
+}
+} finally {
+    Exit-A4SQualificationAutomationLock -Mutex $qualificationAutomationMutex
 }

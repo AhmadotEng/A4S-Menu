@@ -53,6 +53,8 @@ if (-not [Environment]::Is64BitProcess) {
 }
 
 Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
+$qualificationAutomationMutex = if ($AllowMenuAutomation) { Enter-A4SQualificationAutomationLock } else { $null }
+try {
 
 if (-not ('A4SScenarioNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -485,6 +487,8 @@ if ($AllowMenuAutomation) {
     if (@([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId)).Count -ne 0) { throw 'Close the menu before running scenario automation.' }
 
     $dismissedManually = $false
+    $automationMenuExpectedVisible = $false
+    $automationMenuWindow = [IntPtr]::Zero
     try {
         [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
             -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
@@ -494,12 +498,15 @@ if ($AllowMenuAutomation) {
         if ($visibleWindows.Count -ne 1) { throw "Open/close automation found $($visibleWindows.Count) visible A4S menu windows; expected one." }
         [A4SScenarioNative]::FlushDwmChecked()
         $menuWindow = [IntPtr]$visibleWindows[0]
+        $automationMenuWindow = $menuWindow
+        $automationMenuExpectedVisible = $true
         if ([A4SScenarioNative]::GetForegroundWindow() -ne $menuWindow) { throw 'The opened A4S menu was not the foreground top-level window.' }
         $menu = [A4SScenarioNative]::Describe($menuWindow)
         if ($menu.Dpi -eq 0) { throw 'GetDpiForWindow returned zero for the A4S menu; DPI evidence is unavailable.' }
         if ($ObserveManualFocusDismissal) {
             Write-Host "A4S menu is open. Focus another application within $DismissalTimeoutSeconds seconds; this tool will only observe whether the menu dismisses."
             [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId -TimeoutMilliseconds ($DismissalTimeoutSeconds * 1000))
+            $automationMenuExpectedVisible = $false
             $newForeground = [A4SScenarioNative]::GetForegroundWindow()
             [uint32]$newForegroundProcessId = 0
             if ($newForeground -ne [IntPtr]::Zero) { [void][A4SScenarioNative]::GetWindowThreadProcessId($newForeground, [ref]$newForegroundProcessId) }
@@ -516,21 +523,31 @@ if ($AllowMenuAutomation) {
         } else {
             [A4SScenarioNative]::Toggle($hostWindow)
             [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId)
+            $automationMenuExpectedVisible = $false
         }
     } finally {
-        $leftVisible = @([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId))
-        if ($leftVisible.Count -eq 1) {
+        # A cleanup toggle is permitted only while the exact window opened by
+        # this scenario is still expected to be visible. Once a normal/manual
+        # dismissal has been observed, a newly opened menu belongs to the user
+        # or another actor and must not be toggled closed by stale cleanup.
+        if ($automationMenuExpectedVisible) {
+            $leftVisible = @([A4SScenarioNative]::VisibleMenuWindows($explorerProcessId))
+            if ($leftVisible.Count -eq 1 -and [IntPtr]$leftVisible[0] -eq $automationMenuWindow) {
             try {
                 [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
                     -ExpectedHostStartTicks $hostStartTicks -ExpectedExplorerProcessId $explorerProcessId `
                     -ExpectedExplorerStartTicks $explorerStartTicks -ExpectedLogonId $observerLogonId)
                 [A4SScenarioNative]::Toggle($hostWindow)
                 [void](Wait-MenuState -Visible $false -OwnerProcessId $explorerProcessId)
+                $automationMenuExpectedVisible = $false
             } catch {
                 Write-Warning "Could not confirm menu cleanup after scenario automation: $($_.Exception.Message)"
             }
-        } elseif ($leftVisible.Count -gt 1) {
-            Write-Warning "Cleanup found $($leftVisible.Count) visible A4S menu windows and refused an ambiguous toggle."
+            } elseif ($leftVisible.Count -eq 1) {
+                Write-Warning 'Cleanup found one visible A4S menu, but it was not the exact window opened by this scenario; refusing a stale toggle.'
+            } elseif ($leftVisible.Count -gt 1) {
+                Write-Warning "Cleanup found $($leftVisible.Count) visible A4S menu windows and refused an ambiguous toggle."
+            }
         }
     }
     [void](Assert-A4SScenarioContext -ExpectedHostWindow $hostWindow -ExpectedHostProcessId $residentHostProcessId `
@@ -659,4 +676,9 @@ if ($scenarioError) {
 if (-not $entry.assertionsPassed) {
     $failed = @($assertions | Where-Object { -not $_.passed } | ForEach-Object { "$($_.name): expected '$($_.expected)', actual '$($_.actual)'" })
     throw "Scenario environment assertions failed: $($failed -join '; '). Evidence was preserved."
+}
+} finally {
+    if ($qualificationAutomationMutex) {
+        Exit-A4SQualificationAutomationLock -Mutex $qualificationAutomationMutex
+    }
 }

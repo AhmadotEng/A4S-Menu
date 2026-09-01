@@ -107,6 +107,10 @@ foreach ($sourceRecord in @(
     if ($sourceRecord.source -notmatch 'FlushDwmChecked') {
         throw "$($sourceRecord.name) does not validate DwmFlush failures."
     }
+    if ($sourceRecord.source -notmatch 'Enter-A4SQualificationAutomationLock' -or
+        $sourceRecord.source -notmatch 'Exit-A4SQualificationAutomationLock') {
+        throw "$($sourceRecord.name) is not serialized against other menu qualification automation."
+    }
 }
 if ($performanceSource -match '\b(open|close)PresentedMilliseconds\b|\bcloseWithinOneFrame\b|\bwarmOpenDiskQuiet') {
     throw 'The performance tool contains an overclaimed presentation-frame or physical-disk evidence field.'
@@ -120,6 +124,10 @@ if ($performanceSource -notmatch 'Get-A4SLoadedImageIdentity' -or
     $performanceSource -notmatch 'Get-A4SProductDirectoryRegistration') {
     throw 'The performance tool is not strongly bound to resident images, the clean-baseline payload hashes, and durable no-overwrite evidence.'
 }
+if ($performanceSource -notmatch 'automationMenuExpectedVisible' -or
+    $performanceSource -notmatch '\[IntPtr\]\$leftVisible\[0\] -eq \$automationMenuWindow') {
+    throw 'The performance cleanup path can toggle a newly opened or non-test menu.'
+}
 if ($performanceSource -notmatch '\$EnforceTargets -and -not \$BaselinePath' -or
     $performanceSource -notmatch '\$EnforceTargets -and \$WarmSamples -lt 20' -or
     $performanceSource -notmatch '\$EnforceTargets -and \$IdleSeconds -lt 10') {
@@ -128,10 +136,15 @@ if ($performanceSource -notmatch '\$EnforceTargets -and -not \$BaselinePath' -or
 if ($scenarioSource -notmatch 'Get-A4SLoadedImageIdentity' -or
     $scenarioSource -notmatch 'Write-A4SMatrixAtomically' -or
     $scenarioSource -notmatch 'refused an ambiguous toggle' -or
+    $scenarioSource -notmatch 'automationMenuExpectedVisible' -or
+    $scenarioSource -notmatch '\[IntPtr\]\$leftVisible\[0\] -eq \$automationMenuWindow' -or
     $scenarioSource -match 'File\]::Replace\([^\r\n]*\$null') {
     throw 'The scenario tool lacks exact resident-image binding, atomic matrix persistence, or ambiguous-cleanup protection.'
 }
 if ($snapshotSource -notmatch 'MaximumCleanExplorerAgeSeconds' -or
+    $snapshotSource -notmatch 'cleanProductStateVerified' -or
+    $performanceSource -notmatch 'baseline\.qualification\.cleanProductStateVerified' -or
+    $performanceSource -notmatch 'maximumExplorerAgeSeconds -gt 120' -or
     $snapshotSource -notmatch 'The taskbar Explorer identity changed' -or
     $snapshotSource -notmatch 'ProcessLogonId' -or
     $snapshotSource -notmatch '\[string\]\s*\$ProductDirectory' -or
@@ -149,6 +162,7 @@ $identityText = Get-Content -LiteralPath $identityModulePath -Raw
 if ($identityText -notmatch 'Get-A4SInstalledActiveSlot' -or
     $identityText -notmatch 'one direct child of the canonical versions directory' -or
     $identityText -notmatch 'ReparsePoint' -or
+    $identityText -notmatch 'A4SMenu\.QualificationAutomation\.v1' -or
     (Get-Content -LiteralPath $resolverPath -Raw) -notmatch 'Get-A4SInstalledActiveSlot') {
     throw 'Installed ActiveSlot resolution is not canonical, reparse-aware, and shared with the qualification tools.'
 }
@@ -168,7 +182,7 @@ if (-not [Environment]::Is64BitProcess) {
 }
 if (-not $SkipObservationSmokeTest) {
     $snapshot = (& (Join-Path $PSScriptRoot 'Get-A4SPerformanceSnapshot.ps1')) | ConvertFrom-Json
-    if ($snapshot.schemaVersion -ne 2 -or -not $snapshot.explorer.pid -or
+    if ($snapshot.schemaVersion -ne 3 -or -not $snapshot.explorer.pid -or
         $snapshot.observerSessionId -ne $snapshot.explorer.sessionId -or
         $snapshot.observerLogonId -ne $snapshot.explorer.logonId -or
         @($snapshot.desktop.monitors).Count -lt 1 -or

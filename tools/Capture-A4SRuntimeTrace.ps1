@@ -57,6 +57,8 @@ if ($EnforceTargets -and ($CapturedCycles - $(if ($OperatorAttestsFirstCapturedC
 }
 
 Import-Module (Join-Path $PSScriptRoot 'A4SBinaryIdentity.psm1') -Force
+$qualificationAutomationMutex = Enter-A4SQualificationAutomationLock
+try {
 
 if (-not ('A4SRuntimeTraceNative' -as [type])) {
     Add-Type -TypeDefinition @'
@@ -416,7 +418,9 @@ function Wait-A4SMenuVisibility {
 function Invoke-A4SToggleCycle {
     param(
         [Parameter(Mandatory)][IntPtr]$HostWindow,
-        [Parameter(Mandatory)][uint32]$ExplorerProcessId
+        [Parameter(Mandatory)][uint32]$ExplorerProcessId,
+        [Parameter(Mandatory)][ref]$ExpectedVisible,
+        [Parameter(Mandatory)][ref]$OpenedWindow
     )
     if ([A4SRuntimeTraceNative]::HostStatus($HostWindow, 2500) -ne 3) { throw 'A4SMenuHost left READY before a toggle cycle.' }
     $currentTaskbar = [A4SRuntimeTraceNative]::FindWindowW('Shell_TrayWnd', $null)
@@ -429,13 +433,17 @@ function Invoke-A4SToggleCycle {
     [uint32]$visibleOwnerProcessId = 0
     [void][A4SRuntimeTraceNative]::GetWindowThreadProcessId($windows[0], [ref]$visibleOwnerProcessId)
     if ($visibleOwnerProcessId -ne $ExplorerProcessId) { throw "The visible A4S menu belongs to PID $visibleOwnerProcessId, not validated Explorer PID $ExplorerProcessId." }
+    $OpenedWindow.Value = [IntPtr]$windows[0]
+    $ExpectedVisible.Value = $true
     [A4SRuntimeTraceNative]::FlushDwm()
+    $cycleRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate([IntPtr]$windows[0])
     if ($VisibleSettleMilliseconds -gt 0) { [Threading.Thread]::Sleep($VisibleSettleMilliseconds) }
     [A4SRuntimeTraceNative]::Toggle($HostWindow, 2500)
     [void](Wait-A4SMenuVisibility -Visible $false -ExplorerProcessId $ExplorerProcessId -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
+    $ExpectedVisible.Value = $false
     [A4SRuntimeTraceNative]::FlushDwm()
     if ($HiddenSettleMilliseconds -gt 0) { [Threading.Thread]::Sleep($HiddenSettleMilliseconds) }
-    return $windows[0]
+    return [pscustomobject]@{ window = [IntPtr]$windows[0]; refreshRateHz = $cycleRefreshRateHz }
 }
 
 function Invoke-A4SLogman {
@@ -574,14 +582,10 @@ if (@([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId)).Count -ne
     throw 'Close the A4S menu before capture. The tool refuses to guess or alter the initial state.'
 }
 
-$observedNominalRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
-$refreshRateSource = if ($RefreshRateHz -gt 0) { 'operator-supplied-and-checked-against-EnumDisplaySettings' } else { 'EnumDisplaySettings-current-mode-integer' }
-if ($RefreshRateHz -eq 0) {
-    $RefreshRateHz = $observedNominalRefreshRateHz
-    if ($RefreshRateHz -eq 0) { throw 'Could not determine the active display refresh rate; pass -RefreshRateHz explicitly.' }
-} elseif ($observedNominalRefreshRateHz -gt 0 -and [Math]::Abs($RefreshRateHz - $observedNominalRefreshRateHz) -gt 1.0) {
-    throw "The supplied refresh rate $RefreshRateHz Hz differs materially from the current-mode integer value $observedNominalRefreshRateHz Hz. Recheck the active display before using a one-frame target."
-}
+$requestedRefreshRateHz = $RefreshRateHz
+$observedNominalRefreshRateHz = 0
+$refreshRateSource = $null
+$automatedMenuRefreshRates = [Collections.Generic.List[uint32]]::new()
 if (-not $OutputDirectory) {
     $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss-fff')
     $OutputDirectory = Join-Path $repoRoot "build\test-results\A4S-runtime-trace-$stamp-$PID"
@@ -602,6 +606,8 @@ $artifactErrors = [Collections.Generic.List[string]]::new()
 $startedUtc = $null
 $stoppedUtc = $null
 $completedCycles = 0
+$automationMenuExpectedVisible = $false
+$automationMenuWindow = [IntPtr]::Zero
 
 try {
     for ($warmup = 0; $warmup -lt $WarmupCycles; $warmup++) {
@@ -609,7 +615,9 @@ try {
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
             -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
             -ExpectedLogonId $observerLogonId)
-        [void](Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId)
+        $cycleResult = Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId `
+            -ExpectedVisible ([ref]$automationMenuExpectedVisible) -OpenedWindow ([ref]$automationMenuWindow)
+        if ($cycleResult.refreshRateHz -gt 0) { [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz) }
     }
     if ([A4SRuntimeTraceNative]::HostStatus($hostWindow, 2500) -ne 3) { throw 'A4SMenuHost left READY during warm-up.' }
     $startArguments = @(
@@ -634,11 +642,13 @@ try {
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
             -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
             -ExpectedLogonId $observerLogonId)
-        [void](Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId)
+        $cycleResult = Invoke-A4SToggleCycle -HostWindow $hostWindow -ExplorerProcessId $explorerProcessId `
+            -ExpectedVisible ([ref]$automationMenuExpectedVisible) -OpenedWindow ([ref]$automationMenuWindow)
+        if ($cycleResult.refreshRateHz -gt 0) { [void]$automatedMenuRefreshRates.Add([uint32]$cycleResult.refreshRateHz) }
         $completedCycles++
     }
     if ($ManualInteractionSeconds -gt 0) {
-        Write-Host "Manual trace window: for the next $ManualInteractionSeconds seconds, use the A4S menu normally. Open All Programs, wait for it to populate, return, then type a non-empty search query and let results settle."
+        Write-Host "Manual trace window: for the next $ManualInteractionSeconds seconds, use the A4S menu normally. Open All Programs, wait for it to populate, return, then type a non-empty search query and let results settle. Close the menu before the window ends; this tool never toggles a user-opened menu."
         Start-Sleep -Seconds $ManualInteractionSeconds
     }
 } catch {
@@ -649,12 +659,17 @@ try {
             -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
             -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
             -ExpectedLogonId $observerLogonId)
-        $visible = @([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId))
-        if ($visible.Count -eq 1) {
+        if ($automationMenuExpectedVisible) {
+            $visible = @([A4SRuntimeTraceNative]::VisibleMenuWindows($explorerProcessId))
+            if ($visible.Count -eq 1 -and [IntPtr]$visible[0] -eq $automationMenuWindow) {
             [A4SRuntimeTraceNative]::Toggle($hostWindow, 2500)
             [void](Wait-A4SMenuVisibility -Visible $false -ExplorerProcessId $explorerProcessId -TimeoutMilliseconds $TransitionTimeoutMilliseconds)
-        } elseif ($visible.Count -gt 1) {
-            throw "Cleanup found $($visible.Count) A4S menu windows in validated Explorer PID $explorerProcessId and refused an ambiguous toggle."
+                $automationMenuExpectedVisible = $false
+            } elseif ($visible.Count -eq 1) {
+                throw 'Cleanup found one A4S menu, but it was not the exact window opened by this capture; refusing a stale toggle.'
+            } elseif ($visible.Count -gt 1) {
+                throw "Cleanup found $($visible.Count) A4S menu windows in validated Explorer PID $explorerProcessId and refused an ambiguous toggle."
+            }
         }
     } catch { $cleanupError = $_ }
     if ($sessionCreateAttempted) {
@@ -681,6 +696,38 @@ try {
 }
 
 try {
+    $uniqueMenuRefreshRates = @($automatedMenuRefreshRates | Sort-Object -Unique)
+    if ($uniqueMenuRefreshRates.Count -gt 1) {
+        throw "Automated trace cycles used menu monitors with different nominal refresh rates: $($uniqueMenuRefreshRates -join ', ') Hz. Run each monitor/rate as a separate trace."
+    }
+    if ($uniqueMenuRefreshRates.Count -eq 1) {
+        $observedNominalRefreshRateHz = [double]$uniqueMenuRefreshRates[0]
+    }
+    if ($requestedRefreshRateHz -gt 0) {
+        $RefreshRateHz = $requestedRefreshRateHz
+        $refreshRateSource = if ($observedNominalRefreshRateHz -gt 0) {
+            'operator-supplied-and-checked-against-the-actual-menu-monitor-current-mode-integer'
+        } else {
+            'operator-supplied; actual-menu-monitor rate unavailable for comparison'
+        }
+        if ($observedNominalRefreshRateHz -gt 0 -and
+            [Math]::Abs($RefreshRateHz - $observedNominalRefreshRateHz) -gt 1.0) {
+            throw "The supplied refresh rate $RefreshRateHz Hz differs materially from the actual menu monitor's current-mode integer value $observedNominalRefreshRateHz Hz. Recheck the active display before using a one-frame target."
+        }
+    } elseif ($observedNominalRefreshRateHz -gt 0) {
+        $RefreshRateHz = $observedNominalRefreshRateHz
+        $refreshRateSource = 'actual-menu-monitor EnumDisplaySettings current-mode integer'
+    } elseif ($ManualInteractionSeconds -gt 0) {
+        # Manual phase capture does not own the user's menu HWND. Retain an
+        # explicitly labeled taskbar-monitor fallback; pass -RefreshRateHz when
+        # the manual interaction will occur on another monitor.
+        $observedNominalRefreshRateHz = [A4SRuntimeTraceNative]::NominalRefreshRate($taskbar)
+        $RefreshRateHz = $observedNominalRefreshRateHz
+        $refreshRateSource = 'manual-phase taskbar-monitor fallback; no automated menu window was observed'
+        if ($RefreshRateHz -eq 0) { throw 'Could not determine a fallback refresh rate for the manual phase; pass -RefreshRateHz explicitly.' }
+    } else {
+        throw 'Could not determine the actual automated menu monitor refresh rate; pass -RefreshRateHz explicitly and investigate EnumDisplaySettings.'
+    }
     [void](Assert-A4SResidentContext -ExpectedHostWindow $hostWindow `
         -ExpectedHostProcessId $residentHostProcessId -ExpectedHostStartTicks $residentHostStartTicks `
         -ExpectedExplorerProcessId $explorerProcessId -ExpectedExplorerStartTicks $explorerStartTicks `
@@ -827,3 +874,6 @@ if ($terminalErrors.Count) {
 }
 
 Write-Output $reportPath
+} finally {
+    Exit-A4SQualificationAutomationLock -Mutex $qualificationAutomationMutex
+}

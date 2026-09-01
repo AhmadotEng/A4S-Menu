@@ -41,14 +41,20 @@ Assert-A4S ($captureText -match '\[switch\]\$AllowMenuAutomation') 'capture tool
 Assert-A4S ($captureText -match 'if \(-not \$AllowMenuAutomation\)') 'capture gate is not enforced before preflight'
 Assert-A4S ($captureText -notmatch '(?i)Start-Process|Stop-Process|Restart-Computer|Stop-Computer|--rehook|--reset-safety|Invoke-WebRequest|Invoke-RestMethod') 'capture tool contains a forbidden process, injection, restart, or network primitive'
 Assert-A4S ($captureText -notmatch 'VisibleMenuWindows\(0\)') 'capture cleanup can inspect or toggle based on a menu from an unvalidated process'
+Assert-A4S ($captureText -match 'automationMenuExpectedVisible' -and
+    $captureText -match '\[IntPtr\]\$visible\[0\] -eq \$automationMenuWindow') 'capture cleanup can toggle a newly opened or non-test menu'
 Assert-A4S ($captureText -match 'LoadedImageIdentity' -and $captureText -match 'FileImageIdentity') 'capture preflight does not compare resident and staged PE build identities'
 Assert-A4S ($captureText -match 'ExpectedCycleCount\s*=\s*\$\(if\s*\(\$ManualInteractionSeconds -gt 0\)\s*\{\s*0\s*\}\s*else\s*\{\s*\$CapturedCycles\s*\}\)') 'automated capture does not bind report completeness to the requested cycle count'
 Assert-A4S ($captureText -match '\$sessionCreateAttempted\s*=\s*\$true[\s\S]+Invoke-A4SLogman -Arguments \$startArguments') 'ETW create attempts are not armed for unconditional cleanup before logman runs'
 Assert-A4S ($captureText -match 'Invoke-A4SLogman -Arguments @\(''stop'', \$sessionName, ''-ets''\)') 'ETW session teardown is missing'
 Assert-A4S ($captureText -match 'Write-A4SJsonAtomicallyReplacing' -and $captureText -match 'observerLogonId') 'capture metadata is not durably persisted and logon-bound'
+Assert-A4S ($captureText -match 'Enter-A4SQualificationAutomationLock' -and
+    $captureText -match 'Exit-A4SQualificationAutomationLock') 'capture is not serialized against other menu qualification automation'
 Assert-A4S ($captureText -match 'ManualInteractionSeconds' -and
     $captureText -match '\$ManualInteractionSeconds -gt 0 -and \$EnforceTargets' -and
     $captureText -match 'Open All Programs') 'manual Programs/search phase capture is missing or can be mislabeled as an enforced target trace'
+Assert-A4S ($captureText -match 'actual-menu-monitor EnumDisplaySettings' -and
+    $captureText -match 'different nominal refresh rates') 'trace frame budget is not bound to one consistent actual menu-monitor refresh rate'
 $coreText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'A4SRuntimeTrace.Core.psm1') -Raw
 Assert-A4S ($coreText -match 'p95UnroundedMilliseconds' -and $coreText -match '1000\.0 / \$RefreshRateHz') 'one-frame target math rounds away sub-millisecond precision'
 
@@ -185,6 +191,62 @@ try {
     $forcedReport = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
     Assert-A4S ($forcedReport.counts.cycles -eq 3) 'atomic -Force report replacement produced invalid JSON'
     Assert-A4S (@(Get-ChildItem -LiteralPath $tempRoot -Filter 'report.json.backup-*').Count -eq 0) 'atomic -Force report replacement leaked a backup artifact'
+
+    $sourceHashBeforeCollisionTest = (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash
+    $sourceReplacementRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+            -ExpectedProcessId 4242 -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 `
+            -MinimumCloseSampleCount 3 -OutputPath $jsonPath -Force)
+    } catch { if ($_.Exception.Message -match 'distinct eventJsonInput and jsonReport paths') { $sourceReplacementRejected = $true } }
+    Assert-A4S $sourceReplacementRejected '-Force could replace the synthetic source with its derived report'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($sourceHashBeforeCollisionTest,
+        (Get-FileHash -LiteralPath $jsonPath -Algorithm SHA256).Hash)) 'rejected source/report alias changed the source bytes'
+
+    $nonDerivedJson = Join-Path $tempRoot 'unrelated.json'
+    [IO.File]::WriteAllText($nonDerivedJson, '{"unrelated":true}', [Text.UTF8Encoding]::new($false))
+    $nonDerivedJsonHash = (Get-FileHash -LiteralPath $nonDerivedJson -Algorithm SHA256).Hash
+    $nonDerivedJsonRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EventJsonPath $jsonPath `
+            -ExpectedProcessId 4242 -ExpectedCycleCount 3 -MinimumWarmSampleCount 2 `
+            -MinimumCloseSampleCount 3 -OutputPath $nonDerivedJson -Force)
+    } catch { if ($_.Exception.Message -match '-Force refused to replace') { $nonDerivedJsonRejected = $true } }
+    Assert-A4S $nonDerivedJsonRejected '-Force could replace an unrelated existing JSON file'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($nonDerivedJsonHash,
+        (Get-FileHash -LiteralPath $nonDerivedJson -Algorithm SHA256).Hash)) 'refused unrelated JSON target was modified'
+
+    $fakeEtlPath = Join-Path $tempRoot 'raw-input.etl'
+    [IO.File]::WriteAllBytes($fakeEtlPath, [byte[]](1, 2, 3, 4))
+    $fakeEtlHashBefore = (Get-FileHash -LiteralPath $fakeEtlPath -Algorithm SHA256).Hash
+    $rawEtlAliasRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EtlPath $fakeEtlPath `
+            -TracerptXmlPath $fakeEtlPath -OutputPath (Join-Path $tempRoot 'unused-report.json') -Force)
+    } catch { if ($_.Exception.Message -match 'distinct rawEtlInput and decodedXml paths') { $rawEtlAliasRejected = $true } }
+    Assert-A4S $rawEtlAliasRejected '-Force could replace the raw ETL with decoded XML'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($fakeEtlHashBefore,
+        (Get-FileHash -LiteralPath $fakeEtlPath -Algorithm SHA256).Hash)) 'rejected raw-ETL alias changed the ETL bytes'
+
+    $nonDerivedXml = Join-Path $tempRoot 'unrelated.xml'
+    [IO.File]::WriteAllText($nonDerivedXml, '<unrelated />', [Text.UTF8Encoding]::new($false))
+    $nonDerivedXmlHash = (Get-FileHash -LiteralPath $nonDerivedXml -Algorithm SHA256).Hash
+    $nonDerivedXmlRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EtlPath $fakeEtlPath `
+            -TracerptXmlPath $nonDerivedXml -OutputPath (Join-Path $tempRoot 'unused-report-2.json') -Force)
+    } catch { if ($_.Exception.Message -match '-Force refused to replace') { $nonDerivedXmlRejected = $true } }
+    Assert-A4S $nonDerivedXmlRejected '-Force could replace an unrelated existing XML file'
+    Assert-A4S ([StringComparer]::OrdinalIgnoreCase.Equals($nonDerivedXmlHash,
+        (Get-FileHash -LiteralPath $nonDerivedXml -Algorithm SHA256).Hash)) 'refused unrelated XML target was modified'
+
+    $sharedDerivedPath = Join-Path $tempRoot 'shared-derived.out'
+    $derivedAliasRejected = $false
+    try {
+        [void](& (Join-Path $PSScriptRoot 'Convert-A4SRuntimeTrace.ps1') -EtlPath $fakeEtlPath `
+            -TracerptXmlPath $sharedDerivedPath -OutputPath $sharedDerivedPath -Force)
+    } catch { if ($_.Exception.Message -match 'distinct decodedXml and jsonReport paths') { $derivedAliasRejected = $true } }
+    Assert-A4S $derivedAliasRejected 'decoded XML and JSON report could alias the same derived path'
 
     $frameEvents = [Collections.Generic.List[object]]::new()
     function Add-FrameEvent([double]$ms, [int]$eventId, [int]$stageId, [uint64]$operation) {

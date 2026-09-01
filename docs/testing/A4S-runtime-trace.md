@@ -109,7 +109,15 @@ a `finally` block, including failed or partial starts. A successful start whose
 stop fails is a terminal error; after a failed start, the tool also queries a
 failed stop to detect a residual named session. If Windows denies ETW session
 creation, run the same command from an elevated 64-bit PowerShell; do not weaken
-the product preflight.
+the product preflight. A shared session-local qualification mutex refuses a
+capture while the performance or scenario automation tool owns the menu, so
+their extra cycles cannot enter this trace.
+
+For automated cycles, refresh-rate evidence comes from the monitor containing
+the actual visible menu window, not blindly from the primary taskbar. All
+automated cycles must resolve one consistent current-mode integer rate. A
+manual-only phase has no tool-owned menu window; without an explicit
+`-RefreshRateHz` it records a clearly labeled taskbar-monitor fallback instead.
 
 Artifacts in the unique directory include:
 
@@ -155,7 +163,8 @@ manual phase trace; they are not exercised by repeated open/close cycles:
 ```
 
 Automated cycles and a manual interaction window are mutually exclusive, and
-manual phase traces deliberately cannot use `-EnforceTargets`.
+manual phase traces deliberately cannot use `-EnforceTargets`. Close the menu
+before the manual window ends; the tool never toggles a user-opened menu.
 
 ## Offline conversion
 
@@ -170,7 +179,11 @@ An existing ETL can be decoded again without running or touching the product:
 ```
 
 `-Force` permits atomically replacing only derived XML/JSON files. The raw ETL
-is never modified. `-EventJsonPath` exists for deterministic synthetic/offline tests.
+is never modified. Raw ETL/event input, decoded XML, and JSON report paths must
+all be distinct; `-Force` cannot waive that rule. An existing target must also
+parse as the corresponding A4S schema-2 report or A4S tracerpt XML, so `-Force`
+cannot be used as a general arbitrary-file replacement switch.
+`-EventJsonPath` exists for deterministic synthetic/offline tests.
 Offline `-EnforceTargets` cannot pass without an explicit
 `-ExpectedCycleCount`; this prevents a truncated ETL from validating itself.
 The 20-sample minimums can be raised, but lowering them weakens the evidence and

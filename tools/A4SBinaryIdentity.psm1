@@ -323,5 +323,41 @@ function Get-A4SProductDirectoryRegistration {
     [pscustomobject][ordered]@{ kind = 'installed-active-slot'; activeSlot = $activeSlot }
 }
 
+function Enter-A4SQualificationAutomationLock {
+    [CmdletBinding()]
+    param()
+
+    # All product qualification tools use the same session-local mutex. This
+    # prevents a performance probe or scenario run from injecting extra menu
+    # cycles into a custom-provider trace (and prevents two cleanup paths from
+    # racing over the same resident menu). Local\ already separates terminal
+    # sessions; retaining the numeric session in the name makes that scope
+    # explicit in diagnostics.
+    $sessionId = [Diagnostics.Process]::GetCurrentProcess().SessionId
+    $name = "Local\A4SMenu.QualificationAutomation.v1.$sessionId"
+    $mutex = [Threading.Mutex]::new($false, $name)
+    $held = $false
+    try {
+        try { $held = $mutex.WaitOne([TimeSpan]::Zero) }
+        catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) {
+            throw "Another A4S menu qualification tool already owns '$name'. Wait for it to finish so trace and scenario evidence cannot overlap."
+        }
+        return $mutex
+    } catch {
+        $mutex.Dispose()
+        throw
+    }
+}
+
+function Exit-A4SQualificationAutomationLock {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)][Threading.Mutex] $Mutex)
+
+    try { $Mutex.ReleaseMutex() }
+    finally { $Mutex.Dispose() }
+}
+
 Export-ModuleMember -Function Get-A4SFileImageIdentity, Get-A4SLoadedImageIdentity, Get-A4SProcessLogonId, `
-    Get-A4SInstalledActiveSlot, Get-A4SProductDirectoryRegistration
+    Get-A4SInstalledActiveSlot, Get-A4SProductDirectoryRegistration, `
+    Enter-A4SQualificationAutomationLock, Exit-A4SQualificationAutomationLock

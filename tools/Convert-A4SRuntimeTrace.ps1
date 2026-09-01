@@ -33,6 +33,50 @@ function Resolve-A4SOutputPath {
     return [IO.Path]::GetFullPath($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path))
 }
 
+function Assert-A4SDistinctArtifactPaths {
+    param([Parameter(Mandatory)][Collections.IDictionary]$Paths)
+
+    $names = @($Paths.Keys)
+    for ($left = 0; $left -lt $names.Count; $left++) {
+        for ($right = $left + 1; $right -lt $names.Count; $right++) {
+            $leftName = [string]$names[$left]
+            $rightName = [string]$names[$right]
+            if ([StringComparer]::OrdinalIgnoreCase.Equals(
+                [IO.Path]::GetFullPath([string]$Paths[$leftName]),
+                [IO.Path]::GetFullPath([string]$Paths[$rightName]))) {
+                throw "Trace conversion requires distinct $leftName and $rightName paths. -Force never authorizes replacing the raw input or aliasing two derived artifacts."
+            }
+        }
+    }
+}
+
+function Assert-A4SExistingDerivedReport {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try { $existing = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop }
+    catch { throw "-Force refused to replace '$Path' because it is not a readable A4S derived JSON report." }
+    if (-not $existing.PSObject.Properties['schemaVersion'] -or
+        -not $existing.PSObject.Properties['provider'] -or
+        -not $existing.provider -or
+        -not $existing.provider.PSObject.Properties['name'] -or
+        -not $existing.provider.PSObject.Properties['guid'] -or
+        [int]$existing.schemaVersion -ne 2 -or
+        [string]$existing.provider.name -ne 'A4SMenu.Runtime' -or
+        [string]$existing.provider.guid -ne '74a9f986-c7ab-429a-9571-df0fb7f4a33c') {
+        throw "-Force refused to replace '$Path' because it is not an A4SMenu.Runtime schema-2 derived report."
+    }
+}
+
+function Assert-A4SExistingDerivedXml {
+    param([Parameter(Mandatory)][string]$Path)
+
+    try { $existingEvents = @(ConvertFrom-A4STracerptXml -Path $Path -ExpectedProcessId 0) }
+    catch { throw "-Force refused to replace '$Path' because it is not readable A4S tracerpt XML." }
+    if ($existingEvents.Count -eq 0) {
+        throw "-Force refused to replace '$Path' because it contains no A4SMenu.Runtime events."
+    }
+}
+
 function Write-A4SJsonCreateNew {
     param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Value)
     $temporary = "$Path.partial-$PID-$([Guid]::NewGuid().ToString('N'))"
@@ -57,12 +101,32 @@ if ($PSCmdlet.ParameterSetName -eq 'Etl') {
     $sourcePath = (Resolve-Path -LiteralPath $EtlPath -ErrorAction Stop).ProviderPath
     if ([IO.Path]::GetExtension($sourcePath) -ine '.etl') { throw "Expected an .etl input; received '$sourcePath'." }
     $sourceType = 'etl'
-    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
-    $rawEtlPreserved = $true
+    if (-not $OutputPath) { $OutputPath = "$([IO.Path]::ChangeExtension($sourcePath, $null)).a4s-runtime.json" }
+    $resolvedOutput = Resolve-A4SOutputPath $OutputPath
     if (-not $TracerptXmlPath) { $TracerptXmlPath = [IO.Path]::ChangeExtension($sourcePath, '.tracerpt.xml') }
     $decodedXml = Resolve-A4SOutputPath $TracerptXmlPath
+    Assert-A4SDistinctArtifactPaths ([ordered]@{
+        rawEtlInput = $sourcePath
+        decodedXml = $decodedXml
+        jsonReport = $resolvedOutput
+    })
+    if ((Test-Path -LiteralPath $resolvedOutput) -and -not $Force) {
+        throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
+    }
+    if ((Test-Path -LiteralPath $resolvedOutput -PathType Leaf) -and $Force) {
+        Assert-A4SExistingDerivedReport -Path $resolvedOutput
+    }
+    $outputDirectory = Split-Path -Parent $resolvedOutput
+    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
+    $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
+    $rawEtlPreserved = $true
     if ((Test-Path -LiteralPath $decodedXml) -and -not $Force) {
         throw "Decoded tracerpt XML already exists at '$decodedXml'. Use -Force to replace only that derived file; the ETL is never changed."
+    }
+    if ((Test-Path -LiteralPath $decodedXml -PathType Leaf) -and $Force) {
+        Assert-A4SExistingDerivedXml -Path $decodedXml
     }
     $xmlDirectory = Split-Path -Parent $decodedXml
     if (-not (Test-Path -LiteralPath $xmlDirectory -PathType Container)) {
@@ -108,6 +172,22 @@ if ($PSCmdlet.ParameterSetName -eq 'Etl') {
 } else {
     $sourcePath = (Resolve-Path -LiteralPath $EventJsonPath -ErrorAction Stop).ProviderPath
     $sourceType = 'syntheticJson'
+    if (-not $OutputPath) { $OutputPath = "$sourcePath.a4s-runtime.json" }
+    $resolvedOutput = Resolve-A4SOutputPath $OutputPath
+    Assert-A4SDistinctArtifactPaths ([ordered]@{
+        eventJsonInput = $sourcePath
+        jsonReport = $resolvedOutput
+    })
+    if ((Test-Path -LiteralPath $resolvedOutput) -and -not $Force) {
+        throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
+    }
+    if ((Test-Path -LiteralPath $resolvedOutput -PathType Leaf) -and $Force) {
+        Assert-A4SExistingDerivedReport -Path $resolvedOutput
+    }
+    $outputDirectory = Split-Path -Parent $resolvedOutput
+    if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
+        New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
+    }
     $sourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
     $events = @(Import-A4SEventJson -Path $sourcePath -ExpectedProcessId $ExpectedProcessId)
     $postImportSourceHash = (Get-FileHash -LiteralPath $sourcePath -Algorithm SHA256).Hash
@@ -115,19 +195,6 @@ if ($PSCmdlet.ParameterSetName -eq 'Etl') {
         throw "The synthetic event source changed while it was parsed; refusing non-immutable evidence from '$sourcePath'."
     }
     if ($events.Count -eq 0) { throw "No A4S runtime events were found in '$sourcePath'." }
-}
-
-if (-not $OutputPath) {
-    $base = if ($sourceType -eq 'etl') { [IO.Path]::ChangeExtension($sourcePath, $null) } else { $sourcePath }
-    $OutputPath = "$base.a4s-runtime.json"
-}
-$resolvedOutput = Resolve-A4SOutputPath $OutputPath
-if ((Test-Path -LiteralPath $resolvedOutput) -and -not $Force) {
-    throw "Report already exists at '$resolvedOutput'. Use -Force to replace the derived JSON report."
-}
-$outputDirectory = Split-Path -Parent $resolvedOutput
-if (-not (Test-Path -LiteralPath $outputDirectory -PathType Container)) {
-    New-Item -ItemType Directory -Path $outputDirectory -Force | Out-Null
 }
 
 $report = ConvertTo-A4SRuntimeReport -Events $events -ColdSampleCount $ColdSampleCount `

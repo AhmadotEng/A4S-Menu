@@ -18,7 +18,11 @@ start a missing host and therefore cannot inject Explorer accidentally. Their
 window observations are restricted to `A4SMenu.CMenuContainer` windows owned
 by the taskbar Explorer process, and failure cleanup uses the normal toggle
 path to close exactly one menu that the test opened. They refuse an ambiguous
-cleanup toggle if more than one matching Explorer-owned menu is visible.
+cleanup toggle if more than one matching Explorer-owned menu is visible. A
+shared session-local qualification mutex also prevents the performance, trace,
+and automated-scenario tools from overlapping their menu cycles. Scenario
+cleanup records the exact window it opened and will not close a newly opened
+menu after the scenario's own dismissal was already observed.
 
 Environment transitions remain manual:
 
@@ -55,6 +59,12 @@ same Explorer PID, so the memory delta is a true same-process before/after
 comparison rather than a comparison between unrelated Explorer instances. It
 remains a process-wide correlation: unrelated Explorer allocations between the
 two snapshots are part of the delta.
+
+Snapshot schema 3 records that the explicit clean-state contract was requested,
+the observed Explorer age, and the maximum accepted age. The performance probe
+rejects an ordinary read-only observation even when it happens to show no host
+or mapping; it accepts only an explicit clean baseline whose recorded maximum
+is no weaker than 120 seconds.
 
 The snapshot also records:
 
@@ -236,7 +246,9 @@ paint, search initialization, preload, hiding, and repaint rectangles. Capture
 
 `239` is the qualification machine's current configured rate; recheck it if
 the display mode changes. The supplied value is compared with the current-mode
-integer reported by `EnumDisplaySettings`. The report uses the unrounded
+integer reported by `EnumDisplaySettings` for the actual menu monitor. Every
+automated cycle must report the same nominal rate; mixed-rate monitor cycles
+are rejected and must be captured separately. The report uses the unrounded
 `1000 / refresh-rate` budget (4.184100... ms at 239 Hz), while displaying
 rounded values for readability.
 
@@ -277,7 +289,8 @@ those phase markers separately, without target enforcement:
 
 During the announced window, open All Programs, wait for it to populate,
 return to the normal view, type a non-empty search query, and let results
-settle. This trace is phase evidence only: its overall target status cannot be
+settle, then close the menu before the window ends. The tool does not toggle a
+user-opened menu in manual-only mode. This trace is phase evidence only: its overall target status cannot be
 `pass`, and `-EnforceTargets` is deliberately rejected in manual mode.
 
 ## Record the stability matrix
@@ -356,7 +369,8 @@ Use a unique `-ScenarioName` and optional `-Notes` for every run. Duplicate
 names are rejected. A path-derived mutex serializes writers and same-volume
 write-through replacement keeps the aggregate JSON intact. If automation
 fails after the environment snapshot, the failed entry and error are persisted
-before the script returns failure.
+before the script returns failure. The separate shared automation mutex keeps
+scenario menu actions from overlapping a performance or trace run.
 
 The required matrix is:
 
