@@ -52,6 +52,13 @@ if ($parseErrors.Count -ne 0) {
     throw ('A4S failure/recovery contract failed: the qualification harness does not parse: ' +
         (($parseErrors | ForEach-Object Message) -join '; '))
 }
+$automaticHostReferences = @($ast.FindAll({
+    param($node)
+    $node -is [Management.Automation.Language.VariableExpressionAst] -and
+        $node.VariablePath.UserPath -ieq 'Host'
+}, $true))
+Assert-Contract ($automaticHostReferences.Count -eq 0) `
+    'harness declares or references PowerShell automatic variable $Host'
 
 function Get-FunctionText {
     param([Parameter(Mandatory)][string] $Name)
@@ -231,6 +238,38 @@ try {
     }
     Assert-Contract ($binaryBinding -notmatch 'Invoke-A4SHostCommand') `
         'static binding executes the candidate image'
+    $bindingFixture = [pscustomobject][ordered]@{
+        record = [pscustomobject][ordered]@{
+            schemaVersion = [int32]1
+            product = 'A4SMenu'
+            sourceCommit = '0123456789abcdef0123456789abcdef01234567'
+            hostSha256 = ('A' * 64)
+            dllSha256 = ('B' * 64)
+            hostFileVersion = '1.1.0.0'
+            dllFileVersion = '1.1.0.0'
+            hostReportedVersion = 'A4SMenuHost 1.1.0.0'
+        }
+    }
+    $hostBindingFixture = [pscustomobject][ordered]@{
+        sha256 = ('A' * 64)
+        fileVersion = '1.1.0.0'
+    }
+    $dllBindingFixture = [pscustomobject][ordered]@{
+        sha256 = ('B' * 64)
+        fileVersion = '1.1.0.0'
+    }
+    Assert-Contract (& $library {
+        param($releaseFixture, $hostFixture)
+        Assert-HostBindingMatchesReleaseRecord -Release $releaseFixture `
+            -HostBinding $hostFixture
+    } $bindingFixture $hostBindingFixture) `
+        'host-only release binding cannot bind without colliding with automatic $Host'
+    Assert-Contract (& $library {
+        param($releaseFixture, $hostFixture, $dllFixture)
+        Assert-BinaryBindingsMatchReleaseRecord -Release $releaseFixture `
+            -HostBinding $hostFixture -Dll $dllFixture
+    } $bindingFixture $hostBindingFixture $dllBindingFixture) `
+        'host/DLL release binding cannot bind without colliding with automatic $Host'
     $reportedVersion = Get-FunctionText 'Confirm-A4SAuthenticatedHostReportedVersion'
     Assert-InOrder -Text $reportedVersion -Markers @(
         'Assert-HostBindingMatchesReleaseRecord', 'FileShare]::Read',

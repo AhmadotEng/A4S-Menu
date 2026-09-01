@@ -3362,14 +3362,14 @@ function Read-VerifiedA4SReleaseRecord {
 function Assert-BinaryBindingsMatchReleaseRecord {
     param(
         [Parameter(Mandatory)][object] $Release,
-        [Parameter(Mandatory)][object] $Host,
+        [Parameter(Mandatory)][object] $HostBinding,
         [Parameter(Mandatory)][object] $Dll
     )
 
     [void](Assert-ValidA4SReleaseRecord -Record $Release.record)
-    if ($Host.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
+    if ($HostBinding.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
         $Dll.sha256 -cne ([string]$Release.record.dllSha256).ToUpperInvariant() -or
-        $Host.fileVersion -cne [string]$Release.record.hostFileVersion -or
+        $HostBinding.fileVersion -cne [string]$Release.record.hostFileVersion -or
         $Dll.fileVersion -cne [string]$Release.record.dllFileVersion) {
         throw 'The supplied static host/DLL identities do not match the verified immutable release record.'
     }
@@ -3379,12 +3379,12 @@ function Assert-BinaryBindingsMatchReleaseRecord {
 function Assert-HostBindingMatchesReleaseRecord {
     param(
         [Parameter(Mandatory)][object] $Release,
-        [Parameter(Mandatory)][object] $Host
+        [Parameter(Mandatory)][object] $HostBinding
     )
 
     [void](Assert-ValidA4SReleaseRecord -Record $Release.record)
-    if ($Host.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
-        $Host.fileVersion -cne [string]$Release.record.hostFileVersion) {
+    if ($HostBinding.sha256 -cne ([string]$Release.record.hostSha256).ToUpperInvariant() -or
+        $HostBinding.fileVersion -cne [string]$Release.record.hostFileVersion) {
         throw 'The supplied static host identity does not match the verified immutable release record.'
     }
     return $true
@@ -3485,14 +3485,15 @@ function Confirm-A4SAuthenticatedHostReportedVersion {
     )
 
     [void](Assert-HostBindingMatchesReleaseRecord -Release $Release `
-        -Host $AuthenticatedHostBinding)
+        -HostBinding $AuthenticatedHostBinding)
     $outerLock = [IO.File]::Open([string]$AuthenticatedHostBinding.path,
         [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
     try {
         $current = Get-BinaryBinding -Path $AuthenticatedHostBinding.path `
             -Role 'authenticated source A4SMenuHost recheck'
         Assert-BinaryCopyBinding -Source $AuthenticatedHostBinding -Copy $current
-        [void](Assert-HostBindingMatchesReleaseRecord -Release $Release -Host $current)
+        [void](Assert-HostBindingMatchesReleaseRecord -Release $Release `
+            -HostBinding $current)
         $versionResult = Invoke-A4SHostCommand `
             -Executable $AuthenticatedHostBinding.path -Argument '--version'
         if ($versionResult.exitCode -ne 0 -or
@@ -4055,7 +4056,8 @@ function Invoke-IsolatedDllFailureQualification {
     $release = Read-VerifiedA4SReleaseRecord -Path $VerifiedReleaseRecordPath
     $sourceHost = Resolve-RegularFile -Path $SourceHost -Description 'A4SMenuHost test input'
     $sourceBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost'
-    [void](Assert-HostBindingMatchesReleaseRecord -Release $release -Host $sourceBinding)
+    [void](Assert-HostBindingMatchesReleaseRecord -Release $release `
+        -HostBinding $sourceBinding)
     [void](Confirm-A4SAuthenticatedHostReportedVersion -Release $release `
         -AuthenticatedHostBinding $sourceBinding)
     $bundle = New-EvidenceBundle -Mode 'isolated-dll-failures' -RequestedPath $RequestedEvidencePath
@@ -4533,7 +4535,7 @@ function Invoke-LiveFailureRecoveryQualification {
     $sourceHostBinding = Get-BinaryBinding -Path $sourceHost -Role 'source A4SMenuHost'
     $sourceDllBinding = Get-BinaryBinding -Path $sourceDll -Role 'source A4SMenu.dll'
     [void](Assert-BinaryBindingsMatchReleaseRecord -Release $release `
-        -Host $sourceHostBinding -Dll $sourceDllBinding)
+        -HostBinding $sourceHostBinding -Dll $sourceDllBinding)
     [void](Confirm-A4SAuthenticatedHostReportedVersion -Release $release `
         -AuthenticatedHostBinding $sourceHostBinding)
     $bundle = New-EvidenceBundle -Mode 'live-explorer-crash-guard' -RequestedPath $RequestedEvidencePath
