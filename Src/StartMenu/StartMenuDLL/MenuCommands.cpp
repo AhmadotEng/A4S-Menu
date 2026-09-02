@@ -3788,6 +3788,7 @@ static DWORD WINAPI FaderThreadProc( void *param )
 
 void CMenuContainer::FadeOutItem( int index )
 {
+	if (A4SMenuProfile::IsEnabled()) return;
 	int speed=GetSettingInt(L"MenuFadeSpeed");
 	if (speed<=0) return;
 

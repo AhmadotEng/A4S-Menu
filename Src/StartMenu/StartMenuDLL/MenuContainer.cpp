@@ -10005,6 +10005,18 @@ HWND CMenuContainer::ToggleStartMenu( int taskbarId, bool bKeyboard, bool bAllPr
 
 		s_MainMenuLimits=pStartMenu->CalculateWorkArea(taskbarRect);
 		corner=pStartMenu->CalculateCorner();
+		if (A4SMenuProfile::IsEnabled() && s_TaskBarEdge==ABE_BOTTOM)
+		{
+			const int startWidth=s_StartRect.right-s_StartRect.left;
+			const int edgeGap=min(s_StartRect.left-s_MenuLimits.left,s_MenuLimits.right-s_StartRect.right);
+			if (startWidth>0 && edgeGap>startWidth)
+			{
+				const int popupWidth=A4SMenuProfile::MenuWidth(dpi);
+				int popupLeft=s_MainMenuLimits.left+(s_MainMenuLimits.right-s_MainMenuLimits.left-popupWidth)/2;
+				popupLeft=max(s_MainMenuLimits.left,min(popupLeft,s_MainMenuLimits.right-popupWidth));
+				corner.x=(options&CONTAINER_LEFT)?popupLeft:popupLeft+popupWidth;
+			}
+		}
 	}
 
 	// reposition start menu
