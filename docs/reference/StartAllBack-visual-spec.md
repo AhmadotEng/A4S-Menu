@@ -221,7 +221,7 @@ This document separates measured facts from implementation choices. The live con
 - The UAC shield is 16x16 px at popup-local `x=11`; text begins at popup-local `x=35` and uses the same composited Segoe UI Variable Text rendering as the shutdown flyout.
 - The popup uses the shutdown flyout's WCA acrylic, small DWM corners, border, and native shadow. Where it overlaps the root menu, the overlap is temporarily excluded from the root so the popup samples the desktop/application once instead of inheriting the root tint.
 - It follows normal menu focus behavior: it appears above the active Start menu, dismisses on Escape or an outside click, and does not remain globally topmost after another application is activated.
-- While it is open, left- or right-clicking another eligible pinned or All Programs leaf consumes that complete click, closes the old popup, and opens a replacement at the newly clicked program. Clicking any ineligible surface performs an ordinary dismissal.
+- While it is open, right-clicking another eligible pinned or All Programs leaf consumes that complete click, closes the old popup, and opens a replacement at the newly clicked program. Left-clicking an eligible program closes the popup and launches that program through its normal activation path. Clicking any ineligible surface performs an ordinary dismissal.
 
 ## Backdrop material, color, and opacity
 

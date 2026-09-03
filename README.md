@@ -26,7 +26,8 @@ Current source profile: `A4SMenu/phase4-source-profile/23`.
 - Compact source-owned program context flyout containing only Run as
   administrator, Pin/Unpin from start menu, and Open file location.
 - Context flyouts open at the clicked program and can be replaced immediately
-  by left- or right-clicking another eligible pinned or All Programs entry.
+  by right-clicking another eligible pinned or All Programs entry. Left-clicking
+  an eligible program dismisses the flyout and launches that program normally.
 
 ## Product and package boundary
 

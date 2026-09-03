@@ -1355,7 +1355,7 @@ LRESULT CProgramsTree::OnContextMenu( UINT uMsg, WPARAM wParam, LPARAM lParam, B
 	{
 		// WM_CONTEXTMENU carries screen coordinates. Hit-test them here instead of
 		// relying on an earlier button message to select the row. The A4S flyout
-		// replacement path deliberately consumes that earlier left click.
+		// replacement path deliberately consumes that earlier right click.
 		TVHITTESTINFO test={popupPoint};
 		ScreenToClient(&test.pt);
 		TreeView_HitTest(m_hWnd,&test);

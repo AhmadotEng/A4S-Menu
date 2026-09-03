@@ -1657,8 +1657,8 @@ int CMenuContainer::ShowA4SContextFlyout( int parentIndex, const POINT *pPt, boo
 		if (replacementArmed && msg.message==replacementButtonUp)
 		{
 			// Consume the release as well as the press. Otherwise the TreeView can
-			// turn the tail of a left click into a launch, or generate a second native
-			// context request from a right click. Reopen only after this loop unwinds.
+			// generate a second native context request from the right click. Reopen
+			// only after this loop unwinds.
 			replacementReady=true;
 			if (::IsWindow(popup))
 				::DestroyWindow(popup);
@@ -1704,9 +1704,20 @@ int CMenuContainer::ShowA4SContextFlyout( int parentIndex, const POINT *pPt, boo
 
 				if (bProgramRow)
 				{
+					if (msg.message==WM_LBUTTONDOWN)
+					{
+						// A left click keeps its normal activation semantics: close this
+						// flyout, then deliver the original press so the matching release
+						// launches the selected program through its existing input path.
+						if (::IsWindow(popup))
+							::DestroyWindow(popup);
+						TranslateMessage(&msg);
+						DispatchMessage(&msg);
+						continue;
+					}
 					replacementTarget=candidateTarget;
 					replacementPoint=msg.pt;
-					replacementButtonUp=msg.message==WM_RBUTTONDOWN?WM_RBUTTONUP:WM_LBUTTONUP;
+					replacementButtonUp=WM_RBUTTONUP;
 					replacementArmed=true;
 					continue;
 				}
@@ -1729,7 +1740,7 @@ int CMenuContainer::ShowA4SContextFlyout( int parentIndex, const POINT *pPt, boo
 	}
 	if (replacementReady && !m_bDestroyed && ::IsWindow(replacementTarget))
 	{
-		// WM_CONTEXTMENU is queued after the complete left/right click so the old flyout's
+		// WM_CONTEXTMENU is queued after the complete right click so the old flyout's
 		// synchronous activation has returned before the replacement is created.
 		::PostMessage(replacementTarget,WM_CONTEXTMENU,(WPARAM)replacementTarget,
 			MAKELPARAM(replacementPoint.x,replacementPoint.y));
