@@ -144,6 +144,27 @@ Finish the session through the supported logical disarm path:
 After `--exit`, restart Explorer before another test session. Do not force-kill
 the host and do not use same-process `--rehook`.
 
+## Development Environment
+
+The repository is the source of truth for the product. Changes are made in
+source and rebuilt; the compiled `.exe` and `.dll` files are not patched
+directly.
+
+- `A4SMenuHost.exe` is built from `Src\A4SMenu\Host`.
+- `A4SMenu.dll` is built by the A4S menu project from the product-specific
+  sources under `Src\A4SMenu\Menu` and the reused Open-Shell implementation
+  under `Src\StartMenu\StartMenuDLL`.
+- `tools\Build-A4SProduct.ps1` builds the host and DLL, atomically stages
+  their matching two-file runtime, rebuilds `A4SMenuSetup.exe` with those exact
+  binaries embedded, and runs the product validation gates.
+
+The source tree and build toolchain are required only to develop or rebuild the
+product. A target computer uses the resulting one-file `A4SMenuSetup.exe`; it
+does not need the Open-Shell repository or development tools. After either the
+host or DLL changes, setup must be rebuilt because its embedded payloads do not
+update automatically. Generated files under `build` are deliberately ignored
+by Git and are not source artifacts.
+
 ## Validation status
 
 The accepted UI baseline still consists of **14 StartAllBack reference images**
@@ -157,9 +178,10 @@ input Step 1 and the exact-build Step 3 performance baseline have recorded live
 results. The real current-profile installer matrix passed compatible install,
 physical logon startup, repair, update, rollback, explicit activation
 boundaries, and logical uninstall, but physical cleanup failed after Explorer
-restart and exposed a second helper self-deletion failure. The tested setup is
-therefore not release-qualified; the accepted Host and DLL remain frozen while
-a setup-only correction and focused uninstall regression are pending. DPI/
+restart and exposed a second helper self-deletion failure. That evidence is
+bound to the exact recorded binary identities. The current Host/DLL/Setup set
+includes later accepted corrections and therefore requires focused
+requalification; it is not release-qualified. DPI/
 monitor rows, controlled Explorer-failure tests, and the remaining stability
 matrix are also open. The authoritative execution boundary and step-by-step
 audit are recorded in
